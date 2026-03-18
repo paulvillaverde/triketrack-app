@@ -92,7 +92,7 @@ export async function upsertDriverLocation(params: {
     return { error: 'Supabase is not configured.' };
   }
 
-  const { error } = await supabase.rpc('upsert_driver_location', {
+  const rpcAttempt = await supabase.rpc('upsert_driver_location', {
     p_driver_id: params.driverId,
     p_driver_code: params.driverCode,
     p_latitude: params.latitude,
@@ -103,6 +103,35 @@ export async function upsertDriverLocation(params: {
     p_recorded_at: params.recordedAt ?? new Date().toISOString(),
   });
 
+  if (!rpcAttempt.error) {
+    return { error: null };
+  }
+
+  const message = rpcAttempt.error.message ?? '';
+  const shouldFallbackToDirectWrite =
+    message.includes('Could not find the function public.upsert_driver_location') ||
+    message.includes('schema cache');
+
+  if (!shouldFallbackToDirectWrite) {
+    return { error: message };
+  }
+
+  const { error } = await supabase.from('driver_locations').upsert(
+    {
+      driver_id: params.driverId,
+      driver_code: params.driverCode.toUpperCase(),
+      latitude: params.latitude,
+      longitude: params.longitude,
+      speed: typeof params.speed === 'number' ? params.speed : null,
+      heading: typeof params.heading === 'number' ? params.heading : null,
+      accuracy: typeof params.accuracy === 'number' ? params.accuracy : null,
+      is_online: true,
+      recorded_at: params.recordedAt ?? new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: 'driver_id' },
+  );
+
   return { error: error ? error.message : null };
 }
 
@@ -111,9 +140,27 @@ export async function setDriverLocationOffline(driverId: number) {
     return { error: 'Supabase is not configured.' };
   }
 
-  const { error } = await supabase.rpc('set_driver_location_offline', {
+  const rpcAttempt = await supabase.rpc('set_driver_location_offline', {
     p_driver_id: driverId,
   });
+
+  if (!rpcAttempt.error) {
+    return { error: null };
+  }
+
+  const message = rpcAttempt.error.message ?? '';
+  const shouldFallbackToDirectWrite =
+    message.includes('Could not find the function public.set_driver_location_offline') ||
+    message.includes('schema cache');
+
+  if (!shouldFallbackToDirectWrite) {
+    return { error: message };
+  }
+
+  const { error } = await supabase
+    .from('driver_locations')
+    .update({ is_online: false, updated_at: new Date().toISOString() })
+    .eq('driver_id', driverId);
 
   return { error: error ? error.message : null };
 }

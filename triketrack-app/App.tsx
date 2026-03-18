@@ -320,9 +320,8 @@ export default function App() {
     const shouldTrackLiveLocation =
       driverDbId !== null &&
       Boolean(profileDriverCode) &&
-      screen !== 'getStarted' &&
-      screen !== 'login' &&
-      screen !== 'createPassword';
+      isDriverOnline &&
+      routeLocationEnabled;
 
     if (!shouldTrackLiveLocation) {
       liveTrackingSubscriptionRef.current?.remove();
@@ -339,6 +338,7 @@ export default function App() {
       }
 
       if (status !== 'granted') {
+        setIsDriverOnline(false);
         if (!hasShownTrackingPermissionErrorRef.current) {
           hasShownTrackingPermissionErrorRef.current = true;
           Alert.alert(
@@ -388,7 +388,60 @@ export default function App() {
         void setDriverLocationOffline(driverDbId);
       }
     };
-  }, [driverDbId, profileDriverCode, screen]);
+  }, [driverDbId, isDriverOnline, profileDriverCode, routeLocationEnabled]);
+
+  const handleGoOnline = async (options?: { openTripScreen?: boolean }) => {
+    if (driverDbId === null || !profileDriverCode) {
+      Alert.alert('Profile Missing', 'Log in again before going online.');
+      return false;
+    }
+
+    const enabled = await ensureLocationEnabled();
+    if (!enabled) {
+      setIsDriverOnline(false);
+      return false;
+    }
+
+    try {
+      const location = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.High,
+      });
+
+      const { error } = await upsertDriverLocation({
+        driverId: driverDbId,
+        driverCode: profileDriverCode,
+        latitude: location.coords.latitude,
+        longitude: location.coords.longitude,
+        speed: location.coords.speed ?? null,
+        heading: location.coords.heading ?? null,
+        accuracy: location.coords.accuracy ?? null,
+        recordedAt: location.timestamp ? new Date(location.timestamp).toISOString() : undefined,
+      });
+
+      if (error) {
+        Alert.alert('Live Map Sync Error', error);
+        setIsDriverOnline(false);
+        return false;
+      }
+
+      hasShownTrackingPermissionErrorRef.current = false;
+      setIsDriverOnline(true);
+
+      if (options?.openTripScreen) {
+        setHomeTripScreen(true);
+        setScreen('home');
+      }
+
+      return true;
+    } catch {
+      Alert.alert(
+        'Location Error',
+        'Unable to get your current location. Please wait for GPS to stabilize, then try again.',
+      );
+      setIsDriverOnline(false);
+      return false;
+    }
+  };
 
   const handleDriverLogin = async (driverCode: string, password: string) => {
     if (!driverCode || !password) {
@@ -499,9 +552,7 @@ export default function App() {
         return;
       }
 
-      setIsDriverOnline(true);
-      setHomeTripScreen(true);
-      setScreen('home');
+      await handleGoOnline({ openTripScreen: true });
       return;
     }
     if (tab === 'trip') {
@@ -585,7 +636,7 @@ export default function App() {
             totalMinutes={totalMinutes}
             isTripScreen={homeTripScreen}
             onGoOnline={() => {
-              setIsDriverOnline(true);
+              void handleGoOnline();
             }}
             onGoOffline={() => {
               setHomeTripScreen(false);
@@ -889,13 +940,8 @@ export default function App() {
           visible={showEnableLocationModal}
           onRequestClose={() => setShowEnableLocationModal(false)}
           onGrantPermission={async () => {
-            const enabled = await ensureLocationEnabled();
             setShowEnableLocationModal(false);
-            if (enabled) {
-              setIsDriverOnline(true);
-              setHomeTripScreen(true);
-              setScreen('home');
-            }
+            await handleGoOnline({ openTripScreen: true });
           }}
           onMaybeLater={() => setShowEnableLocationModal(false)}
         />

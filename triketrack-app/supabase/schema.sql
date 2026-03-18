@@ -827,6 +827,41 @@ end $$;
 
 do $$
 begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'driver_locations'
+      and policyname = 'authenticated_can_insert_driver_locations'
+  ) then
+    create policy authenticated_can_insert_driver_locations
+    on public.driver_locations
+    for insert
+    to authenticated, anon
+    with check (true);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'driver_locations'
+      and policyname = 'authenticated_can_update_driver_locations'
+  ) then
+    create policy authenticated_can_update_driver_locations
+    on public.driver_locations
+    for update
+    to authenticated, anon
+    using (true)
+    with check (true);
+  end if;
+end $$;
+
+do $$
+begin
   begin
     alter publication supabase_realtime add table public.driver_locations;
   exception
