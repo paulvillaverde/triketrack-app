@@ -1,0 +1,2 @@
+export { TrikeTrackLogo } from './TrikeTrackLogo';
+
