@@ -159,6 +159,7 @@ create table if not exists public.drivers (
   first_name text not null,
   last_name text not null,
   contact_no text,
+  avatar_url text,
   password_hash text,
   status public.entity_status not null default 'active',
   created_at timestamptz not null default now(),
@@ -166,6 +167,7 @@ create table if not exists public.drivers (
 );
 
 alter table public.drivers add column if not exists updated_at timestamptz not null default now();
+alter table public.drivers add column if not exists avatar_url text;
 update public.drivers
 set updated_at = coalesce(updated_at, created_at, now())
 where updated_at is null;
@@ -369,6 +371,17 @@ create table if not exists public.trip_route_points (
   primary key (trip_id, idx)
 );
 
+create table if not exists public.trip_routes (
+  id bigint generated always as identity primary key,
+  local_trip_id text not null,
+  trip_id bigint references public.trips(trip_id) on delete set null,
+  driver_id bigint not null references public.drivers(driver_id) on delete cascade,
+  latitude double precision not null,
+  longitude double precision not null,
+  recorded_at timestamptz not null,
+  created_at timestamptz not null default now()
+);
+
 create table if not exists public.mobile_violations (
   id uuid primary key default gen_random_uuid(),
   driver_id bigint not null references public.drivers(driver_id) on delete cascade,
@@ -432,7 +445,7 @@ begin
     coalesce(d.driver_code, d.driver_id::text) as driver_id,
     coalesce(d.contact_no, '') as contact_number,
     coalesce(t.plate_no, '') as plate_number,
-    null::text as avatar_url
+    d.avatar_url
   from public.drivers d
   left join public.tricycles t on t.tricycle_id = d.tricycle_id
   where d.status = 'active'
@@ -465,7 +478,7 @@ begin
       updated_at = now()
     where upper(coalesce(d.driver_code, d.driver_id::text)) = upper(p_driver_code)
       and d.status = 'active'
-    returning d.driver_id, d.driver_code, d.first_name, d.last_name, d.contact_no, d.tricycle_id
+    returning d.driver_id, d.driver_code, d.first_name, d.last_name, d.contact_no, d.tricycle_id, d.avatar_url
   )
   select
     d.driver_id as id,
@@ -473,9 +486,33 @@ begin
     coalesce(d.driver_code, d.driver_id::text) as driver_id,
     coalesce(d.contact_no, '') as contact_number,
     coalesce(t.plate_no, '') as plate_number,
-    null::text as avatar_url
+    d.avatar_url
   from updated_driver d
   left join public.tricycles t on t.tricycle_id = d.tricycle_id;
+end;
+$$;
+
+create or replace function public.set_driver_avatar(
+  p_driver_id bigint,
+  p_avatar_url text
+)
+returns text
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_avatar_url text;
+begin
+  update public.drivers
+  set
+    avatar_url = p_avatar_url,
+    updated_at = now()
+  where driver_id = p_driver_id
+    and status = 'active'
+  returning avatar_url into v_avatar_url;
+
+  return v_avatar_url;
 end;
 $$;
 
@@ -562,9 +599,10 @@ declare
   v_trip_id bigint;
   v_tricycle_id bigint;
   v_route_id bigint;
+  v_toda_id bigint;
 begin
-  select d.tricycle_id, r.route_id
-  into v_tricycle_id, v_route_id
+  select d.tricycle_id, d.toda_id, r.route_id
+  into v_tricycle_id, v_toda_id, v_route_id
   from public.drivers d
   left join public.routes r on r.toda_id = d.toda_id and r.status = 'active'
   where d.driver_id = p_driver_id
@@ -575,8 +613,25 @@ begin
     raise exception 'Driver % has no tricycle assigned.', p_driver_id;
   end if;
 
+  if v_route_id is null and v_toda_id is not null then
+    insert into public.routes (toda_id, origin, destination, status)
+    values (v_toda_id, 'Test Route', 'Live GPS Tracking', 'active')
+    on conflict (toda_id, origin, destination) do update
+      set status = 'active'
+    returning route_id into v_route_id;
+  end if;
+
   if v_route_id is null then
-    raise exception 'Driver % has no active route assigned.', p_driver_id;
+    select r.route_id
+    into v_route_id
+    from public.routes r
+    where r.status = 'active'
+    order by r.route_id asc
+    limit 1;
+  end if;
+
+  if v_route_id is null then
+    raise exception 'Driver % has no route available for testing.', p_driver_id;
   end if;
 
   insert into public.trips (driver_id, tricycle_id, route_id, trip_start, trip_status, fare_amount, duration_minutes)
@@ -755,6 +810,10 @@ create index if not exists idx_violations_tricycle_id on public.violations (tric
 create index if not exists idx_violations_status on public.violations (status);
 create index if not exists idx_violations_detected_at on public.violations (detected_at);
 create index if not exists idx_trip_route_points_trip on public.trip_route_points (trip_id);
+create index if not exists idx_trip_routes_local_trip_recorded_at on public.trip_routes (local_trip_id, recorded_at);
+create index if not exists idx_trip_routes_driver_recorded_at on public.trip_routes (driver_id, recorded_at desc);
+create unique index if not exists uq_trip_routes_local_trip_point
+on public.trip_routes (local_trip_id, driver_id, recorded_at, latitude, longitude);
 create index if not exists idx_mobile_violations_driver_occurred_at_desc on public.mobile_violations (driver_id, occurred_at desc);
 create index if not exists idx_mobile_violations_status on public.mobile_violations (status);
 create index if not exists idx_mobile_violations_type on public.mobile_violations (type);
@@ -805,6 +864,7 @@ alter table public.reports enable row level security;
 alter table public.report_media enable row level security;
 alter table public.violations enable row level security;
 alter table public.trip_route_points enable row level security;
+alter table public.trip_routes enable row level security;
 alter table public.mobile_violations enable row level security;
 alter table public.violation_appeals enable row level security;
 
@@ -822,6 +882,67 @@ begin
     for select
     to authenticated
     using (true);
+  end if;
+end $$;
+
+do $$
+begin
+  insert into storage.buckets (id, name, public)
+  values ('driver-avatars', 'driver-avatars', true)
+  on conflict (id) do nothing;
+exception
+  when undefined_table then null;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'storage'
+      and tablename = 'objects'
+      and policyname = 'public_can_read_driver_avatars'
+  ) then
+    create policy public_can_read_driver_avatars
+    on storage.objects
+    for select
+    to public
+    using (bucket_id = 'driver-avatars');
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'storage'
+      and tablename = 'objects'
+      and policyname = 'public_can_upload_driver_avatars'
+  ) then
+    create policy public_can_upload_driver_avatars
+    on storage.objects
+    for insert
+    to anon, authenticated
+    with check (bucket_id = 'driver-avatars');
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'storage'
+      and tablename = 'objects'
+      and policyname = 'public_can_update_driver_avatars'
+  ) then
+    create policy public_can_update_driver_avatars
+    on storage.objects
+    for update
+    to anon, authenticated
+    using (bucket_id = 'driver-avatars')
+    with check (bucket_id = 'driver-avatars');
   end if;
 end $$;
 
@@ -882,6 +1003,7 @@ grant execute on function public.upsert_driver_location(
 ) to anon, authenticated;
 
 grant execute on function public.set_driver_location_offline(bigint) to anon, authenticated;
+grant execute on function public.set_driver_avatar(bigint, text) to anon, authenticated;
 
 do $$
 begin

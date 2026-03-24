@@ -1,5 +1,6 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import MapView, { Marker, Polygon, Polyline } from 'react-native-maps';
+import { smoothDisplayedRoutePath } from '../../lib/roadPath';
 
 type LatLng = { latitude: number; longitude: number };
 
@@ -17,19 +18,20 @@ type TripRouteMapProps = {
 
 export function TripRouteMap({ routePath, geofence, style, getRouteRegion }: TripRouteMapProps) {
   const mapRef = useRef<MapView | null>(null);
+  const displayRoutePath = useMemo(() => smoothDisplayedRoutePath(routePath), [routePath]);
 
   useEffect(() => {
-    if (!mapRef.current || routePath.length < 2) {
+    if (!mapRef.current || displayRoutePath.length < 2) {
       return;
     }
     const timer = setTimeout(() => {
-      mapRef.current?.fitToCoordinates(routePath, {
+      mapRef.current?.fitToCoordinates(displayRoutePath, {
         edgePadding: { top: 30, right: 30, bottom: 30, left: 30 },
         animated: false,
       });
     }, 30);
     return () => clearTimeout(timer);
-  }, [routePath]);
+  }, [displayRoutePath]);
 
   return (
     <MapView
@@ -38,7 +40,7 @@ export function TripRouteMap({ routePath, geofence, style, getRouteRegion }: Tri
       }}
       style={style}
       pointerEvents="none"
-      initialRegion={getRouteRegion(routePath)}
+      initialRegion={getRouteRegion(displayRoutePath)}
       mapType="standard"
       rotateEnabled={false}
       scrollEnabled
@@ -48,18 +50,18 @@ export function TripRouteMap({ routePath, geofence, style, getRouteRegion }: Tri
         if (!mapRef.current) {
           return;
         }
-        if (routePath.length > 1) {
-          mapRef.current.fitToCoordinates([...geofence, ...routePath], {
+        if (displayRoutePath.length > 1) {
+          mapRef.current.fitToCoordinates([...geofence, ...displayRoutePath], {
             // Slightly zoomed out so route and geofence are both visible on open.
             edgePadding: { top: 92, right: 36, bottom: 340, left: 36 },
             animated: false,
           });
           return;
         }
-        if (routePath.length === 1) {
+        if (displayRoutePath.length === 1) {
           mapRef.current.animateCamera(
             {
-              center: routePath[0],
+              center: displayRoutePath[0],
               zoom: 18,
               pitch: 45,
               heading: 0,
@@ -69,20 +71,20 @@ export function TripRouteMap({ routePath, geofence, style, getRouteRegion }: Tri
         }
       }}
     >
-      {routePath.length > 1 ? (
+      {displayRoutePath.length > 1 ? (
         <Polyline
-          coordinates={routePath}
+          coordinates={displayRoutePath}
           strokeColor="#2D7DF6"
           strokeWidth={4}
           lineCap="round"
           lineJoin="round"
         />
       ) : null}
-      {routePath.length > 0 ? (
-        <Marker coordinate={routePath[0]} title="Start" pinColor="#10B981" />
+      {displayRoutePath.length > 0 ? (
+        <Marker coordinate={displayRoutePath[0]} title="Start" pinColor="#10B981" />
       ) : null}
-      {routePath.length > 1 ? (
-        <Marker coordinate={routePath[routePath.length - 1]} title="End" pinColor="#3B82F6" />
+      {displayRoutePath.length > 1 ? (
+        <Marker coordinate={displayRoutePath[displayRoutePath.length - 1]} title="End" pinColor="#3B82F6" />
       ) : null}
       <Polygon
         coordinates={geofence}

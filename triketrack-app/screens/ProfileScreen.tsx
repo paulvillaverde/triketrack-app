@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import { BottomTab, HomeNavigationCard } from '../components/navigation/HomeNavigationCard';
@@ -15,7 +15,11 @@ type ProfileScreenProps = {
   profileContact: string;
   profilePlateNumber: string;
   profileImageUri: string | null;
-  onUpdateProfile: (payload: { name: string; contact: string; imageUri: string | null }) => void;
+  onUpdateProfile: (payload: {
+    name: string;
+    contact: string;
+    imageUri: string | null;
+  }) => void | Promise<void>;
   styles: Record<string, any>;
 };
 
@@ -38,6 +42,7 @@ export function ProfileScreen({
   const [editModalShowAvatar, setEditModalShowAvatar] = useState(false);
   const [termsModalVisible, setTermsModalVisible] = useState(false);
   const [supportModalVisible, setSupportModalVisible] = useState(false);
+  const [isSavingProfile, setIsSavingProfile] = useState(false);
 
   useEffect(() => {
     setDraftName(profileName);
@@ -53,13 +58,20 @@ export function ProfileScreen({
     setEditModalVisible(true);
   };
 
-  const saveProfileChanges = () => {
-    onUpdateProfile({
-      name: draftName.trim() || 'Juan Dela Cruz',
-      contact: draftContact.trim() || '09276096932',
-      imageUri: draftImageUri,
-    });
-    setEditModalVisible(false);
+  const saveProfileChanges = async () => {
+    try {
+      setIsSavingProfile(true);
+      await onUpdateProfile({
+        name: draftName.trim() || 'Juan Dela Cruz',
+        contact: draftContact.trim() || '09276096932',
+        imageUri: draftImageUri,
+      });
+      setEditModalVisible(false);
+    } catch (error) {
+      Alert.alert('Profile Update Error', error instanceof Error ? error.message : 'Unable to save profile.');
+    } finally {
+      setIsSavingProfile(false);
+    }
   };
 
   const pickProfileImage = async () => {
@@ -94,7 +106,14 @@ export function ProfileScreen({
     if (!result.canceled && result.assets.length > 0) {
       const uri = result.assets[0].uri;
       setDraftImageUri(uri);
-      onUpdateProfile({ name: profileName, contact: profileContact, imageUri: uri });
+      try {
+        setIsSavingProfile(true);
+        await onUpdateProfile({ name: profileName, contact: profileContact, imageUri: uri });
+      } catch (error) {
+        Alert.alert('Profile Update Error', error instanceof Error ? error.message : 'Unable to update avatar.');
+      } finally {
+        setIsSavingProfile(false);
+      }
     }
   };
 
@@ -112,6 +131,7 @@ export function ProfileScreen({
               </Pressable>
             </View>
           </View>
+          {isSavingProfile ? <Text style={localStyles.savingText}>Updating profile photo...</Text> : null}
 
           <View style={localStyles.card}>
             <View style={localStyles.cardHeader}>
@@ -254,6 +274,15 @@ const localStyles = StyleSheet.create({
     shadowRadius: 6,
     shadowOffset: { width: 0, height: 2 },
     elevation: 2,
+  },
+  savingText: {
+    marginTop: -2,
+    marginBottom: 10,
+    textAlign: 'center',
+    fontSize: 12,
+    lineHeight: 15,
+    color: '#475569',
+    fontFamily: 'CircularStdMedium500',
   },
   card: {
     backgroundColor: '#FFFFFF',

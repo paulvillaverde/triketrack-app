@@ -3,16 +3,66 @@ import { Alert, Animated, Easing, Platform, Pressable, StyleSheet, Text, View } 
 import { Feather } from '@expo/vector-icons';
 import MapView, {
   AnimatedRegion,
+  Circle,
   MarkerAnimated,
   Polygon,
   Polyline,
   PROVIDER_GOOGLE,
 } from 'react-native-maps';
-import * as Location from 'expo-location';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useNetInfo } from '@react-native-community/netinfo';
 import { BottomTab, HomeNavigationCard } from '../components/navigation/HomeNavigationCard';
+import { HomeDashboardSheet } from '../components/home/HomeDashboardSheet';
+import { StartTripPanel } from '../components/home/StartTripPanel';
+import { DriverAvatarMarker } from '../components/maps/DriverAvatarMarker';
+import { GeofenceViolationBanner } from '../components/maps/GeofenceViolationBanner';
 import { OutsideGeofenceModal } from '../components/modals';
-import { Avatar } from '../components/ui';
+import { getMotionDurationMs, shortestAngleDelta } from '../lib/mapTracking';
+import {
+  dedupeSequentialPoints,
+  fetchMatchedRoadPath,
+  fetchNearestRoadPoint,
+  fetchRoutedRoadPath,
+  polylineDistanceKm,
+  smoothDisplayedRoutePath,
+  type LatLngPoint,
+} from '../lib/roadPath';
+import { startLiveGpsTracker } from '../lib/liveGpsTracker';
+import {
+  averagePoints,
+  buildRandomSimulationWaypoints,
+  COARSE_FIRST_FIX_ACCURACY_METERS,
+  DARK_MAP_STYLE,
+  ENABLE_TRIP_SIMULATION,
+  FAST_START_REQUIRED_ACCURACY_METERS,
+  formatPeso,
+  HIGH_CONFIDENCE_ACCURACY_METERS,
+  INITIAL_LOCATION_TIMEOUT_MS,
+  INITIAL_VISIBLE_ACCURACY_METERS,
+  isPointInsidePolygon,
+  isValidCoordinate,
+  LAST_KNOWN_MAX_AGE_MS,
+  LAST_KNOWN_REQUIRED_ACCURACY_METERS,
+  MAP_TYPE_OPTIONS,
+  MAX_ACCEPTED_ACCURACY_METERS,
+  MAX_ACCEPTED_SPEED_KMH,
+  MAX_LOCATION_JUMP_KM,
+  MAX_POINT_GAP_KM,
+  MAX_STATIONARY_SPEED_KMH,
+  mergeRouteSegment,
+  MIN_ROAD_MATCH_POINTS,
+  MIN_SNAPPED_MOVE_KM,
+  MIN_TRACK_MOVE_KM,
+  MOVEMENT_CONFIRMATION_COUNT,
+  NORMAL_CAMERA,
+  OBRERO_GEOFENCE,
+  ROAD_MATCH_BATCH_SIZE,
+  type MapTypeOption,
+  TRIP_CAMERA_FOLLOW_INTERVAL_MS,
+  WATCH_LOCATION_INTERVAL_MS,
+} from './homeScreenShared';
+
+export type { MapTypeOption } from './homeScreenShared';
 
 type HomeScreenProps = {
   onLogout?: () => void;
@@ -22,7 +72,10 @@ type HomeScreenProps = {
   onGoOnline: () => void;
   onGoOffline: () => void;
   onBackToHome: () => void;
+  onOpenSimulation?: () => void;
   locationEnabled: boolean;
+  tripOpenPending?: boolean;
+  onLocationVisibilityChange?: (visible: boolean) => void;
   onTripComplete: (payload: {
     fare: number;
     distanceKm: number;
@@ -31,6 +84,11 @@ type HomeScreenProps = {
     endLocation: { latitude: number; longitude: number } | null;
   }) => void;
   onTripStart?: (payload: { startLocation: { latitude: number; longitude: number } | null }) => void;
+  onTripPointRecord?: (payload: {
+    latitude: number;
+    longitude: number;
+    recordedAt: string;
+  }) => void;
   onGeofenceExit?: (payload: { location: { latitude: number; longitude: number } | null }) => void;
   totalEarnings: number;
   totalTrips: number;
@@ -45,259 +103,6 @@ type HomeScreenProps = {
   styles: Record<string, any>;
 };
 
-const OBRERO_GEOFENCE = [
-  { latitude: 7.0849408, longitude: 125.6121403 }, // 1) McDonald's Davao Bajada (Lacson St)
-  { latitude: 7.0861485, longitude: 125.6130254 }, // 2) San Roque Central Elementary School
-  { latitude: 7.09253, longitude: 125.61713 }, // 3) Queensland Hotel Davao (Dacudao area)
-  { latitude: 7.0832297, longitude: 125.6242034 }, // 4) AUB Agdao
-  { latitude: 7.0771506, longitude: 125.6170807 }, // 5) Sta. Ana Shrine Parish Church
-  { latitude: 7.0776251, longitude: 125.6141467 }, // 6) Gaisano Mall of Davao
-  { latitude: 7.0835656, longitude: 125.6126754 }, // 7) Bajada Suites
-];
-
-const NORMAL_CAMERA = {
-  zoom: 14,
-  pitch: 0,
-  heading: 0,
-} as const;
-const MIN_TRACK_MOVE_KM = 0.01;
-const MAX_ACCEPTED_ACCURACY_METERS = 20;
-const MAX_ACCEPTED_SPEED_KMH = 95;
-const MAX_STATIONARY_SPEED_KMH = 3;
-const MIN_SNAPPED_MOVE_KM = 0.008;
-const ROAD_MATCH_BATCH_SIZE = 8;
-const GOOGLE_MAPS_ROADS_API_KEY =
-  process.env.EXPO_PUBLIC_GOOGLE_MAPS_ROADS_API_KEY ?? process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY ?? '';
-type LatLngPoint = { latitude: number; longitude: number };
-
-const isPointInsidePolygon = (
-  point: { latitude: number; longitude: number },
-  polygon: Array<{ latitude: number; longitude: number }>,
-) => {
-  let inside = false;
-  const x = point.longitude;
-  const y = point.latitude;
-
-  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-    const xi = polygon[i].longitude;
-    const yi = polygon[i].latitude;
-    const xj = polygon[j].longitude;
-    const yj = polygon[j].latitude;
-    const intersects = yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi;
-    if (intersects) {
-      inside = !inside;
-    }
-  }
-
-  return inside;
-};
-
-const formatPeso = (amount: number) =>
-  `\u20B1${amount.toLocaleString('en-PH', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
-
-const mergeRouteSegment = (current: LatLngPoint[], segment: LatLngPoint[]) => {
-  if (segment.length === 0) {
-    return current;
-  }
-  if (current.length === 0) {
-    return segment;
-  }
-
-  const last = current[current.length - 1];
-  const first = segment[0];
-  const samePoint =
-    Math.abs(last.latitude - first.latitude) < 0.00001 &&
-    Math.abs(last.longitude - first.longitude) < 0.00001;
-
-  return samePoint ? [...current, ...segment.slice(1)] : [...current, ...segment];
-};
-
-const polylineDistanceKm = (points: LatLngPoint[]) => {
-  if (points.length < 2) {
-    return 0;
-  }
-
-  let total = 0;
-  for (let index = 1; index < points.length; index += 1) {
-    const from = points[index - 1];
-    const to = points[index];
-    const earthRadiusKm = 6371;
-    const toRad = (value: number) => (value * Math.PI) / 180;
-    const dLat = toRad(to.latitude - from.latitude);
-    const dLon = toRad(to.longitude - from.longitude);
-    const lat1 = toRad(from.latitude);
-    const lat2 = toRad(to.latitude);
-    const a =
-      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-      Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    total += earthRadiusKm * c;
-  }
-
-  return total;
-};
-
-const fetchMatchedRoadPath = async (points: LatLngPoint[]) => {
-  if (points.length === 0) {
-    return null;
-  }
-
-  if (points.length === 1) {
-    return [points[0]];
-  }
-
-  if (GOOGLE_MAPS_ROADS_API_KEY) {
-    const path = points.map((point) => `${point.latitude},${point.longitude}`).join('|');
-    const url =
-      `https://roads.googleapis.com/v1/snapToRoads?interpolate=true&path=${encodeURIComponent(path)}` +
-      `&key=${GOOGLE_MAPS_ROADS_API_KEY}`;
-
-    try {
-      const response = await fetch(url);
-      if (!response.ok) {
-        return null;
-      }
-
-      const json = (await response.json()) as {
-        snappedPoints?: Array<{ location?: { latitude?: number; longitude?: number } }>;
-      };
-      const snappedPoints = json.snappedPoints
-        ?.map((point) => {
-          const latitude = point.location?.latitude;
-          const longitude = point.location?.longitude;
-          if (typeof latitude !== 'number' || typeof longitude !== 'number') {
-            return null;
-          }
-          return { latitude, longitude };
-        })
-        .filter((point): point is LatLngPoint => point !== null);
-
-      return snappedPoints && snappedPoints.length > 0 ? snappedPoints : null;
-    } catch {
-      return null;
-    }
-  }
-
-  const coordinates = points.map((point) => `${point.longitude},${point.latitude}`).join(';');
-  const url =
-    `https://router.project-osrm.org/match/v1/driving/${coordinates}` +
-    `?overview=full&geometries=geojson&gaps=ignore&tidy=true`;
-
-  try {
-    const response = await fetch(url);
-    if (!response.ok) {
-      return null;
-    }
-
-    const json = (await response.json()) as {
-      matchings?: Array<{ geometry?: { coordinates?: number[][] } }>;
-    };
-    const matchedCoordinates = json.matchings?.flatMap((matching) => matching.geometry?.coordinates ?? []);
-    if (!matchedCoordinates || matchedCoordinates.length === 0) {
-      return null;
-    }
-
-    return matchedCoordinates
-      .filter((point) => Array.isArray(point) && point.length >= 2)
-      .map((point) => ({
-        latitude: point[1],
-        longitude: point[0],
-      }));
-  } catch {
-    return null;
-  }
-};
-
-const fetchNearestRoadPoint = async (point: LatLngPoint) => {
-  if (GOOGLE_MAPS_ROADS_API_KEY) {
-    const url =
-      `https://roads.googleapis.com/v1/nearestRoads?points=${point.latitude},${point.longitude}` +
-      `&key=${GOOGLE_MAPS_ROADS_API_KEY}`;
-
-    try {
-      const response = await fetch(url);
-      if (!response.ok) {
-        return null;
-      }
-
-      const json = (await response.json()) as {
-        snappedPoints?: Array<{ location?: { latitude?: number; longitude?: number } }>;
-      };
-      const location = json.snappedPoints?.[0]?.location;
-      if (typeof location?.latitude !== 'number' || typeof location?.longitude !== 'number') {
-        return null;
-      }
-
-      return {
-        latitude: location.latitude,
-        longitude: location.longitude,
-      };
-    } catch {
-      return null;
-    }
-  }
-
-  const url =
-    `https://router.project-osrm.org/nearest/v1/driving/` +
-    `${point.longitude},${point.latitude}?number=1`;
-
-  try {
-    const response = await fetch(url);
-    if (!response.ok) {
-      return null;
-    }
-
-    const json = (await response.json()) as {
-      waypoints?: Array<{ location?: [number, number] }>;
-    };
-    const location = json.waypoints?.[0]?.location;
-    if (!location || location.length < 2) {
-      return null;
-    }
-
-    return {
-      latitude: location[1],
-      longitude: location[0],
-    };
-  } catch {
-    return null;
-  }
-};
-
-const DARK_MAP_STYLE = [
-  { elementType: 'geometry', stylers: [{ color: '#1d2c4d' }] },
-  { elementType: 'labels.text.fill', stylers: [{ color: '#8ec3b9' }] },
-  { elementType: 'labels.text.stroke', stylers: [{ color: '#1a3646' }] },
-  { featureType: 'administrative.country', elementType: 'geometry.stroke', stylers: [{ color: '#4b6878' }] },
-  { featureType: 'administrative.land_parcel', elementType: 'labels.text.fill', stylers: [{ color: '#64779e' }] },
-  { featureType: 'administrative.province', elementType: 'geometry.stroke', stylers: [{ color: '#4b6878' }] },
-  { featureType: 'landscape.man_made', elementType: 'geometry.stroke', stylers: [{ color: '#334e87' }] },
-  { featureType: 'landscape.natural', elementType: 'geometry', stylers: [{ color: '#023e58' }] },
-  { featureType: 'poi', elementType: 'geometry', stylers: [{ color: '#283d6a' }] },
-  { featureType: 'poi', elementType: 'labels.text.fill', stylers: [{ color: '#6f9ba5' }] },
-  { featureType: 'poi', elementType: 'labels.text.stroke', stylers: [{ color: '#1d2c4d' }] },
-  { featureType: 'poi.park', elementType: 'geometry.fill', stylers: [{ color: '#023e58' }] },
-  { featureType: 'poi.park', elementType: 'labels.text.fill', stylers: [{ color: '#3C7680' }] },
-  { featureType: 'road', elementType: 'geometry', stylers: [{ color: '#304a7d' }] },
-  { featureType: 'road', elementType: 'labels.text.fill', stylers: [{ color: '#98a5be' }] },
-  { featureType: 'road', elementType: 'labels.text.stroke', stylers: [{ color: '#1d2c4d' }] },
-  { featureType: 'road.highway', elementType: 'geometry', stylers: [{ color: '#2c6675' }] },
-  { featureType: 'road.highway', elementType: 'geometry.stroke', stylers: [{ color: '#255763' }] },
-  { featureType: 'road.highway', elementType: 'labels.text.fill', stylers: [{ color: '#b0d5ce' }] },
-  { featureType: 'road.highway', elementType: 'labels.text.stroke', stylers: [{ color: '#023e58' }] },
-  { featureType: 'transit', elementType: 'labels.text.fill', stylers: [{ color: '#98a5be' }] },
-  { featureType: 'transit', elementType: 'labels.text.stroke', stylers: [{ color: '#1d2c4d' }] },
-  { featureType: 'transit.line', elementType: 'geometry.fill', stylers: [{ color: '#283d6a' }] },
-  { featureType: 'transit.station', elementType: 'geometry', stylers: [{ color: '#3a4762' }] },
-  { featureType: 'water', elementType: 'geometry', stylers: [{ color: '#0e1626' }] },
-  { featureType: 'water', elementType: 'labels.text.fill', stylers: [{ color: '#4e6d70' }] },
-] as const;
-
-export const MAP_TYPE_OPTIONS = ['default', 'satellite', 'dark'] as const;
-export type MapTypeOption = (typeof MAP_TYPE_OPTIONS)[number];
 
 export function HomeScreen({
   onLogout,
@@ -307,9 +112,13 @@ export function HomeScreen({
   onGoOnline,
   onGoOffline,
   onBackToHome,
+  onOpenSimulation,
   locationEnabled,
+  tripOpenPending = false,
+  onLocationVisibilityChange,
   onTripComplete,
   onTripStart,
+  onTripPointRecord,
   onGeofenceExit,
   totalEarnings,
   totalTrips,
@@ -326,35 +135,54 @@ export function HomeScreen({
   const mapRef = useRef<MapView | null>(null);
   const markerRef = useRef<any>(null);
   const insets = useSafeAreaInsets();
+  const netInfo = useNetInfo();
   const [hasCentered, setHasCentered] = useState(false);
   const [coords, setCoords] = useState<{ latitude: number; longitude: number } | null>(null);
   const [farePickerOpen, setFarePickerOpen] = useState(false);
   const [showOutsideGeofenceModal, setShowOutsideGeofenceModal] = useState(false);
   const [selectedFare, setSelectedFare] = useState(10);
   const [isTripStarted, setIsTripStarted] = useState(false);
+  const [isSimulatingTrip, setIsSimulatingTrip] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [distanceKm, setDistanceKm] = useState(0);
   const [speedKmh, setSpeedKmh] = useState(0);
+  const [isResolvingAccurateLocation, setIsResolvingAccurateLocation] = useState(false);
+  const [shouldTrackMarkerViewChanges, setShouldTrackMarkerViewChanges] = useState(true);
+  const [displayAccuracyMeters, setDisplayAccuracyMeters] = useState<number | null>(null);
+  const [firstFixDurationMs, setFirstFixDurationMs] = useState<number | null>(null);
+  const [lastLocationTimestampMs, setLastLocationTimestampMs] = useState<number | null>(null);
+  const [locationFreshnessSeconds, setLocationFreshnessSeconds] = useState(0);
   const [lastTrackPoint, setLastTrackPoint] = useState<{ latitude: number; longitude: number } | null>(null);
   const [routePoints, setRoutePoints] = useState<Array<{ latitude: number; longitude: number }>>([]);
+  const [travelPath, setTravelPath] = useState<Array<{ latitude: number; longitude: number }>>([]);
+  const [startConnectorPoints, setStartConnectorPoints] = useState<Array<{ latitude: number; longitude: number }>>([]);
   const [isInsideGeofence, setIsInsideGeofence] = useState(true);
+  const [hasGeofenceViolation, setHasGeofenceViolation] = useState(false);
   const [headingDeg, setHeadingDeg] = useState(0);
   const isTripStartedRef = useRef(isTripStarted);
   const hasCenteredRef = useRef(hasCentered);
   const lastTrackPointRef = useRef(lastTrackPoint);
   const lastRawTrackPointRef = useRef<LatLngPoint | null>(null);
   const pendingRawPointsRef = useRef<LatLngPoint[]>([]);
+  const recentAcceptedPointsRef = useRef<LatLngPoint[]>([]);
   const routePointsRef = useRef<Array<LatLngPoint>>([]);
-  const locationWatchRef = useRef<Location.LocationSubscription | null>(null);
+  const travelPathRef = useRef<Array<LatLngPoint>>([]);
+  const locationWatchRef = useRef<{ stop: () => void } | null>(null);
   const roadSnapQueueRef = useRef<Promise<void>>(Promise.resolve());
-  const markerSnapQueueRef = useRef<Promise<void>>(Promise.resolve());
   const snappedCoordsRef = useRef<LatLngPoint | null>(null);
+  const simulationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const simulationPointsRef = useRef<LatLngPoint[]>([]);
+  const latestActualCoordsRef = useRef<LatLngPoint | null>(null);
+  const lastCameraFollowAtRef = useRef(0);
   const markerInitializedRef = useRef(false);
   const hasShownExitAlert = useRef(false);
   const headingAnim = useRef(new Animated.Value(0)).current;
   const headingAnimValue = useRef(0);
+  const alertPulse = useRef(new Animated.Value(0)).current;
   const liveHeadingRef = useRef<number | null>(null);
   const lastTrackTimestampMsRef = useRef<number | null>(null);
+  const lastAcceptedSampleRef = useRef<{ point: LatLngPoint; timestampMs: number } | null>(null);
+  const isSimulatingTripRef = useRef(isSimulatingTrip);
   const fareOptions = [10, 20, 30, 40, 50, 60, 70];
   const animatedMarkerCoordinate = useRef(
     new AnimatedRegion({
@@ -364,9 +192,19 @@ export function HomeScreen({
       longitudeDelta: 0,
     }),
   ).current;
+  const lastAnimatedMarkerPointRef = useRef<LatLngPoint | null>(null);
+  const firstFixStartedAtRef = useRef<number | null>(null);
+  const firstFixCapturedRef = useRef(false);
+  const hasLoggedLowAccuracyRef = useRef(false);
+  const hasLoggedInvalidSampleRef = useRef(false);
+  const hasLoggedJumpSampleRef = useRef(false);
+  const lastDisplayPointRef = useRef<LatLngPoint | null>(null);
+  const movementConfirmationCountRef = useRef(0);
 
   const isDarkMap = mapTypeOption === 'dark';
   const activeMapType: 'standard' | 'satellite' = mapTypeOption === 'satellite' ? 'satellite' : 'standard';
+  const hasValidCoords = isValidCoordinate(coords);
+  const isNetworkAvailable = Boolean(netInfo.isConnected && netInfo.isInternetReachable !== false);
 
   const mapTypeLabel = (value: MapTypeOption) => {
     if (value === 'satellite') return 'Satellite';
@@ -387,6 +225,10 @@ export function HomeScreen({
   }, [isTripStarted]);
 
   useEffect(() => {
+    isSimulatingTripRef.current = isSimulatingTrip;
+  }, [isSimulatingTrip]);
+
+  useEffect(() => {
     hasCenteredRef.current = hasCentered;
   }, [hasCentered]);
 
@@ -399,12 +241,51 @@ export function HomeScreen({
   }, [routePoints]);
 
   useEffect(() => {
+    travelPathRef.current = travelPath;
+  }, [travelPath]);
+
+  useEffect(() => {
+    if (travelPath.length > 0 && startConnectorPoints.length > 0) {
+      setStartConnectorPoints([]);
+    }
+  }, [travelPath.length, startConnectorPoints.length]);
+
+  useEffect(() => {
     snappedCoordsRef.current = coords;
+    lastDisplayPointRef.current = coords;
   }, [coords]);
 
   useEffect(() => {
-    if (!coords) {
+    onLocationVisibilityChange?.(hasValidCoords);
+  }, [hasValidCoords, onLocationVisibilityChange]);
+
+  useEffect(() => {
+    setShouldTrackMarkerViewChanges(true);
+    const timeout = setTimeout(() => {
+      setShouldTrackMarkerViewChanges(false);
+    }, 1800);
+
+    return () => clearTimeout(timeout);
+  }, [profileImageUri, profileName]);
+
+  useEffect(() => {
+    if (!hasValidCoords) {
+      return;
+    }
+
+    console.info('[HomeScreen] Rendering driver marker at', coords);
+    setShouldTrackMarkerViewChanges(true);
+    const timeout = setTimeout(() => {
+      setShouldTrackMarkerViewChanges(false);
+    }, 1800);
+
+    return () => clearTimeout(timeout);
+  }, [coords, hasValidCoords]);
+
+  useEffect(() => {
+    if (!hasValidCoords) {
       markerInitializedRef.current = false;
+      lastAnimatedMarkerPointRef.current = null;
       return;
     }
 
@@ -412,6 +293,11 @@ export function HomeScreen({
       latitude: coords.latitude,
       longitude: coords.longitude,
     };
+    const animationDuration = getMotionDurationMs({
+      from: lastAnimatedMarkerPointRef.current,
+      to: nextCoordinate,
+      speedMetersPerSecond: speedKmh > 0 ? speedKmh / 3.6 : null,
+    });
 
     if (!markerInitializedRef.current) {
       markerInitializedRef.current = true;
@@ -420,11 +306,7 @@ export function HomeScreen({
         latitudeDelta: 0,
         longitudeDelta: 0,
       });
-      return;
-    }
-
-    if (Platform.OS === 'android' && markerRef.current?.animateMarkerToCoordinate) {
-      markerRef.current.animateMarkerToCoordinate(nextCoordinate, 650);
+      lastAnimatedMarkerPointRef.current = nextCoordinate;
       return;
     }
 
@@ -433,17 +315,49 @@ export function HomeScreen({
         ...nextCoordinate,
         latitudeDelta: 0,
         longitudeDelta: 0,
-        duration: 650,
+        duration: animationDuration,
         useNativeDriver: false,
       } as any)
       .start();
-  }, [animatedMarkerCoordinate, coords]);
+    lastAnimatedMarkerPointRef.current = nextCoordinate;
+  }, [animatedMarkerCoordinate, coords, hasValidCoords]);
 
   useEffect(() => {
-    if (!isDriverOnline || !locationEnabled) {
+    if (!locationEnabled) {
+      setIsResolvingAccurateLocation(false);
       setCoords(null);
+      setDisplayAccuracyMeters(null);
+      setFirstFixDurationMs(null);
+      setLastLocationTimestampMs(null);
+      setLocationFreshnessSeconds(0);
+      setHasGeofenceViolation(false);
+      firstFixStartedAtRef.current = null;
+      firstFixCapturedRef.current = false;
+      lastCameraFollowAtRef.current = 0;
+      recentAcceptedPointsRef.current = [];
+      lastAcceptedSampleRef.current = null;
+      movementConfirmationCountRef.current = 0;
+      lastDisplayPointRef.current = null;
+      hasLoggedLowAccuracyRef.current = false;
+      hasLoggedInvalidSampleRef.current = false;
+      hasLoggedJumpSampleRef.current = false;
     }
-  }, [isDriverOnline, locationEnabled]);
+  }, [locationEnabled]);
+
+  useEffect(() => {
+    if (!lastLocationTimestampMs) {
+      setLocationFreshnessSeconds(0);
+      return;
+    }
+
+    const updateFreshness = () => {
+      setLocationFreshnessSeconds(Math.max(0, Math.floor((Date.now() - lastLocationTimestampMs) / 1000)));
+    };
+
+    updateFreshness();
+    const timer = setInterval(updateFreshness, 1000);
+    return () => clearInterval(timer);
+  }, [lastLocationTimestampMs]);
 
   const fallbackCenter = {
     latitude: 7.0849408,
@@ -464,21 +378,35 @@ export function HomeScreen({
 
   useEffect(() => {
     if (!isTripScreen) {
+      if (simulationTimeoutRef.current) {
+        clearTimeout(simulationTimeoutRef.current);
+        simulationTimeoutRef.current = null;
+      }
+      setIsSimulatingTrip(false);
       setIsTripStarted(false);
       setElapsedSeconds(0);
       setDistanceKm(0);
       setSpeedKmh(0);
       setLastTrackPoint(null);
       setRoutePoints([]);
+      setTravelPath([]);
+      setStartConnectorPoints([]);
       lastTrackPointRef.current = null;
       lastRawTrackPointRef.current = null;
       pendingRawPointsRef.current = [];
       routePointsRef.current = [];
+      travelPathRef.current = [];
       roadSnapQueueRef.current = Promise.resolve();
-      markerSnapQueueRef.current = Promise.resolve();
       setHeadingDeg(0);
       headingAnimValue.current = 0;
       headingAnim.setValue(0);
+      setIsResolvingAccurateLocation(false);
+      setDisplayAccuracyMeters(null);
+      recentAcceptedPointsRef.current = [];
+      lastAcceptedSampleRef.current = null;
+      movementConfirmationCountRef.current = 0;
+      lastDisplayPointRef.current = null;
+      simulationPointsRef.current = [];
       setFarePickerOpen(false);
       lastTrackTimestampMsRef.current = null;
       setHasCentered(false);
@@ -492,16 +420,39 @@ export function HomeScreen({
   }, [isTripScreen]);
 
   useEffect(() => {
+    return () => {
+      if (simulationTimeoutRef.current) {
+        clearTimeout(simulationTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     if (!isTripScreen || !mapRef.current || isTripStarted) {
       return;
     }
-    // Default Route screen view: show full geofence without requiring manual zoom out.
+    if (hasValidCoords) {
+      mapRef.current.animateCamera(
+        {
+          center: coords,
+          zoom: 17,
+          heading: 0,
+          pitch: 0,
+        },
+        { duration: 450 },
+      );
+      hasCenteredRef.current = true;
+      setHasCentered(true);
+      return;
+    }
+
     mapRef.current.fitToCoordinates(OBRERO_GEOFENCE, {
       edgePadding: { top: 110, right: 52, bottom: 260, left: 52 },
       animated: true,
     });
-    setHasCentered(true);
-  }, [isTripScreen, isTripStarted]);
+    hasCenteredRef.current = false;
+    setHasCentered(false);
+  }, [coords, hasValidCoords, isTripScreen, isTripStarted]);
 
   useEffect(() => {
     const nextHeading = ((headingDeg % 360) + 360) % 360;
@@ -518,6 +469,37 @@ export function HomeScreen({
       useNativeDriver: true,
     }).start();
   }, [headingDeg, headingAnim]);
+
+  useEffect(() => {
+    if (!hasGeofenceViolation) {
+      alertPulse.stopAnimation();
+      alertPulse.setValue(0);
+      return;
+    }
+
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(alertPulse, {
+          toValue: 1,
+          duration: 420,
+          easing: Easing.inOut(Easing.ease),
+          useNativeDriver: true,
+        }),
+        Animated.timing(alertPulse, {
+          toValue: 0,
+          duration: 420,
+          easing: Easing.inOut(Easing.ease),
+          useNativeDriver: true,
+        }),
+      ]),
+    );
+    loop.start();
+
+    return () => {
+      loop.stop();
+      alertPulse.stopAnimation();
+    };
+  }, [alertPulse, hasGeofenceViolation]);
 
   const toRad = (value: number) => (value * Math.PI) / 180;
   const distanceBetweenKm = (
@@ -547,95 +529,434 @@ export function HomeScreen({
     const bearing = (Math.atan2(y, x) * 180) / Math.PI;
     return (bearing + 360) % 360;
   };
-  const shortestAngleDiff = (fromDeg: number, toDeg: number) => {
-    let diff = (((toDeg - fromDeg) % 360) + 360) % 360;
-    if (diff > 180) diff -= 360;
-    return Math.abs(diff);
-  };
 
   const appendRouteSegment = (segment: LatLngPoint[]) => {
-    setRoutePoints((prev) => {
-      const merged = mergeRouteSegment(prev, segment);
-      routePointsRef.current = merged;
-      return merged;
+    const mergedRaw = mergeRouteSegment(routePointsRef.current, segment);
+    routePointsRef.current = mergedRaw;
+    const smoothedDisplayPath = smoothDisplayedRoutePath(mergedRaw);
+    travelPathRef.current = smoothedDisplayPath;
+    setRoutePoints(mergedRaw);
+    setTravelPath(smoothedDisplayPath);
+  };
+
+  const setSimulationRouteProgress = (points: LatLngPoint[]) => {
+    const dedupedPoints = dedupeSequentialPoints(points);
+    const smoothedDisplayPath = smoothDisplayedRoutePath(dedupedPoints);
+    routePointsRef.current = dedupedPoints;
+    travelPathRef.current = smoothedDisplayPath;
+    setRoutePoints(dedupedPoints);
+    setTravelPath(smoothedDisplayPath);
+    const latestPoint = smoothedDisplayPath[smoothedDisplayPath.length - 1] ?? dedupedPoints[dedupedPoints.length - 1] ?? null;
+    lastTrackPointRef.current = latestPoint;
+    setLastTrackPoint(latestPoint);
+    snappedCoordsRef.current = latestPoint;
+    if (latestPoint) {
+      setCoords(latestPoint);
+    }
+  };
+
+  const updateMarkerPosition = (point: LatLngPoint) => {
+    setCoords((prev) => {
+      if (prev && distanceBetweenKm(prev, point) < 0.0015 && !isTripStartedRef.current) {
+        return prev;
+      }
+      return point;
     });
   };
 
-  const updateSnappedMarker = (rawPoint: LatLngPoint) => {
-    markerSnapQueueRef.current = markerSnapQueueRef.current
-      .then(async () => {
-        const snappedPoint = (await fetchNearestRoadPoint(rawPoint)) ?? rawPoint;
-        setCoords((prev) => {
-          if (
-            prev &&
-            distanceBetweenKm(prev, snappedPoint) < 0.002 &&
-            !isTripStartedRef.current
-          ) {
-            return prev;
-          }
-          snappedCoordsRef.current = snappedPoint;
-          return snappedPoint;
+  const getStabilizedPoint = ({
+    point,
+    accuracy,
+  }: {
+    point: LatLngPoint;
+    accuracy?: number | null;
+  }) => {
+    const previousAccepted = lastAcceptedSampleRef.current?.point ?? null;
+    if (!previousAccepted) {
+      recentAcceptedPointsRef.current = [point];
+      return point;
+    }
+
+    const movedKm = distanceBetweenKm(previousAccepted, point);
+    if (movedKm >= 0.02) {
+      recentAcceptedPointsRef.current = [point];
+      return point;
+    }
+
+    const blendFactor =
+      typeof accuracy === 'number' && Number.isFinite(accuracy)
+        ? accuracy <= HIGH_CONFIDENCE_ACCURACY_METERS
+          ? 0.9
+          : accuracy <= MAX_ACCEPTED_ACCURACY_METERS
+            ? 0.72
+            : 0.55
+        : 0.7;
+
+    const stabilizedPoint = {
+      latitude: previousAccepted.latitude + (point.latitude - previousAccepted.latitude) * blendFactor,
+      longitude: previousAccepted.longitude + (point.longitude - previousAccepted.longitude) * blendFactor,
+    };
+    recentAcceptedPointsRef.current = [stabilizedPoint];
+    return stabilizedPoint;
+  };
+
+  const seedVisibleLocation = ({
+    latitude,
+    longitude,
+    accuracy,
+    timestampMs,
+  }: {
+    latitude: number;
+    longitude: number;
+    accuracy?: number | null;
+    timestampMs?: number | null;
+  }) => {
+    const provisionalPoint = { latitude, longitude };
+    if (!isValidCoordinate(provisionalPoint)) {
+      if (!hasLoggedInvalidSampleRef.current) {
+        hasLoggedInvalidSampleRef.current = true;
+        console.warn('[HomeScreen] Ignored invalid seeded location.', {
+          latitude,
+          longitude,
+          accuracy,
+          timestampMs,
         });
-      })
-      .catch(() => {
-        setCoords(rawPoint);
-        snappedCoordsRef.current = rawPoint;
+      }
+      return;
+    }
+    latestActualCoordsRef.current = provisionalPoint;
+    if (isSimulatingTripRef.current) {
+      return;
+    }
+    console.info('[HomeScreen] Seeded visible location.', {
+      latitude,
+      longitude,
+      accuracy,
+      timestampMs,
+    });
+    updateMarkerPosition(provisionalPoint);
+    setIsResolvingAccurateLocation(false);
+    setDisplayAccuracyMeters(typeof accuracy === 'number' ? accuracy : null);
+    setLastLocationTimestampMs(timestampMs ?? Date.now());
+    if (!firstFixCapturedRef.current && firstFixStartedAtRef.current) {
+      firstFixCapturedRef.current = true;
+      setFirstFixDurationMs(Date.now() - firstFixStartedAtRef.current);
+    }
+    if (mapRef.current && !hasCenteredRef.current) {
+      mapRef.current.animateCamera(
+        {
+          center: provisionalPoint,
+          zoom: isTripScreen ? 18 : 16,
+          heading: 0,
+          pitch: 0,
+        },
+        { duration: 450 },
+      );
+      hasCenteredRef.current = true;
+      setHasCentered(true);
+    }
+  };
+
+  const acceptLocationSample = ({
+    latitude,
+    longitude,
+    accuracy,
+    heading,
+    speed,
+    timestampMs,
+  }: {
+    latitude: number;
+    longitude: number;
+    accuracy?: number | null;
+    heading?: number | null;
+    speed?: number | null;
+    timestampMs?: number;
+  }) => {
+    const sampleTimestampMs = timestampMs ?? Date.now();
+    const previousAccepted = lastAcceptedSampleRef.current;
+    const accuracyLimit = previousAccepted
+      ? MAX_ACCEPTED_ACCURACY_METERS
+      : INITIAL_VISIBLE_ACCURACY_METERS;
+    if (
+      typeof accuracy === 'number' &&
+      Number.isFinite(accuracy) &&
+      accuracy > accuracyLimit
+    ) {
+      if (
+        !lastAcceptedSampleRef.current &&
+        !hasValidCoords &&
+        accuracy <= COARSE_FIRST_FIX_ACCURACY_METERS
+      ) {
+        seedVisibleLocation({
+          latitude,
+          longitude,
+          accuracy,
+          timestampMs: sampleTimestampMs,
+        });
+      } else if (!hasLoggedLowAccuracyRef.current) {
+        hasLoggedLowAccuracyRef.current = true;
+        console.warn('[HomeScreen] Rejected low-accuracy GPS sample.', {
+          latitude,
+          longitude,
+          accuracy,
+          accuracyLimit,
+        });
+      }
+      return false;
+    }
+    hasLoggedLowAccuracyRef.current = false;
+
+    const rawPoint = { latitude, longitude };
+    if (!isValidCoordinate(rawPoint)) {
+      if (!hasLoggedInvalidSampleRef.current) {
+        hasLoggedInvalidSampleRef.current = true;
+        console.warn('[HomeScreen] Rejected invalid GPS sample.', {
+          latitude,
+          longitude,
+          accuracy,
+          timestampMs: sampleTimestampMs,
+        });
+      }
+      return false;
+    }
+    hasLoggedInvalidSampleRef.current = false;
+    if (previousAccepted) {
+      const gapKm = distanceBetweenKm(previousAccepted.point, rawPoint);
+      const elapsedSec = Math.max((sampleTimestampMs - previousAccepted.timestampMs) / 1000, 0);
+      if (gapKm > MAX_LOCATION_JUMP_KM && elapsedSec <= 3) {
+        if (!hasLoggedJumpSampleRef.current) {
+          hasLoggedJumpSampleRef.current = true;
+          console.warn('[HomeScreen] Rejected GPS jump sample.', {
+            latitude,
+            longitude,
+            gapKm,
+            elapsedSec,
+          });
+        }
+        return false;
+      }
+    }
+    hasLoggedJumpSampleRef.current = false;
+
+    let stablePoint = getStabilizedPoint({
+      point: rawPoint,
+      accuracy,
+    });
+    const speedKmh =
+      typeof speed === 'number' && Number.isFinite(speed) && speed >= 0 ? speed * 3.6 : null;
+    const lastDisplayPoint = lastDisplayPointRef.current ?? previousAccepted?.point ?? null;
+    if (!isTripStartedRef.current && !isSimulatingTripRef.current && lastDisplayPoint) {
+      const displayGapKm = distanceBetweenKm(lastDisplayPoint, stablePoint);
+      const likelyStationary =
+        displayGapKm < MIN_TRACK_MOVE_KM ||
+        (speedKmh !== null && speedKmh <= MAX_STATIONARY_SPEED_KMH);
+
+      if (likelyStationary) {
+        movementConfirmationCountRef.current = 0;
+        stablePoint = lastDisplayPoint;
+      } else {
+        movementConfirmationCountRef.current += 1;
+        if (movementConfirmationCountRef.current < MOVEMENT_CONFIRMATION_COUNT) {
+          stablePoint = lastDisplayPoint;
+        } else {
+          movementConfirmationCountRef.current = 0;
+        }
+      }
+    }
+
+    latestActualCoordsRef.current = stablePoint;
+    lastAcceptedSampleRef.current = {
+      point: stablePoint,
+      timestampMs: sampleTimestampMs,
+    };
+    setIsResolvingAccurateLocation(false);
+    setDisplayAccuracyMeters(typeof accuracy === 'number' ? accuracy : null);
+    setLastLocationTimestampMs(sampleTimestampMs);
+    if (!firstFixCapturedRef.current && firstFixStartedAtRef.current) {
+      firstFixCapturedRef.current = true;
+      setFirstFixDurationMs(Date.now() - firstFixStartedAtRef.current);
+      console.info('[HomeScreen] First accurate GPS fix acquired.', {
+        latitude: stablePoint.latitude,
+        longitude: stablePoint.longitude,
+        accuracy,
+        fixDurationMs: Date.now() - firstFixStartedAtRef.current,
       });
+    }
+    if (isSimulatingTripRef.current) {
+      return true;
+    }
+    if (!isTripStartedRef.current) {
+      updateMarkerPosition(stablePoint);
+    }
+    if (mapRef.current && !hasCenteredRef.current) {
+      mapRef.current.animateCamera(
+        {
+          center: stablePoint,
+          zoom: isTripScreen ? 18 : 16,
+          heading: 0,
+          pitch: 0,
+        },
+        { duration: 450 },
+      );
+      hasCenteredRef.current = true;
+      setHasCentered(true);
+    } else if (
+      mapRef.current &&
+      !isSimulatingTripRef.current &&
+      !isTripStartedRef.current &&
+      Date.now() - lastCameraFollowAtRef.current >= 800
+    ) {
+      lastCameraFollowAtRef.current = Date.now();
+      mapRef.current.animateCamera(
+        {
+          center: stablePoint,
+          zoom: isTripScreen ? 18 : 16,
+          heading: 0,
+          pitch: 0,
+        },
+        { duration: 500 },
+      );
+    }
+
+    if (typeof heading === 'number' && Number.isFinite(heading) && heading >= 0) {
+      liveHeadingRef.current = heading;
+      setHeadingDeg(heading);
+    }
+    if (
+      typeof speed === 'number' &&
+      Number.isFinite(speed) &&
+      speed >= 0 &&
+      !isTripStartedRef.current
+    ) {
+      setSpeedKmh(speedKmh ?? 0);
+    } else if (!isTripStartedRef.current && speedKmh !== null && speedKmh <= MAX_STATIONARY_SPEED_KMH) {
+      setSpeedKmh(0);
+    }
+
+    applyLocationUpdate({
+      latitude: stablePoint.latitude,
+      longitude: stablePoint.longitude,
+      rawLatitude: rawPoint.latitude,
+      rawLongitude: rawPoint.longitude,
+      heading,
+      accuracy,
+      speed,
+    });
+    return true;
   };
 
   const flushBufferedRoadPoints = (force = false) => {
     if (pendingRawPointsRef.current.length === 0) {
-      return;
+      return roadSnapQueueRef.current;
     }
 
-    if (!force && pendingRawPointsRef.current.length < 1) {
-      return;
+    if (!force && pendingRawPointsRef.current.length < MIN_ROAD_MATCH_POINTS) {
+      return roadSnapQueueRef.current;
     }
 
-    const anchorPoint = lastTrackPointRef.current ?? snappedCoordsRef.current;
+    const anchorPoint = lastTrackPointRef.current;
     const batchPoints = pendingRawPointsRef.current.splice(
       0,
       Math.min(pendingRawPointsRef.current.length, ROAD_MATCH_BATCH_SIZE),
     );
+    if (!force && batchPoints.length < MIN_ROAD_MATCH_POINTS) {
+      pendingRawPointsRef.current = [...batchPoints, ...pendingRawPointsRef.current];
+      return roadSnapQueueRef.current;
+    }
 
     roadSnapQueueRef.current = roadSnapQueueRef.current
       .then(async () => {
         const inputPoints = anchorPoint ? [anchorPoint, ...batchPoints] : batchPoints;
-        const matchedPath = await fetchMatchedRoadPath(inputPoints);
-        const fallbackPoint = batchPoints[batchPoints.length - 1] ?? anchorPoint;
-        const segment =
-          matchedPath && matchedPath.length > 0
-            ? matchedPath
-            : fallbackPoint
-              ? [fallbackPoint]
-              : [];
+        if (inputPoints.length < 2) {
+          return;
+        }
 
-        if (segment.length === 0) {
+        const rawSegment = dedupeSequentialPoints(inputPoints);
+        if (rawSegment.length < 2) {
+          return;
+        }
+
+        const rawSegmentDistanceKm = polylineDistanceKm(rawSegment);
+
+        if (!isNetworkAvailable) {
+          const latestRawPoint = rawSegment[rawSegment.length - 1];
+          appendRouteSegment(rawSegment);
+          updateMarkerPosition(latestRawPoint);
+          snappedCoordsRef.current = latestRawPoint;
+          lastTrackPointRef.current = latestRawPoint;
+          setLastTrackPoint(latestRawPoint);
+          setDistanceKm((prev) => prev + rawSegmentDistanceKm);
+          return;
+        }
+
+        const latestRawPoint = rawSegment[rawSegment.length - 1];
+        const snappedStartPoint = anchorPoint
+          ? (await fetchNearestRoadPoint(anchorPoint)) ?? anchorPoint
+          : rawSegment[0];
+        const snappedEndPoint = (await fetchNearestRoadPoint(latestRawPoint)) ?? latestRawPoint;
+        const snappedWaypoints = dedupeSequentialPoints([snappedStartPoint, snappedEndPoint]);
+        const matchedSegment =
+          snappedWaypoints.length >= 2 ? await fetchRoutedRoadPath(snappedWaypoints) : null;
+        let segment = dedupeSequentialPoints(matchedSegment ?? snappedWaypoints);
+
+        if (segment.length >= 2) {
+          const latestSnappedPoint = segment[segment.length - 1];
+          const snappedDistanceKm = polylineDistanceKm(segment);
+          const endpointOffsetKm = distanceBetweenKm(latestSnappedPoint, latestRawPoint);
+          const looksOverRouted =
+            rawSegmentDistanceKm > 0 &&
+            snappedDistanceKm > Math.max(rawSegmentDistanceKm * 1.45, rawSegmentDistanceKm + 0.02);
+          const endpointTooFar = endpointOffsetKm > 0.03;
+          if (looksOverRouted || endpointTooFar) {
+            segment = snappedWaypoints;
+          }
+        }
+
+        if (segment.length < 2) {
+          const fallbackPoint = batchPoints[batchPoints.length - 1];
+          if (rawSegment.length >= 2) {
+            appendRouteSegment(rawSegment);
+            const latestRawPoint = rawSegment[rawSegment.length - 1];
+            updateMarkerPosition(latestRawPoint);
+            snappedCoordsRef.current = latestRawPoint;
+            lastTrackPointRef.current = latestRawPoint;
+            setLastTrackPoint(latestRawPoint);
+            setDistanceKm((prev) => prev + rawSegmentDistanceKm);
+          } else if (fallbackPoint) {
+            updateMarkerPosition(fallbackPoint);
+          }
           return;
         }
 
         const latestPoint = segment[segment.length - 1];
         const previousPoint = anchorPoint ?? segment[0];
+        if (previousPoint && distanceBetweenKm(previousPoint, latestPoint) > MAX_POINT_GAP_KM) {
+          return;
+        }
+
         const segmentDistanceKm = polylineDistanceKm(segment);
 
         appendRouteSegment(segment);
         lastTrackPointRef.current = latestPoint;
         setLastTrackPoint(latestPoint);
         snappedCoordsRef.current = latestPoint;
-        setCoords(latestPoint);
 
         if (segmentDistanceKm >= MIN_SNAPPED_MOVE_KM) {
           const movementHeading = headingBetweenDeg(previousPoint, latestPoint);
           const lastLiveHeading = liveHeadingRef.current;
           const shouldUpdateHeading =
-            lastLiveHeading === null || shortestAngleDiff(lastLiveHeading, movementHeading) >= 4;
+            lastLiveHeading === null || Math.abs(shortestAngleDelta(lastLiveHeading, movementHeading)) >= 4;
           if (shouldUpdateHeading) {
             liveHeadingRef.current = movementHeading;
             setHeadingDeg(movementHeading);
           }
 
           setDistanceKm((prev) => prev + segmentDistanceKm);
-          if (mapRef.current) {
+          if (
+            mapRef.current &&
+            Date.now() - lastCameraFollowAtRef.current >= TRIP_CAMERA_FOLLOW_INTERVAL_MS
+          ) {
+            lastCameraFollowAtRef.current = Date.now();
             mapRef.current.animateCamera(
               {
                 center: latestPoint,
@@ -643,7 +964,7 @@ export function HomeScreen({
                 heading: 0,
                 pitch: 0,
               },
-              { duration: 650 },
+              { duration: 450 },
             );
           }
         }
@@ -654,50 +975,57 @@ export function HomeScreen({
       })
       .catch(() => {
         const fallbackPoint = batchPoints[batchPoints.length - 1];
-        if (!fallbackPoint) {
-          return;
+        if (fallbackPoint) {
+          updateMarkerPosition(fallbackPoint);
         }
-
-        appendRouteSegment([fallbackPoint]);
-        lastTrackPointRef.current = fallbackPoint;
-        setLastTrackPoint(fallbackPoint);
-        snappedCoordsRef.current = fallbackPoint;
-        setCoords(fallbackPoint);
       });
+
+    return roadSnapQueueRef.current;
   };
 
   const applyLocationUpdate = (coordinate: {
     latitude: number;
     longitude: number;
+    rawLatitude?: number | null;
+    rawLongitude?: number | null;
     heading?: number | null;
     accuracy?: number | null;
     speed?: number | null;
   }) => {
-    if (!isDriverOnline || !locationEnabled) {
+    if (!locationEnabled || (!isDriverOnline && !isTripStartedRef.current)) {
       return;
     }
 
     const next = { latitude: coordinate.latitude, longitude: coordinate.longitude };
-    if (!isTripStartedRef.current) {
-      updateSnappedMarker(next);
-    }
 
     const insideBoundary = isPointInsidePolygon(next, OBRERO_GEOFENCE);
     setIsInsideGeofence(insideBoundary);
+    setHasGeofenceViolation(!insideBoundary);
     const gpsAccuracyMeters =
       typeof coordinate.accuracy === 'number' ? coordinate.accuracy : null;
+    const rawTrackPoint = {
+      latitude:
+        typeof coordinate.rawLatitude === 'number' ? coordinate.rawLatitude : next.latitude,
+      longitude:
+        typeof coordinate.rawLongitude === 'number' ? coordinate.rawLongitude : next.longitude,
+    };
     const speedFromGpsKmh =
       typeof coordinate.speed === 'number' && coordinate.speed >= 0
         ? coordinate.speed * 3.6
         : null;
 
     if (isTripStartedRef.current) {
+      onTripPointRecord?.({
+        latitude: rawTrackPoint.latitude,
+        longitude: rawTrackPoint.longitude,
+        recordedAt: new Date().toISOString(),
+      });
+
       const prevRawPoint = lastRawTrackPointRef.current;
       if (!prevRawPoint) {
         lastRawTrackPointRef.current = next;
         pendingRawPointsRef.current = [next];
         lastTrackTimestampMsRef.current = Date.now();
-        flushBufferedRoadPoints(true);
       } else {
         if (
           gpsAccuracyMeters !== null &&
@@ -716,7 +1044,7 @@ export function HomeScreen({
             ? speedFromGpsKmh
             : computedSpeedKmh;
 
-        if (effectiveSpeedKmh > MAX_ACCEPTED_SPEED_KMH) {
+        if (movedKm > MAX_POINT_GAP_KM || effectiveSpeedKmh > MAX_ACCEPTED_SPEED_KMH) {
           return;
         }
 
@@ -734,11 +1062,27 @@ export function HomeScreen({
         pendingRawPointsRef.current.push(next);
         flushBufferedRoadPoints();
       }
+
+      if (
+        mapRef.current &&
+        Date.now() - lastCameraFollowAtRef.current >= TRIP_CAMERA_FOLLOW_INTERVAL_MS
+      ) {
+        const displayPoint = snappedCoordsRef.current ?? next;
+        lastCameraFollowAtRef.current = Date.now();
+        mapRef.current.animateCamera(
+          {
+            center: displayPoint,
+            zoom: 18,
+            heading: 0,
+            pitch: 0,
+          },
+          { duration: 400 },
+        );
+      }
     }
 
     if (isTripStartedRef.current && !insideBoundary && !hasShownExitAlert.current) {
       hasShownExitAlert.current = true;
-      Alert.alert('Geofence Alert', 'You are outside the Obrero geofence boundary.');
       onGeofenceExit?.({
         location: { latitude: next.latitude, longitude: next.longitude },
       });
@@ -763,109 +1107,183 @@ export function HomeScreen({
   };
 
   useEffect(() => {
-    if (!isTripScreen || !isDriverOnline || !locationEnabled) {
-      locationWatchRef.current?.remove();
+    if (!locationEnabled) {
+      locationWatchRef.current?.stop();
       locationWatchRef.current = null;
       return;
     }
 
     let cancelled = false;
 
+    setIsResolvingAccurateLocation(true);
+    firstFixStartedAtRef.current = Date.now();
+    firstFixCapturedRef.current = false;
+    setFirstFixDurationMs(null);
+
     void (async () => {
-      try {
-        const sub = await Location.watchPositionAsync(
-          {
-            accuracy: Location.Accuracy.High,
-            timeInterval: 1000,
-            distanceInterval: 1,
-          },
-          (loc) => {
-            if (cancelled) return;
-            applyLocationUpdate({
-              latitude: loc.coords.latitude,
-              longitude: loc.coords.longitude,
-              heading: loc.coords.heading,
-              accuracy: loc.coords.accuracy,
-              speed: loc.coords.speed,
+      const tracker = await startLiveGpsTracker({
+        minMoveMeters: MIN_TRACK_MOVE_KM * 1000,
+        initialTimeoutMs: INITIAL_LOCATION_TIMEOUT_MS,
+        watchIntervalMs: WATCH_LOCATION_INTERVAL_MS,
+        lastKnownMaxAgeMs: LAST_KNOWN_MAX_AGE_MS,
+        lastKnownRequiredAccuracyMeters: LAST_KNOWN_REQUIRED_ACCURACY_METERS,
+        onSeed: (sample) => {
+          if (cancelled) {
+            return;
+          }
+
+          const accepted = acceptLocationSample({
+            latitude: sample.latitude,
+            longitude: sample.longitude,
+            heading: sample.heading,
+            accuracy: sample.accuracy,
+            speed: sample.speed,
+            timestampMs: sample.timestampMs,
+          });
+
+          if (
+            !accepted &&
+            typeof sample.accuracy === 'number' &&
+            sample.accuracy <= FAST_START_REQUIRED_ACCURACY_METERS
+          ) {
+            seedVisibleLocation({
+              latitude: sample.latitude,
+              longitude: sample.longitude,
+              accuracy: sample.accuracy,
+              timestampMs: sample.timestampMs,
             });
-          },
-        );
+          }
+        },
+        onUpdate: (sample) => {
+          if (cancelled) {
+            return;
+          }
 
-        if (cancelled) {
-          sub.remove();
-          return;
-        }
+          const accepted = acceptLocationSample({
+            latitude: sample.latitude,
+            longitude: sample.longitude,
+            heading: sample.heading,
+            accuracy: sample.accuracy,
+            speed: sample.speed,
+            timestampMs: sample.timestampMs,
+          });
 
-        locationWatchRef.current?.remove();
-        locationWatchRef.current = sub;
-      } catch {
-        // Permission/availability is handled in the parent flow.
+          if (
+            !accepted &&
+            !lastAcceptedSampleRef.current &&
+            typeof sample.accuracy === 'number' &&
+            sample.accuracy <= FAST_START_REQUIRED_ACCURACY_METERS
+          ) {
+            seedVisibleLocation({
+              latitude: sample.latitude,
+              longitude: sample.longitude,
+              accuracy: sample.accuracy,
+              timestampMs: sample.timestampMs,
+            });
+          }
+        },
+      });
+
+      if (cancelled) {
+        tracker.stop();
+        return;
       }
+
+      locationWatchRef.current?.stop();
+      locationWatchRef.current = tracker;
     })();
 
     return () => {
       cancelled = true;
-      locationWatchRef.current?.remove();
+      locationWatchRef.current?.stop();
       locationWatchRef.current = null;
+      setIsResolvingAccurateLocation(false);
     };
-  }, [isTripScreen, isDriverOnline, locationEnabled]);
+  }, [locationEnabled]);
 
   const minutesText = `${Math.floor(elapsedSeconds / 60)}:${String(elapsedSeconds % 60).padStart(2, '0')}`;
   const kmText = distanceKm.toFixed(2);
 
-  const handleTripButtonPress = () => {
-    if (!isTripStarted) {
-      setIsTripStarted(true);
-      onTripStart?.({
-        startLocation: coords ? { latitude: coords.latitude, longitude: coords.longitude } : null,
-      });
-      setElapsedSeconds(0);
-      setDistanceKm(0);
-      setSpeedKmh(0);
-      // Use the first actual GPS fix as baseline to avoid a big initial jump.
-      setLastTrackPoint(coords);
-      lastTrackPointRef.current = coords;
-      lastRawTrackPointRef.current = null;
-      pendingRawPointsRef.current = [];
-      setRoutePoints(coords ? [coords] : []);
-      routePointsRef.current = coords ? [coords] : [];
-      snappedCoordsRef.current = coords;
-      roadSnapQueueRef.current = Promise.resolve();
-      markerSnapQueueRef.current = Promise.resolve();
-      lastTrackTimestampMsRef.current = Date.now();
-      if (coords && mapRef.current) {
-        mapRef.current.animateCamera(
-          {
-            center: coords,
-            zoom: 18,
-            heading: 0,
-            pitch: 0,
-          },
-          { duration: 850 },
-        );
+  const beginTripSession = async (startLocation = coords) => {
+    setIsTripStarted(true);
+    onTripStart?.({
+      startLocation: startLocation ? { latitude: startLocation.latitude, longitude: startLocation.longitude } : null,
+    });
+    setElapsedSeconds(0);
+    setDistanceKm(0);
+    setSpeedKmh(0);
+    setLastTrackPoint(startLocation);
+    lastTrackPointRef.current = startLocation;
+    lastRawTrackPointRef.current = startLocation;
+    pendingRawPointsRef.current = [];
+    setRoutePoints([]);
+    setTravelPath([]);
+    setStartConnectorPoints([]);
+    routePointsRef.current = [];
+    travelPathRef.current = [];
+    snappedCoordsRef.current = null;
+    roadSnapQueueRef.current = Promise.resolve();
+    lastTrackTimestampMsRef.current = Date.now();
+
+      if (startLocation) {
+        const nearestRoadPoint = await fetchNearestRoadPoint(startLocation);
+        if (nearestRoadPoint) {
+          const connectorDistanceKm = distanceBetweenKm(startLocation, nearestRoadPoint);
+          if (connectorDistanceKm > 0.00002 && connectorDistanceKm <= 0.12) {
+            setStartConnectorPoints([startLocation, nearestRoadPoint]);
+            updateMarkerPosition(nearestRoadPoint);
+            snappedCoordsRef.current = nearestRoadPoint;
+            lastTrackPointRef.current = nearestRoadPoint;
+            setLastTrackPoint(nearestRoadPoint);
+          }
+        }
       }
-      return;
+
+    if (startLocation && mapRef.current) {
+      mapRef.current.animateCamera(
+        {
+          center: startLocation,
+          zoom: 18,
+          heading: 0,
+          pitch: 0,
+        },
+        { duration: 850 },
+      );
     }
+  };
+
+  const finishTripSession = async ({ openTripHistory = false }: { openTripHistory?: boolean } = {}) => {
+    await flushBufferedRoadPoints(true);
+    await roadSnapQueueRef.current.catch(() => undefined);
 
     const completedRoutePath =
-      routePointsRef.current.length > 0
-        ? routePointsRef.current
-        : coords
-          ? [{ latitude: coords.latitude, longitude: coords.longitude }]
-          : [];
+      travelPathRef.current.length > 0
+        ? travelPathRef.current
+        : dedupeSequentialPoints(simulationPointsRef.current);
     const endLocation =
       completedRoutePath.length > 0 ? completedRoutePath[completedRoutePath.length - 1] : null;
+    const completedDistanceKm =
+      distanceKm > 0 ? distanceKm : polylineDistanceKm(completedRoutePath);
+    const restoredActualPoint = latestActualCoordsRef.current;
+
+    if (simulationTimeoutRef.current) {
+      clearTimeout(simulationTimeoutRef.current);
+      simulationTimeoutRef.current = null;
+    }
 
     setIsTripStarted(false);
+    setIsSimulatingTrip(false);
     setLastTrackPoint(null);
     lastTrackPointRef.current = null;
     lastRawTrackPointRef.current = null;
     pendingRawPointsRef.current = [];
     setRoutePoints([]);
+    setTravelPath([]);
+    setStartConnectorPoints([]);
     routePointsRef.current = [];
+    travelPathRef.current = [];
     snappedCoordsRef.current = coords;
     roadSnapQueueRef.current = Promise.resolve();
-    markerSnapQueueRef.current = Promise.resolve();
     setElapsedSeconds(0);
     setDistanceKm(0);
     setSpeedKmh(0);
@@ -873,10 +1291,15 @@ export function HomeScreen({
     headingAnimValue.current = 0;
     headingAnim.setValue(0);
     lastTrackTimestampMsRef.current = null;
+    simulationPointsRef.current = [];
+    if (restoredActualPoint) {
+      setCoords(restoredActualPoint);
+      snappedCoordsRef.current = restoredActualPoint;
+    }
     if (mapRef.current) {
       mapRef.current.animateCamera(
         {
-          center: coords ?? fallbackCenter,
+          center: restoredActualPoint ?? coords ?? fallbackCenter,
           zoom: NORMAL_CAMERA.zoom,
           pitch: NORMAL_CAMERA.pitch,
           heading: NORMAL_CAMERA.heading,
@@ -886,14 +1309,109 @@ export function HomeScreen({
     }
     onTripComplete({
       fare: selectedFare,
-      distanceKm,
+      distanceKm: completedDistanceKm,
       durationSeconds: elapsedSeconds,
       routePath: completedRoutePath,
       endLocation,
     });
+
+    if (openTripHistory) {
+      setTimeout(() => {
+        onNavigate?.('trip');
+      }, 250);
+    }
+  };
+
+  const handleTripButtonPress = async () => {
+    if (!isTripStarted) {
+      await beginTripSession(coords);
+      return;
+    }
+
+    await finishTripSession();
+  };
+
+  const handleSimulateTripPress = () => {
+    if (isTripStarted || isSimulatingTrip) {
+      return;
+    }
+
+    void (async () => {
+      const currentActualPoint = latestActualCoordsRef.current ?? coords ?? null;
+      const simulationWaypoints = buildRandomSimulationWaypoints(currentActualPoint);
+      const snappedSimulationRoute =
+        (await fetchRoutedRoadPath(simulationWaypoints)) ??
+        (await fetchMatchedRoadPath(simulationWaypoints)) ??
+        dedupeSequentialPoints(simulationWaypoints);
+      const simulationPoints = snappedSimulationRoute.length > 1
+        ? snappedSimulationRoute
+        : dedupeSequentialPoints(simulationWaypoints);
+      const initialPoint = simulationPoints[0] ?? coords ?? fallbackCenter;
+
+      simulationPointsRef.current = [initialPoint];
+      setIsSimulatingTrip(true);
+      setCoords(initialPoint);
+      await beginTripSession(initialPoint);
+
+      let index = 0;
+      const pushNextPoint = () => {
+        const point = simulationPoints[index];
+        if (!point) {
+          setIsSimulatingTrip(false);
+          simulationTimeoutRef.current = null;
+          void finishTripSession({ openTripHistory: true });
+          return;
+        }
+
+        const nextRoutePath = simulationPoints.slice(0, index + 1);
+        simulationPointsRef.current = nextRoutePath;
+        setSimulationRouteProgress(nextRoutePath);
+
+        if (index > 0) {
+          const previousPoint = simulationPoints[index - 1] ?? point;
+          const segmentHeading = headingBetweenDeg(previousPoint, point);
+          liveHeadingRef.current = segmentHeading;
+          setHeadingDeg(segmentHeading);
+          setDistanceKm(polylineDistanceKm(nextRoutePath));
+          setSpeedKmh(18);
+        } else {
+          setSpeedKmh(0);
+        }
+
+        if (mapRef.current) {
+          mapRef.current.animateCamera(
+            {
+              center: point,
+              zoom: 18,
+              heading: 0,
+              pitch: 0,
+            },
+            { duration: 650 },
+          );
+        }
+
+        index += 1;
+        simulationTimeoutRef.current = setTimeout(pushNextPoint, 700);
+      };
+
+      simulationTimeoutRef.current = setTimeout(pushNextPoint, 250);
+    })();
   };
 
   const distanceSummaryKm = totalDistanceKm.toFixed(2);
+  const alertScale = alertPulse.interpolate({
+    inputRange: [0, 1],
+    outputRange: [1, 1.04],
+  });
+  const alertOpacity = alertPulse.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0.7, 1],
+  });
+  const gpsDebugText = [
+    firstFixDurationMs !== null ? `Fix ${Math.max(0, Math.round(firstFixDurationMs / 100) / 10)}s` : 'Fix --',
+    displayAccuracyMeters !== null ? `Acc ${Math.round(displayAccuracyMeters)}m` : 'Acc --',
+    `Fresh ${locationFreshnessSeconds}s`,
+  ].join('  •  ');
   const handleAdjustZoom = async (delta: number) => {
     if (!mapRef.current) {
       return;
@@ -942,38 +1460,70 @@ export function HomeScreen({
           showsUserLocation={false}
           followsUserLocation={false}
           showsMyLocationButton={false}
+          pitchEnabled={false}
+          rotateEnabled={false}
         >
           <Polygon
             coordinates={OBRERO_GEOFENCE}
-            strokeColor={geofenceStrokeColor}
-            fillColor={geofenceFillColor}
+            strokeColor={hasGeofenceViolation ? '#EF4444' : geofenceStrokeColor}
+            fillColor={hasGeofenceViolation ? 'rgba(239,68,68,0.08)' : geofenceFillColor}
             strokeWidth={2}
           />
-          {isTripScreen && routePoints.length > 1 ? (
+          {coords && displayAccuracyMeters ? (
+            <Circle
+              center={coords}
+              radius={Math.max(displayAccuracyMeters, 6)}
+              strokeColor="rgba(45, 125, 246, 0.35)"
+              fillColor="rgba(45, 125, 246, 0.12)"
+            />
+          ) : null}
+          {isTripScreen && travelPath.length > 1 ? (
             <Polyline
-              coordinates={routePoints}
+              coordinates={travelPath}
               strokeColor="#2D7DF6"
               strokeWidth={6}
               lineCap="round"
               lineJoin="round"
             />
           ) : null}
-          {coords ? (
-            <MarkerAnimated
-              ref={markerRef}
-              coordinate={animatedMarkerCoordinate as any}
-              title="Your Location"
-              anchor={{ x: 0.5, y: 0.5 }}
-              centerOffset={{ x: 0, y: 0 }}
-            >
-              <View style={localStyles.navMarkerWrap}>
-                <View style={localStyles.navAvatarRingOuter}>
-                  <Avatar name={profileName} imageUri={profileImageUri} style={localStyles.navMarkerAvatar} />
-                </View>
-              </View>
+          {isTripScreen && startConnectorPoints.length === 2 ? (
+            <Polyline
+              coordinates={startConnectorPoints}
+              strokeColor="rgba(15,23,42,0.72)"
+              strokeWidth={3}
+              lineCap="round"
+              lineJoin="round"
+              lineDashPattern={[6, 6]}
+            />
+          ) : null}
+        {hasValidCoords ? (
+          <MarkerAnimated
+            ref={markerRef}
+            coordinate={animatedMarkerCoordinate as any}
+            title="Your Location"
+            anchor={{ x: 0.5, y: 0.82 }}
+            centerOffset={{ x: 0, y: 0 }}
+            tracksViewChanges={Platform.OS === 'android' ? true : shouldTrackMarkerViewChanges}
+          >
+            <DriverAvatarMarker
+              heading={headingAnim.interpolate({
+                inputRange: [-360, 360],
+                outputRange: ['-360deg', '360deg'],
+                })}
+                profileName={profileName}
+                profileImageUri={profileImageUri}
+              />
             </MarkerAnimated>
           ) : null}
         </MapView>
+
+        {hasGeofenceViolation ? (
+          <GeofenceViolationBanner
+            opacity={alertOpacity}
+            scale={alertScale}
+            message="The driver is currently outside the geofence boundary."
+          />
+        ) : null}
 
         <Pressable
           style={[
@@ -1008,182 +1558,62 @@ export function HomeScreen({
         ) : null}
 
         {!isTripScreen ? (
-          <>
-            <View style={localStyles.statusBarCard}>
-              <Text style={localStyles.statusTitle}>{isDriverOnline ? 'Online' : 'Offline'}</Text>
-              <View style={localStyles.statusActions}>
-                <Pressable
-                  style={localStyles.statusIconButton}
-                  onPress={() => Alert.alert('Notifications', 'No notifications yet.')}
-                >
-                  <Feather name="bell" size={16} color="#0F172A" />
-                </Pressable>
-
-                <Pressable
-                  style={[
-                    localStyles.statusToggle,
-                    isDriverOnline ? localStyles.statusToggleOn : localStyles.statusToggleOff,
-                  ]}
-                  onPress={() => {
-                    if (isDriverOnline) {
-                      onGoOffline();
-                      return;
-                    }
-                    onGoOnline();
-                  }}
-                >
-                  <View
-                    style={[
-                      localStyles.statusToggleThumb,
-                      isDriverOnline
-                        ? localStyles.statusToggleThumbOn
-                        : localStyles.statusToggleThumbOff,
-                    ]}
-                  />
-                </Pressable>
-              </View>
-            </View>
-
-            {!isDriverOnline ? (
-              <View style={localStyles.offlineBanner}>
-                <Feather name="cloud-off" size={14} color="#FFFFFF" />
-                <Text style={localStyles.offlineBannerText}>
-                  You are offline. Go online to start trips.
-                </Text>
-              </View>
-            ) : null}
-
-            <View style={[localStyles.dashboardSheet, { bottom: 100 + (insets.bottom || 0) }]}>
-              <View style={localStyles.sheetHeaderRow}>
-                <View style={localStyles.avatarChip}>
-                  <Avatar name={profileName} imageUri={profileImageUri} style={localStyles.avatarImage} />
-                </View>
-                <View style={localStyles.driverMeta}>
-                  <Text style={localStyles.driverName} numberOfLines={1}>
-                    {profileName}
-                  </Text>
-                  <Text style={localStyles.driverSub} numberOfLines={1}>
-                    {profileDriverCode} {'\u2022'} {profilePlateNumber}
-                  </Text>
-                </View>
-                <Text style={localStyles.todayText}>Today</Text>
-              </View>
-
-              <View style={localStyles.statsCard}>
-                <View style={localStyles.metricRow}>
-                  <View style={localStyles.metricCard}>
-                    <View style={localStyles.metricPesoIconWrap}>
-                      <Text style={localStyles.metricPesoIconText}>{'\u20B1'}</Text>
-                    </View>
-                    <Text style={localStyles.metricLabel}>Total earned</Text>
-                    <Text style={localStyles.metricValue}>{formatPeso(totalEarnings)}</Text>
-                  </View>
-                  <View style={localStyles.metricCard}>
-                    <Feather name="file-text" size={18} color="#57c7a8" />
-                    <Text style={localStyles.metricLabel}>Total trips</Text>
-                    <Text style={localStyles.metricValue}>{totalTrips}</Text>
-                  </View>
-                  <View style={localStyles.metricCard}>
-                    <Feather name="map-pin" size={18} color="#57c7a8" />
-                    <Text style={localStyles.metricLabel}>Total distance</Text>
-                    <Text style={localStyles.metricValue}>{distanceSummaryKm} km</Text>
-                  </View>
-                </View>
-              </View>
-            </View>
-          </>
+          <HomeDashboardSheet
+            isDriverOnline={isDriverOnline}
+            onGoOnline={onGoOnline}
+            onGoOffline={onGoOffline}
+            isResolvingAccurateLocation={isResolvingAccurateLocation}
+            tripOpenPending={tripOpenPending}
+            firstFixDurationMs={firstFixDurationMs}
+            displayAccuracyMeters={displayAccuracyMeters}
+            locationFreshnessSeconds={locationFreshnessSeconds}
+            gpsDebugText={gpsDebugText}
+            profileName={profileName}
+            profileDriverCode={profileDriverCode}
+            profilePlateNumber={profilePlateNumber}
+            profileImageUri={profileImageUri}
+            totalEarnings={totalEarnings}
+            totalTrips={totalTrips}
+            distanceSummaryKm={distanceSummaryKm}
+            formatPeso={formatPeso}
+            localStyles={localStyles}
+            insetsBottom={insets.bottom || 0}
+          />
         ) : (
           <>
             <Pressable style={styles.routeBackButton} onPress={onBackToHome}>
               <Feather name="chevron-left" size={20} color="#030318" />
             </Pressable>
-
-            <View style={[styles.routeTripPanel, { bottom: 104 + (insets.bottom || 0) }]}>
-              <View style={styles.routeGeofenceStatusRow}>
-                <Text style={styles.routeGeofenceStatusLabel}>Obrero Geofence</Text>
-                <View
-                  style={[
-                    styles.routeGeofencePill,
-                    isInsideGeofence ? styles.routeGeofencePillInside : styles.routeGeofencePillOutside,
-                  ]}
-                >
-                  <Text
-                    style={[
-                      styles.routeGeofencePillText,
-                      isInsideGeofence
-                        ? styles.routeGeofencePillTextInside
-                        : styles.routeGeofencePillTextOutside,
-                    ]}
-                  >
-                    {isInsideGeofence ? 'Inside' : 'Outside'}
-                  </Text>
-                </View>
-              </View>
-
-              <View style={[styles.routeTripStatsRow, localStyles.tripStatsRow]}>
-                <View style={[styles.routeTripStatPill, localStyles.tripStatPill]}>
-                  <Text style={styles.routeTripStatValue}>{minutesText}</Text>
-                  <Text style={styles.routeTripStatLabel}>mins</Text>
-                </View>
-                <View style={[styles.routeTripStatPill, localStyles.tripStatPill]}>
-                  <Text style={styles.routeTripStatValue}>{kmText}</Text>
-                  <Text style={styles.routeTripStatLabel}>km</Text>
-                </View>
-                <Pressable
-                  style={[styles.routeTripStatPill, localStyles.tripStatPill]}
-                  onPress={() => setFarePickerOpen((prev) => !prev)}
-                >
-                  <Text style={styles.routeTripStatValue}>{'\u20B1'}{selectedFare}</Text>
-                  <Text style={styles.routeTripStatLabel}>fare</Text>
-                </Pressable>
-              </View>
-
-              <View style={localStyles.navigationMetaRow}>
-                <Text style={localStyles.navigationMetaText}>Speed {speedKmh.toFixed(1)} km/h</Text>
-                <Text style={localStyles.navigationMetaText}>Auto-reroute on</Text>
-              </View>
-
-              {farePickerOpen ? (
-                <View style={styles.routeFareList}>
-                  {fareOptions.map((value) => (
-                    <Pressable
-                      key={value}
-                      style={[
-                        styles.routeFareOption,
-                        value === selectedFare && styles.routeFareOptionActive,
-                      ]}
-                      onPress={() => {
-                        setSelectedFare(value);
-                        setFarePickerOpen(false);
-                      }}
-                    >
-                      <Text
-                        style={[
-                          styles.routeFareOptionText,
-                          value === selectedFare && styles.routeFareOptionTextActive,
-                        ]}
-                      >
-                        {'\u20B1'}{value}
-                      </Text>
-                    </Pressable>
-                  ))}
-                </View>
-              ) : null}
-
-              <Pressable style={styles.routeStartTripButton} onPress={handleTripButtonPress}>
-                <Text style={styles.routeStartTripText}>{isTripStarted ? 'End Trip' : 'Start Trip'}</Text>
-              </Pressable>
-            </View>
+            <StartTripPanel
+              styles={styles}
+              localStyles={localStyles}
+              insetsBottom={insets.bottom || 0}
+              isInsideGeofence={isInsideGeofence}
+              minutesText={minutesText}
+              kmText={kmText}
+              selectedFare={selectedFare}
+              fareOptions={fareOptions}
+              farePickerOpen={farePickerOpen}
+              setFarePickerOpen={setFarePickerOpen}
+              setSelectedFare={setSelectedFare}
+              speedKmh={speedKmh}
+              enableTripSimulation={ENABLE_TRIP_SIMULATION}
+              isTripStarted={isTripStarted}
+              onOpenSimulation={onOpenSimulation}
+              onTripButtonPress={handleTripButtonPress}
+            />
           </>
         )}
       </View>
 
-      <HomeNavigationCard
-        activeTab="home"
-        onNavigate={onNavigate}
-        showCenterRoute={!isTripScreen}
-        styles={styles}
-      />
+      {!isTripScreen ? (
+        <HomeNavigationCard
+          activeTab="home"
+          onNavigate={onNavigate}
+          showCenterRoute
+          styles={styles}
+        />
+      ) : null}
 
       <OutsideGeofenceModal
         visible={showOutsideGeofenceModal}
@@ -1279,6 +1709,77 @@ const localStyles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 12,
     lineHeight: 15,
+    fontFamily: 'CircularStdMedium500',
+  },
+  locationWarmupBanner: {
+    position: 'absolute',
+    left: 14,
+    right: 14,
+    top: 110,
+    minHeight: 44,
+    borderRadius: 14,
+    backgroundColor: 'rgba(15, 23, 42, 0.9)',
+    paddingHorizontal: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(148, 163, 184, 0.45)',
+  },
+  locationWarmupBannerText: {
+    flex: 1,
+    color: '#FFFFFF',
+    fontSize: 12,
+    lineHeight: 15,
+    fontFamily: 'CircularStdMedium500',
+  },
+  tripGateBanner: {
+    position: 'absolute',
+    left: 14,
+    right: 14,
+    top: 162,
+    minHeight: 44,
+    borderRadius: 14,
+    backgroundColor: 'rgba(45, 125, 246, 0.92)',
+    paddingHorizontal: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(191, 219, 254, 0.45)',
+  },
+  tripGateBannerText: {
+    flex: 1,
+    color: '#FFFFFF',
+    fontSize: 12,
+    lineHeight: 15,
+    fontFamily: 'CircularStdMedium500',
+  },
+  gpsDebugBadge: {
+    position: 'absolute',
+    left: 14,
+    right: 14,
+    top: 214,
+    minHeight: 38,
+    borderRadius: 14,
+    backgroundColor: 'rgba(255,255,255,0.94)',
+    paddingHorizontal: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(226, 232, 240, 0.92)',
+    shadowColor: '#0F172A',
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 2,
+  },
+  gpsDebugText: {
+    flex: 1,
+    color: '#0F172A',
+    fontSize: 11,
+    lineHeight: 14,
     fontFamily: 'CircularStdMedium500',
   },
   dashboardSheet: {
@@ -1392,6 +1893,10 @@ const localStyles = StyleSheet.create({
     width: '31%',
     marginHorizontal: 0,
   },
+  simulationButton: {
+    marginBottom: 10,
+    backgroundColor: '#2D7DF6',
+  },
   navigationMetaRow: {
     marginBottom: 10,
     flexDirection: 'row',
@@ -1461,20 +1966,89 @@ const localStyles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  navAvatarRingOuter: {
-    width: 54,
-    height: 54,
-    borderRadius: 27,
-    borderWidth: 3,
-    borderColor: '#57c7a8',
+  vehicleMarkerShell: {
     alignItems: 'center',
     justifyContent: 'center',
-    overflow: 'hidden',
+  },
+  vehicleMarker: {
+    width: 52,
+    height: 52,
+    borderRadius: 16,
+    backgroundColor: '#2D7DF6',
+    borderWidth: 2,
+    borderColor: '#DBEAFE',
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOpacity: 0.18,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 5,
+  },
+  driverBadge: {
+    position: 'absolute',
+    top: -8,
+    right: -8,
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   navMarkerAvatar: {
-    width: '100%',
-    height: '100%',
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+  },
+  navMarkerPointer: {
+    marginTop: -6,
+    width: 14,
+    height: 14,
+    backgroundColor: '#2D7DF6',
+    transform: [{ rotate: '45deg' }],
+    borderBottomLeftRadius: 4,
+  },
+  navMarkerPulse: {
+    width: 24,
+    height: 8,
     borderRadius: 999,
+    marginTop: 4,
+    backgroundColor: 'rgba(45,125,246,0.16)',
+  },
+  violationBanner: {
+    position: 'absolute',
+    top: 106,
+    left: 14,
+    right: 14,
+    borderRadius: 18,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    backgroundColor: 'rgba(220,38,38,0.95)',
+    borderWidth: 1,
+    borderColor: 'rgba(254,202,202,0.9)',
+  },
+  violationDot: {
+    position: 'absolute',
+    top: 16,
+    right: 16,
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: '#FFFFFF',
+  },
+  violationTitle: {
+    fontFamily: 'CircularStdMedium500',
+    fontSize: 15,
+    color: '#FFFFFF',
+  },
+  violationText: {
+    marginTop: 4,
+    fontFamily: 'CircularStdMedium500',
+    fontSize: 12,
+    color: '#FEE2E2',
   },
 });
 

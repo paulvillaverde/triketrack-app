@@ -167,6 +167,15 @@ export async function setDriverLocationOffline(driverId: number) {
 
 export type TripRoutePoint = { latitude: number; longitude: number };
 
+export type TripRouteSyncRow = {
+  local_trip_id: string;
+  trip_id?: number | null;
+  driver_id: number;
+  latitude: number;
+  longitude: number;
+  recorded_at: string;
+};
+
 export type TripRecord = {
   id: string;
   driver_id: number;
@@ -246,6 +255,46 @@ export async function completeTrip(params: {
   return { error: error ? error.message : null };
 }
 
+export async function insertTripRouteBatch(rows: TripRouteSyncRow[]) {
+  if (!supabase) {
+    return { error: 'Supabase is not configured.' };
+  }
+  if (rows.length === 0) {
+    return { error: null as string | null };
+  }
+
+  const { error } = await supabase.from('trip_routes').upsert(
+    rows.map((row) => ({
+      local_trip_id: row.local_trip_id,
+      trip_id: typeof row.trip_id === 'number' ? row.trip_id : null,
+      driver_id: row.driver_id,
+      latitude: row.latitude,
+      longitude: row.longitude,
+      recorded_at: row.recorded_at,
+    })),
+    {
+      onConflict: 'local_trip_id,driver_id,recorded_at,latitude,longitude',
+      ignoreDuplicates: true,
+    },
+  );
+
+  return { error: error ? error.message : null };
+}
+
+export async function attachTripRoutesToServerTrip(localTripId: string, tripId: number) {
+  if (!supabase) {
+    return { error: 'Supabase is not configured.' };
+  }
+
+  const { error } = await supabase
+    .from('trip_routes')
+    .update({ trip_id: tripId })
+    .eq('local_trip_id', localTripId)
+    .is('trip_id', null);
+
+  return { error: error ? error.message : null };
+}
+
 export async function listTripsByWeekBucket(driverId: number, bucket: 'THIS_WEEK' | 'LAST_WEEK' | 'OVER_30' | 'ALL') {
   if (!supabase) {
     return { trips: [] as TripRecord[], error: 'Supabase is not configured.' };
@@ -310,9 +359,29 @@ export async function listTripsWithRoutePoints(driverId: number, limit = 100) {
     };
   }
 
+  const { data: syncedRouteRows, error: syncedRouteError } = await supabase
+    .from('trip_routes')
+    .select('trip_id, recorded_at, latitude, longitude')
+    .in('trip_id', tripIds)
+    .order('trip_id', { ascending: true })
+    .order('recorded_at', { ascending: true });
+
+  if (syncedRouteError) {
+    return {
+      trips: trips.map((t) => ({ ...t, route_points: [] })),
+      error: syncedRouteError.message,
+    };
+  }
+
   const points = (pointRows as Array<{
     trip_id: string;
     idx: number;
+    latitude: number;
+    longitude: number;
+  }>) ?? [];
+  const syncedRoutePoints = (syncedRouteRows as Array<{
+    trip_id: string;
+    recorded_at: string;
     latitude: number;
     longitude: number;
   }>) ?? [];
@@ -324,8 +393,36 @@ export async function listTripsWithRoutePoints(driverId: number, limit = 100) {
     pointsByTrip.set(row.trip_id, list);
   }
 
+  const syncedPointsByTrip = new Map<string, TripRoutePoint[]>();
+  for (const row of syncedRoutePoints) {
+    if (!row.trip_id) {
+      continue;
+    }
+    const list = syncedPointsByTrip.get(row.trip_id) ?? [];
+    const previous = list[list.length - 1];
+    if (
+      previous &&
+      previous.latitude === row.latitude &&
+      previous.longitude === row.longitude
+    ) {
+      continue;
+    }
+    list.push({ latitude: row.latitude, longitude: row.longitude });
+    syncedPointsByTrip.set(row.trip_id, list);
+  }
+
   return {
-    trips: trips.map((t) => ({ ...t, route_points: pointsByTrip.get(t.id) ?? [] })),
+    trips: trips.map((t) => {
+      const routePoints = pointsByTrip.get(t.id) ?? [];
+      const syncedFallbackPoints = syncedPointsByTrip.get(t.id) ?? [];
+      return {
+        ...t,
+        route_points:
+          syncedFallbackPoints.length > routePoints.length
+            ? syncedFallbackPoints
+            : routePoints,
+      };
+    }),
     error: null as string | null,
   };
 }
@@ -427,8 +524,56 @@ export async function uploadDriverAvatar(_params: {
   contentType?: string;
   ext?: string;
 }) {
-  return {
-    publicUrl: null as string | null,
-    error: 'Avatar upload is not linked to the current drivers table schema.',
-  };
+  if (!supabase) {
+    return { publicUrl: null as string | null, error: 'Supabase is not configured.' };
+  }
+
+  try {
+    const response = await fetch(_params.localUri);
+    const blob = await response.blob();
+    const extension =
+      _params.ext ??
+      _params.localUri.split('.').pop()?.split('?')[0]?.toLowerCase() ??
+      'jpg';
+    const normalizedExt = extension === 'jpeg' ? 'jpg' : extension;
+    const filePath = `driver-${_params.driverId}/avatar.${normalizedExt}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('driver-avatars')
+      .upload(filePath, blob, {
+        upsert: true,
+        contentType: _params.contentType ?? blob.type ?? `image/${normalizedExt}`,
+      });
+
+    if (uploadError) {
+      return { publicUrl: null as string | null, error: uploadError.message };
+    }
+
+    const {
+      data: { publicUrl },
+    } = supabase.storage.from('driver-avatars').getPublicUrl(filePath);
+
+    const rpcAttempt = await supabase.rpc('set_driver_avatar', {
+      p_driver_id: _params.driverId,
+      p_avatar_url: publicUrl,
+    });
+
+    if (rpcAttempt.error) {
+      const { error: updateError } = await supabase
+        .from('drivers')
+        .update({ avatar_url: publicUrl, updated_at: new Date().toISOString() })
+        .eq('driver_id', _params.driverId);
+
+      if (updateError) {
+        return { publicUrl: null as string | null, error: updateError.message };
+      }
+    }
+
+    return { publicUrl, error: null as string | null };
+  } catch (error) {
+    return {
+      publicUrl: null as string | null,
+      error: error instanceof Error ? error.message : 'Unable to upload avatar.',
+    };
+  }
 }
