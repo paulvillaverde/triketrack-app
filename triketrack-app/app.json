@@ -28,7 +28,19 @@
       "favicon": "./assets/adaptive-icon.png"
     },
     "plugins": [
-      "expo-sqlite"
+      "expo-sqlite",
+      [
+        "expo-contacts",
+        {
+          "contactsPermission": "Allow TrikeTrack to access your contacts so we can complete trusted device onboarding on this phone."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow TrikeTrack to access your location so trip tracking stays accurate and follows the real road."
+        }
+      ]
     ]
   }
 }

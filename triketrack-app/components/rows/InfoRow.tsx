@@ -1,8 +1,8 @@
 import { Pressable, Text, View } from 'react-native';
-import { Feather } from '@expo/vector-icons';
+import { AppIcon, type AppIconName } from '../ui';
 
 type InfoRowProps = {
-  icon: keyof typeof Feather.glyphMap;
+  icon: AppIconName;
   label: string;
   value: string;
   isLast?: boolean;
@@ -20,7 +20,7 @@ export function InfoRow({ icon, label, value, isLast = false, onPress, showChevr
       disabled={!onPress}
     >
       <View style={styles.infoIconWrap}>
-        <Feather name={icon} size={16} color="#111827" />
+        <AppIcon name={icon} size={16} color="#111827" />
       </View>
       <View style={styles.infoTextWrap}>
         <Text style={styles.infoLabel}>{label}</Text>
@@ -28,7 +28,7 @@ export function InfoRow({ icon, label, value, isLast = false, onPress, showChevr
       </View>
       {showChevron ? (
         <View style={{ width: 22, alignItems: 'flex-end', justifyContent: 'center', paddingTop: 3 }}>
-          <Feather name="chevron-right" size={16} color="#94A3B8" />
+          <AppIcon name="chevron-right" size={16} color="#94A3B8" />
         </View>
       ) : null}
     </Container>

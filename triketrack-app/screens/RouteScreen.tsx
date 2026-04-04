@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { Alert, Pressable, Text, View } from 'react-native';
-import { Feather } from '@expo/vector-icons';
 import MapView, { Marker, Polygon } from 'react-native-maps';
 import { BottomTab, HomeNavigationCard } from '../components/navigation/HomeNavigationCard';
+import { AppleMapPinMarker } from '../components/maps/AppleMapPinMarker';
+import { AppIcon } from '../components/ui';
 
 type RouteScreenProps = {
   onNavigate?: (tab: BottomTab) => void;
@@ -156,7 +157,7 @@ export function RouteScreen({
 
             <View style={styles.routeScreenBody}>
               <View style={styles.routePinWrap}>
-                <Feather name="map-pin" size={44} color="#57c7a8" />
+                <AppIcon name="map-pin" size={44} color="#57c7a8" />
               </View>
 
               <Text style={styles.routeTitle}>Enable Location</Text>
@@ -170,7 +171,7 @@ export function RouteScreen({
         ) : (
           <View style={styles.routeMapScreen}>
             <Pressable style={styles.routeBackButton} onPress={() => setShowEnableScreen(true)}>
-              <Feather name="chevron-left" size={20} color="#030318" />
+              <AppIcon name="chevron-left" size={20} color="#030318" />
             </Pressable>
 
             <MapView
@@ -240,7 +241,16 @@ export function RouteScreen({
                 fillColor="rgba(90,103,216,0.04)"
                 strokeWidth={2}
               />
-              {coords ? <Marker coordinate={coords} title="Your Location" pinColor="red" /> : null}
+              {coords ? (
+                <Marker
+                  coordinate={coords}
+                  title="Your Location"
+                  anchor={{ x: 0.5, y: 1 }}
+                  tracksViewChanges
+                >
+                  <AppleMapPinMarker color="#38BDF8" iconName="radio" size="md" />
+                </Marker>
+              ) : null}
             </MapView>
 
             <View style={styles.routeTripPanel}>

@@ -1,6 +1,6 @@
 import { Alert, Modal, Pressable, Text, TextInput, View } from 'react-native';
-import { Feather } from '@expo/vector-icons';
 import { violationModalStyles } from './violationModalStyles';
+import { AppIcon } from '../../ui';
 
 type SubmitAppealModalProps = {
   visible: boolean;
@@ -34,7 +34,7 @@ export function SubmitAppealModal({
           <View style={violationModalStyles.modalHeadRow}>
             <View style={violationModalStyles.modalTitleWrap}>
               <View style={violationModalStyles.modalTitleIcon}>
-                <Feather name="edit-3" size={14} color="#FFFFFF" />
+                <AppIcon name="edit-3" size={14} color="#FFFFFF" />
               </View>
               <View>
                 <Text style={violationModalStyles.modalTitle}>Submit Appeal</Text>
@@ -46,12 +46,12 @@ export function SubmitAppealModal({
               </View>
             </View>
             <Pressable style={violationModalStyles.modalCloseBtn} onPress={onClose}>
-              <Feather name="x" size={16} color="#475569" />
+              <AppIcon name="x" size={16} color="#475569" />
             </Pressable>
           </View>
 
           <View style={violationModalStyles.modalViolationInfo}>
-            <Feather name="alert-circle" size={14} color="#B45309" />
+            <AppIcon name="alert-circle" size={14} color="#B45309" />
             <Text style={violationModalStyles.modalViolationInfoText}>
               Choose one reason and submit your appeal for review.
             </Text>

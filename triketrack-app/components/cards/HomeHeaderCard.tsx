@@ -1,6 +1,5 @@
 import { Pressable, Text, View } from 'react-native';
-import { Feather } from '@expo/vector-icons';
-import { Avatar } from '../ui';
+import { AppIcon, Avatar } from '../ui';
 
 type HomeHeaderCardProps = {
   onPressNotification?: () => void;
@@ -24,7 +23,7 @@ export function HomeHeaderCard({ onPressNotification, styles }: HomeHeaderCardPr
           </View>
 
           <Pressable style={styles.homeHeaderAction} onPress={onPressNotification}>
-            <Feather name="bell" size={20} color="#FFFFFF" />
+            <AppIcon name="bell" size={20} color="#FFFFFF" />
           </Pressable>
         </View>
       </View>

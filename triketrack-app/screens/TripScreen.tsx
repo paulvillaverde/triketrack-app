@@ -1,9 +1,19 @@
-import { useMemo, useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
-import { Feather } from '@expo/vector-icons';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Animated,
+  Dimensions,
+  PanResponder,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BottomTab, HomeNavigationCard } from '../components/navigation/HomeNavigationCard';
 import { TripRouteMap } from '../components/maps/TripRouteMap';
-import { Avatar } from '../components/ui';
+import { AppIcon, Avatar, type AppIconName } from '../components/ui';
 
 type TripScreenProps = {
   onLogout?: () => void;
@@ -50,9 +60,78 @@ export function TripScreen({
   activeTab = 'trip',
   styles,
 }: TripScreenProps) {
+  const insets = useSafeAreaInsets();
+  const { height: windowHeight } = Dimensions.get('window');
   const [selectedTrip, setSelectedTrip] = useState<TripItem | null>(null);
   const [listTab, setListTab] = useState<'ALL' | 'THIS_WEEK' | 'LAST_WEEK' | 'OVER_30'>('ALL');
   const [query, setQuery] = useState('');
+  const detailSheetHeight = useMemo(() => Math.min(Math.max(windowHeight * 0.48, 600), 450), [windowHeight]);
+  const detailSheetVisiblePeek = 280;
+  const detailSheetCollapsedOffset = useMemo(
+    () => Math.max(detailSheetHeight - detailSheetVisiblePeek, 0),
+    [detailSheetHeight],
+  );
+  const detailSheetTranslateY = useRef(new Animated.Value(detailSheetCollapsedOffset)).current;
+  const detailSheetTranslateYValueRef = useRef(detailSheetCollapsedOffset);
+  const detailSheetGestureStartRef = useRef(detailSheetCollapsedOffset);
+
+  useEffect(() => {
+    const listener = detailSheetTranslateY.addListener(({ value }) => {
+      detailSheetTranslateYValueRef.current = value;
+    });
+    return () => {
+      detailSheetTranslateY.removeListener(listener);
+    };
+  }, [detailSheetTranslateY]);
+
+  useEffect(() => {
+    if (!selectedTrip) {
+      return;
+    }
+    detailSheetTranslateY.setValue(detailSheetCollapsedOffset);
+  }, [detailSheetCollapsedOffset, detailSheetTranslateY, selectedTrip]);
+
+  const animateDetailSheetTo = (target: number) => {
+    Animated.spring(detailSheetTranslateY, {
+      toValue: target,
+      useNativeDriver: true,
+      damping: 22,
+      stiffness: 220,
+      mass: 0.9,
+    }).start();
+  };
+
+  const detailSheetPanResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onMoveShouldSetPanResponder: (_, gestureState) =>
+          Math.abs(gestureState.dy) > 5 && Math.abs(gestureState.dy) > Math.abs(gestureState.dx),
+        onPanResponderGrant: () => {
+          detailSheetGestureStartRef.current = detailSheetTranslateYValueRef.current;
+          detailSheetTranslateY.stopAnimation((value) => {
+            detailSheetGestureStartRef.current = value;
+            detailSheetTranslateYValueRef.current = value;
+          });
+        },
+        onPanResponderMove: (_, gestureState) => {
+          const nextValue = Math.min(
+            Math.max(detailSheetGestureStartRef.current + gestureState.dy, 0),
+            detailSheetCollapsedOffset,
+          );
+          detailSheetTranslateY.setValue(nextValue);
+        },
+        onPanResponderRelease: (_, gestureState) => {
+          const projectedValue = detailSheetTranslateYValueRef.current + gestureState.vy * 30;
+          const target =
+            projectedValue > detailSheetCollapsedOffset / 2 ? detailSheetCollapsedOffset : 0;
+          animateDetailSheetTo(target);
+        },
+        onPanResponderTerminate: () => {
+          animateDetailSheetTo(detailSheetTranslateYValueRef.current > detailSheetCollapsedOffset / 2 ? detailSheetCollapsedOffset : 0);
+        },
+      }),
+    [detailSheetCollapsedOffset, detailSheetTranslateY],
+  );
 
   const getDaysAgo = (tripDate: string) => {
     const today = new Date();
@@ -164,67 +243,100 @@ export function TripScreen({
               </View>
             ) : (
               <View style={[localStyles.detailMapContainer, localStyles.tripMapEmptyFull]}>
-                <Feather name="map-pin" size={18} color="#94A3B8" />
+                <AppIcon name="map-pin" size={18} color="#94A3B8" />
                 <Text style={localStyles.tripMapEmptyText}>No route saved for this trip</Text>
               </View>
             )}
 
-            <Pressable style={localStyles.detailBackFloating} onPress={() => setSelectedTrip(null)}>
-              <Feather name="chevron-left" size={20} color="#111827" />
+            <Pressable
+              style={[
+                localStyles.detailBackFloating,
+                { top: Math.max(insets.top + 8, 18) },
+              ]}
+              onPress={() => setSelectedTrip(null)}
+            >
+              <AppIcon name="chevron-left" size={20} color="#111827" />
             </Pressable>
 
-            <View style={localStyles.detailBottomSheet}>
-              <View style={localStyles.sheetHandle} />
-              <Text style={localStyles.detailSheetSub}>Trip #{getTripNumber(selectedTrip.id)}</Text>
+            <Animated.View
+              style={[
+                localStyles.detailBottomSafeArea,
+                { height: Math.max(insets.bottom + 18, 42) },
+                {
+                  transform: [{ translateY: detailSheetTranslateY }],
+                },
+              ]}
+            />
 
-              <View style={localStyles.detailDriverRow}>
-                <Avatar
-                  name={profileName}
-                  imageUri={profileImageUri}
-                  style={localStyles.driverAvatarImage}
-                />
-                <View style={localStyles.driverTextWrap}>
-                  <Text style={localStyles.driverName}>{profileName}</Text>
-                  <Text style={localStyles.driverSub}>
-                    {profileDriverCode} {'\u2022'} Plate No. {profilePlateNumber}
-                  </Text>
-                </View>
-                <Text style={localStyles.vehicleText}>{selectedTrip.id}</Text>
+            <Animated.View
+              style={[
+                localStyles.detailBottomSheet,
+                {
+                  height: detailSheetHeight,
+                  paddingBottom: Math.max(insets.bottom, 14) + 8,
+                  transform: [{ translateY: detailSheetTranslateY }],
+                },
+              ]}
+            >
+              <View style={localStyles.sheetDragZone} {...detailSheetPanResponder.panHandlers}>
+                <View style={localStyles.sheetHandle} />
               </View>
 
-              <View style={localStyles.detailMetricsGrid}>
-                <View style={localStyles.detailMetricBlock}>
-                  <Text style={localStyles.metricLabel}>Fare</Text>
-                  <Text style={localStyles.metricValue}>{selectedTrip.fare}</Text>
+              <View style={localStyles.detailSheetScrollContent}>
+                <View style={localStyles.detailHeaderBlock}>
+                  <Text style={localStyles.detailEyebrow}>Completed Trip</Text>
+                  <View style={localStyles.detailTitleRow}>
+                    <Text style={localStyles.detailSheetSub}>Trip #{getTripNumber(selectedTrip.id)}</Text>
+                    <View style={localStyles.tripIdPill}>
+                      <Text style={localStyles.tripIdPillText}>{selectedTrip.id}</Text>
+                    </View>
+                  </View>
                 </View>
-                <View style={localStyles.detailMetricBlock}>
-                  <Text style={localStyles.metricLabel}>Distance</Text>
-                  <Text style={localStyles.metricValue}>{selectedTrip.distance}</Text>
+
+                <View style={localStyles.detailDriverRow}>
+                  <Avatar
+                    name={profileName}
+                    imageUri={profileImageUri}
+                    style={localStyles.driverAvatarImage}
+                  />
+                  <View style={localStyles.driverTextWrap}>
+                    <Text style={localStyles.driverName}>{profileName}</Text>
+                    <Text style={localStyles.driverSub}>
+                      {profileDriverCode} {'\u2022'} Plate No. {profilePlateNumber}
+                    </Text>
+                  </View>
+                  <View style={localStyles.statusPill}>
+                    <Text style={localStyles.statusPillText}>Completed</Text>
+                  </View>
                 </View>
-                <View style={localStyles.detailMetricBlock}>
-                  <Text style={localStyles.metricLabel}>Duration</Text>
-                  <Text style={localStyles.metricValue}>{selectedTrip.duration}</Text>
+
+                <View style={localStyles.primaryStatsRow}>
+                  <SummaryStat icon="dollar-sign" label="Fare" value={selectedTrip.fare} />
+                  <SummaryStat icon="map" label="Distance" value={selectedTrip.distance} />
+                  <SummaryStat icon="clock" label="Duration" value={selectedTrip.duration} />
                 </View>
-                <View style={localStyles.detailMetricBlock}>
-                  <Text style={localStyles.metricLabel}>Date</Text>
-                  <Text style={localStyles.metricValue}>{formatTripDateForCard(selectedTrip.tripDate)}</Text>
-                </View>
-                <View style={localStyles.detailMetricBlock}>
-                  <Text style={localStyles.metricLabel}>Violations</Text>
-                  <Text style={localStyles.metricValue}>{selectedTrip.violations}</Text>
-                </View>
-                <View style={localStyles.detailMetricBlock}>
-                  <Text style={localStyles.metricLabel}>Compliance</Text>
-                  <Text style={localStyles.metricValue}>{selectedTrip.compliance}%</Text>
+
+                <View style={localStyles.detailSection}>
+                  <Text style={localStyles.detailSectionTitle}>Trip details</Text>
+
+                  <View style={localStyles.detailInfoRow}>
+                    <DetailInfoItem label="Date" value={formatTripDateForCard(selectedTrip.tripDate)} />
+                    <DetailInfoItem label="Trip ID" value={selectedTrip.id} align="right" />
+                  </View>
+                  <View style={localStyles.detailInfoDivider} />
+                  <View style={localStyles.detailInfoRow}>
+                    <DetailInfoItem label="Violations" value={selectedTrip.violations} />
+                    <DetailInfoItem label="Compliance" value={`${selectedTrip.compliance}%`} align="right" />
+                  </View>
                 </View>
               </View>
-            </View>
+            </Animated.View>
           </View>
         ) : (
           <ScrollView contentContainerStyle={localStyles.scrollContent} showsVerticalScrollIndicator={false}>
             <View style={localStyles.listHeaderRow}>
               <Pressable style={localStyles.iconGhost} onPress={() => onNavigate?.('home')}>
-                <Feather name="chevron-left" size={18} color="#111827" />
+                <AppIcon name="chevron-left" size={18} color="#111827" />
               </Pressable>
               <Text style={localStyles.headerTitle}>Trip History</Text>
               <View style={localStyles.iconGhost} />
@@ -238,7 +350,7 @@ export function TripScreen({
                 placeholderTextColor="#98A3B3"
                 style={localStyles.searchInput}
               />
-              <Feather name="search" size={16} color="#9CA3AF" />
+              <AppIcon name="search" size={16} color="#9CA3AF" />
             </View>
             <Text style={localStyles.listSub}>Showing all your trip records</Text>
 
@@ -290,12 +402,14 @@ export function TripScreen({
         )}
       </View>
 
-      <HomeNavigationCard
-        activeTab={activeTab}
-        onNavigate={onNavigate}
-        showCenterRoute={false}
-        styles={styles}
-      />
+      {!selectedTrip ? (
+        <HomeNavigationCard
+          activeTab={activeTab}
+          onNavigate={onNavigate}
+          showCenterRoute={false}
+          styles={styles}
+        />
+      ) : null}
     </View>
   );
 
@@ -303,14 +417,14 @@ export function TripScreen({
     return (
       <View style={localStyles.tripRowInner}>
         <View style={localStyles.tripRowBadge}>
-          <Feather name="navigation" size={14} color="#FFFFFF" />
+          <AppIcon name="navigation" size={14} color="#FFFFFF" />
         </View>
         <View style={localStyles.tripRowMain}>
           <Text style={localStyles.tripRowTitle}>Trip #{getTripNumber(trip.id)}</Text>
           <View style={localStyles.tripRowMeta}>
-            <Feather name="calendar" size={11} color="#6B7280" />
+            <AppIcon name="calendar" size={11} color="#6B7280" />
             <Text style={localStyles.tripRowMetaText}>{formatTripDateForCard(trip.tripDate)}</Text>
-            <Feather name="clock" size={11} color="#6B7280" />
+            <AppIcon name="clock" size={11} color="#6B7280" />
             <Text style={localStyles.tripRowMetaText}>{trip.duration}</Text>
           </View>
           <View style={localStyles.tripRowMeta}>
@@ -320,6 +434,45 @@ export function TripScreen({
           </View>
         </View>
         <Text style={localStyles.tripRowFare}>{trip.fare}</Text>
+      </View>
+    );
+  }
+
+  function SummaryStat({
+    icon,
+    label,
+    value,
+  }: {
+    icon: AppIconName;
+    label: string;
+    value: string;
+  }) {
+    return (
+      <View style={localStyles.primaryStatCard}>
+        <View style={localStyles.primaryStatIconWrap}>
+          <AppIcon name={icon} size={14} color="#57c7a8" />
+        </View>
+        <Text style={localStyles.primaryStatLabel}>{label}</Text>
+        <Text style={localStyles.primaryStatValue}>{value}</Text>
+      </View>
+    );
+  }
+
+  function DetailInfoItem({
+    label,
+    value,
+    align = 'left',
+  }: {
+    label: string;
+    value: string;
+    align?: 'left' | 'right';
+  }) {
+    return (
+      <View style={[localStyles.detailInfoItem, align === 'right' && localStyles.detailInfoItemRight]}>
+        <Text style={localStyles.detailInfoLabel}>{label}</Text>
+        <Text style={[localStyles.detailInfoValue, align === 'right' && localStyles.detailInfoValueRight]}>
+          {value}
+        </Text>
       </View>
     );
   }
@@ -658,6 +811,13 @@ const localStyles = StyleSheet.create({
   detailMapContainer: {
     ...StyleSheet.absoluteFillObject,
   },
+  detailBottomSafeArea: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: '#FFFFFF',
+  },
   detailBackFloating: {
     position: 'absolute',
     top: 18,
@@ -681,38 +841,72 @@ const localStyles = StyleSheet.create({
     position: 'absolute',
     left: 0,
     right: 0,
-    bottom: 74,
+    bottom: 0,
     backgroundColor: '#FFFFFF',
-    borderTopLeftRadius: 22,
-    borderTopRightRadius: 22,
-    borderWidth: 1,
-    borderColor: '#E4EBF2',
-    borderBottomWidth: 0,
-    paddingHorizontal: 16,
-    paddingTop: 14,
-    paddingBottom: 20,
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
+    paddingHorizontal: 18,
+    paddingTop: 12,
     shadowColor: '#0F172A',
     shadowOpacity: 0.12,
-    shadowRadius: 10,
-    shadowOffset: { width: 0, height: -2 },
-    elevation: 6,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: -4 },
+    elevation: 10,
+  },
+  sheetDragZone: {
+    paddingTop: 2,
+    paddingBottom: 2,
+    marginBottom: 6,
   },
   sheetHandle: {
     alignSelf: 'center',
-    width: 48,
+    width: 46,
     height: 5,
     borderRadius: 999,
     backgroundColor: '#D7DEE7',
-    marginBottom: 10,
+    marginBottom: 12,
+  },
+  detailSheetScrollContent: {
+    paddingBottom: 4,
+  },
+  detailHeaderBlock: {
+    marginBottom: 12,
+  },
+  detailEyebrow: {
+    fontSize: 10,
+    lineHeight: 12,
+    letterSpacing: 0.3,
+    textTransform: 'uppercase',
+    color: '#94A3B8',
+    fontFamily: 'CircularStdMedium500',
+    marginBottom: 5,
+  },
+  detailTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
   },
   detailSheetSub: {
-    marginTop: 0,
-    marginBottom: 10,
-    fontSize: 15,
-    lineHeight: 18,
+    flex: 1,
+    fontSize: 20,
+    lineHeight: 24,
     color: '#111827',
     fontFamily: 'CircularStdMedium500',
-    textAlign: 'center',
+  },
+  tripIdPill: {
+    borderRadius: 999,
+    backgroundColor: '#F3F6FA',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+  },
+  tripIdPillText: {
+    fontSize: 10,
+    lineHeight: 12,
+    color: '#475569',
+    fontFamily: 'CircularStdMedium500',
   },
   tripMapEmpty: {
     height: 90,
@@ -740,10 +934,10 @@ const localStyles = StyleSheet.create({
   detailDriverRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingBottom: 10,
+    paddingBottom: 12,
     borderBottomWidth: 1,
     borderBottomColor: '#EEF2F6',
-    marginBottom: 10,
+    marginBottom: 14,
   },
   driverAvatar: {
     width: 34,
@@ -755,9 +949,9 @@ const localStyles = StyleSheet.create({
     marginRight: 10,
   },
   driverAvatarImage: {
-    width: 38,
-    height: 38,
-    borderRadius: 19,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
     marginRight: 10,
     borderWidth: 1,
     borderColor: '#DCE5EC',
@@ -766,45 +960,119 @@ const localStyles = StyleSheet.create({
     flex: 1,
   },
   driverName: {
-    fontSize: 14,
-    lineHeight: 17,
+    fontSize: 17,
+    lineHeight: 21,
     color: '#111827',
     fontFamily: 'CircularStdMedium500',
   },
   driverSub: {
+    marginTop: 2,
     fontSize: 12,
     lineHeight: 15,
     color: '#6B7280',
     fontFamily: 'CircularStdMedium500',
   },
-  vehicleText: {
-    fontSize: 12,
-    lineHeight: 15,
+  statusPill: {
+    borderRadius: 999,
+    backgroundColor: '#E8FBF6',
+    borderWidth: 1,
+    borderColor: '#BDEDDC',
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+  },
+  statusPillText: {
+    fontSize: 10,
+    lineHeight: 12,
+    color: '#17906E',
+    fontFamily: 'CircularStdMedium500',
+  },
+  primaryStatsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 8,
+    marginBottom: 16,
+  },
+  primaryStatCard: {
+    flex: 1,
+    minHeight: 82,
+    paddingHorizontal: 12,
+    paddingVertical: 11,
+    borderRadius: 16,
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E7EDF3',
+  },
+  primaryStatIconWrap: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    backgroundColor: '#E8FBF6',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 9,
+  },
+  primaryStatLabel: {
+    fontSize: 11,
+    lineHeight: 14,
+    color: '#6B7280',
+    fontFamily: 'CircularStdMedium500',
+  },
+  primaryStatValue: {
+    marginTop: 4,
+    fontSize: 16,
+    lineHeight: 20,
     color: '#111827',
     fontFamily: 'CircularStdMedium500',
   },
-  detailMetricsGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'space-between',
-    marginBottom: 10,
+  detailSection: {
+    borderRadius: 18,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#E7EDF3',
+    paddingHorizontal: 14,
+    paddingVertical: 14,
   },
-  detailMetricBlock: {
-    width: '48%',
-    marginBottom: 9,
-  },
-  metricLabel: {
+  detailSectionTitle: {
     fontSize: 12,
     lineHeight: 15,
-    color: '#6B7280',
+    color: '#94A3B8',
+    fontFamily: 'CircularStdMedium500',
+    textTransform: 'uppercase',
+    letterSpacing: 0.3,
+    marginBottom: 10,
+  },
+  detailInfoRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    gap: 10,
+  },
+  detailInfoItem: {
+    flex: 1,
+  },
+  detailInfoItemRight: {
+    alignItems: 'flex-end',
+  },
+  detailInfoLabel: {
+    fontSize: 11,
+    lineHeight: 14,
+    color: '#94A3B8',
     fontFamily: 'CircularStdMedium500',
   },
-  metricValue: {
-    marginTop: 2,
+  detailInfoValue: {
+    marginTop: 4,
     fontSize: 15,
     lineHeight: 19,
     color: '#111827',
     fontFamily: 'CircularStdMedium500',
+  },
+  detailInfoValueRight: {
+    textAlign: 'right',
+  },
+  detailInfoDivider: {
+    height: 1,
+    backgroundColor: '#EEF2F6',
+    marginVertical: 12,
   },
 });
 

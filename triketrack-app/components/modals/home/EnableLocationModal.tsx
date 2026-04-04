@@ -1,6 +1,6 @@
 import { Modal, Pressable, Text, View } from 'react-native';
-import { Feather } from '@expo/vector-icons';
 import { homeModalStyles } from './homeModalStyles';
+import { AppIcon } from '../../ui';
 
 type EnableLocationModalProps = {
   visible: boolean;
@@ -20,7 +20,7 @@ export function EnableLocationModal({
       <View style={homeModalStyles.modalBackdrop}>
         <View style={homeModalStyles.modalCard}>
           <View style={homeModalStyles.modalIconWrap}>
-            <Feather name="map-pin" size={20} color="#57c7a8" />
+            <AppIcon name="map-pin" size={20} color="#57c7a8" />
           </View>
           <Text style={homeModalStyles.modalTitle}>Enable Location</Text>
           <Text style={homeModalStyles.modalText}>

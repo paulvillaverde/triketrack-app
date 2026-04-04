@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Animated, Easing, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
-import { Feather } from '@expo/vector-icons';
 import MapView, { AnimatedRegion, MarkerAnimated, Polygon, Polyline, PROVIDER_GOOGLE } from 'react-native-maps';
-import { Avatar } from '../components/ui';
+import { AppIcon, Avatar } from '../components/ui';
 import { DriverVehicleMarker } from '../components/maps/DriverVehicleMarker';
 import { GeofenceViolationBanner } from '../components/maps/GeofenceViolationBanner';
 import {
@@ -481,7 +480,7 @@ export function SimulationScreen({
       </MapView>
 
       <Pressable style={styles.backButton} onPress={onBack}>
-        <Feather name="chevron-left" size={20} color="#0F172A" />
+        <AppIcon name="chevron-left" size={20} color="#0F172A" />
       </Pressable>
 
       <View style={styles.topCard}>
@@ -521,7 +520,7 @@ export function SimulationScreen({
                     : 'Ready for demo'}
           </Text>
           <Pressable style={styles.followToggle} onPress={() => setCameraFollowEnabled((prev) => !prev)}>
-            <Feather name={cameraFollowEnabled ? 'navigation' : 'map'} size={14} color="#0F172A" />
+            <AppIcon name={cameraFollowEnabled ? 'navigation' : 'map'} size={14} color="#0F172A" />
             <Text style={styles.followToggleText}>{cameraFollowEnabled ? 'Follow On' : 'Follow Off'}</Text>
           </Pressable>
         </View>
@@ -531,7 +530,7 @@ export function SimulationScreen({
             style={[styles.scenarioChip, scenario === 'normal' && styles.scenarioChipActive]}
             onPress={() => setScenario('normal')}
           >
-            <Feather name="check-circle" size={14} color={scenario === 'normal' ? '#FFFFFF' : '#0F172A'} />
+            <AppIcon name="check-circle" size={14} color={scenario === 'normal' ? '#FFFFFF' : '#0F172A'} />
             <Text style={[styles.scenarioChipText, scenario === 'normal' && styles.scenarioChipTextActive]}>
               Normal Trip
             </Text>
@@ -544,7 +543,7 @@ export function SimulationScreen({
             ]}
             onPress={() => setScenario('violation')}
           >
-            <Feather name="alert-triangle" size={14} color={scenario === 'violation' ? '#FFFFFF' : '#B91C1C'} />
+            <AppIcon name="alert-triangle" size={14} color={scenario === 'violation' ? '#FFFFFF' : '#B91C1C'} />
             <Text
               style={[
                 styles.scenarioChipText,

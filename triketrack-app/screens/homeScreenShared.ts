@@ -1,4 +1,5 @@
 import { dedupeSequentialPoints, type LatLngPoint } from '../lib/roadPath';
+import * as Location from 'expo-location';
 
 export const OBRERO_GEOFENCE: Array<{ latitude: number; longitude: number }> = [
   { latitude: 7.0849408, longitude: 125.6121403 },
@@ -16,26 +17,35 @@ export const NORMAL_CAMERA = {
   heading: 0,
 } as const;
 
-export const MIN_TRACK_MOVE_KM = 0.004;
+export const MIN_TRACK_MOVE_KM = 0.0018;
 export const MAX_POINT_GAP_KM = 0.3;
-export const MAX_ACCEPTED_ACCURACY_METERS = 35;
-export const INITIAL_VISIBLE_ACCURACY_METERS = 65;
-export const HIGH_CONFIDENCE_ACCURACY_METERS = 20;
+export const MAX_ACCEPTED_ACCURACY_METERS = 16;
+export const INITIAL_VISIBLE_ACCURACY_METERS = 22;
+export const HIGH_CONFIDENCE_ACCURACY_METERS = 9;
 export const COARSE_FIRST_FIX_ACCURACY_METERS = 250;
-export const MAX_LOCATION_JUMP_KM = 0.08;
+export const WEAK_GPS_RECOVERY_ACCURACY_METERS = 28;
+export const MAX_LOCATION_JUMP_KM = 0.045;
 export const MAX_ACCEPTED_SPEED_KMH = 95;
-export const MAX_STATIONARY_SPEED_KMH = 3;
-export const MIN_SNAPPED_MOVE_KM = 0.004;
+export const MAX_STATIONARY_SPEED_KMH = 2.5;
+export const MIN_SNAPPED_MOVE_KM = 0.0018;
 export const MOVEMENT_CONFIRMATION_COUNT = 2;
-export const MIN_ROAD_MATCH_POINTS = 1;
-export const ROAD_MATCH_BATCH_SIZE = 1;
-export const FAST_START_REQUIRED_ACCURACY_METERS = 80;
+export const MIN_ROAD_MATCH_POINTS = 2;
+export const ROAD_MATCH_BATCH_SIZE = 4;
+export const ROAD_MATCH_OVERLAP_POINTS = 2;
+export const FAST_START_REQUIRED_ACCURACY_METERS = 22;
 export const INITIAL_LOCATION_TIMEOUT_MS = 4000;
-export const WATCH_LOCATION_INTERVAL_MS = 1000;
-export const LAST_KNOWN_MAX_AGE_MS = 15000;
-export const LAST_KNOWN_REQUIRED_ACCURACY_METERS = 250;
-export const TRIP_CAMERA_FOLLOW_INTERVAL_MS = 350;
+export const WATCH_LOCATION_INTERVAL_MS = 800;
+export const GPS_DISTANCE_INTERVAL_METERS = 1;
+export const GPS_STALE_SAMPLE_THRESHOLD_MS = 2800;
+export const TRIP_CAMERA_FOLLOW_INTERVAL_MS = 280;
 export const ENABLE_TRIP_SIMULATION = process.env.EXPO_PUBLIC_ENABLE_TRIP_SIMULATION === 'true';
+export const IDLE_WATCH_LOCATION_INTERVAL_MS = 3500;
+export const IDLE_GPS_DISTANCE_INTERVAL_METERS = 8;
+export const IDLE_GPS_STALE_SAMPLE_THRESHOLD_MS = 12000;
+export const ACTIVE_CAMERA_ACCURACY_METERS = 18;
+export const IDLE_CAMERA_ACCURACY_METERS = 14;
+export const ACTIVE_LOCATION_ACCURACY = Location.Accuracy.BestForNavigation;
+export const IDLE_LOCATION_ACCURACY = Location.Accuracy.High;
 
 export const SIMULATION_ROUTE_TEMPLATES: LatLngPoint[][] = [
   [

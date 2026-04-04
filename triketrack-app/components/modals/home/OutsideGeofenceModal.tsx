@@ -1,6 +1,6 @@
 import { Modal, Pressable, Text, View } from 'react-native';
-import { Feather } from '@expo/vector-icons';
 import { homeModalStyles } from './homeModalStyles';
+import { AppIcon } from '../../ui';
 
 type OutsideGeofenceModalProps = {
   visible: boolean;
@@ -18,7 +18,7 @@ export function OutsideGeofenceModal({
       <View style={homeModalStyles.modalBackdrop}>
         <View style={homeModalStyles.modalCard}>
           <View style={[homeModalStyles.modalIconWrap, homeModalStyles.modalIconWarnWrap]}>
-            <Feather name="alert-triangle" size={20} color="#B45309" />
+            <AppIcon name="alert-triangle" size={20} color="#B45309" />
           </View>
           <Text style={homeModalStyles.modalTitle}>Outside Geofence</Text>
           <Text style={homeModalStyles.modalText}>
@@ -34,4 +34,3 @@ export function OutsideGeofenceModal({
     </Modal>
   );
 }
-

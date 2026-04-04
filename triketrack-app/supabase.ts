@@ -1,5 +1,6 @@
 import 'react-native-url-polyfill/auto';
 import { createClient } from '@supabase/supabase-js';
+import * as FileSystemLegacy from 'expo-file-system/legacy';
 
 export type DriverRecord = {
   id: number;
@@ -13,19 +14,59 @@ export type DriverRecord = {
 const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL;
 const supabaseAnonKey =
   process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY ?? process.env.EXPO_PUBLIC_SUPABASE_KEY;
+const EXPECTED_SUPABASE_HOST = 'irkbdinugnasepjowhzr.supabase.co';
 
-export const hasSupabaseConfig = Boolean(supabaseUrl && supabaseAnonKey);
+const getSupabaseHost = (url: string | undefined | null) => {
+  if (!url) {
+    return null;
+  }
+
+  try {
+    return new URL(url).host;
+  } catch {
+    return null;
+  }
+};
+
+const configuredSupabaseHost = getSupabaseHost(supabaseUrl);
+const isExpectedSupabaseProject =
+  configuredSupabaseHost === null || configuredSupabaseHost === EXPECTED_SUPABASE_HOST;
+
+export const hasSupabaseConfig = Boolean(supabaseUrl && supabaseAnonKey && isExpectedSupabaseProject);
+
+const getSupabaseProjectLabel = () => {
+  if (!supabaseUrl) {
+    return 'unknown-project';
+  }
+
+  try {
+    return new URL(supabaseUrl).host;
+  } catch {
+    return supabaseUrl;
+  }
+};
 
 export const supabase = hasSupabaseConfig
   ? createClient(supabaseUrl as string, supabaseAnonKey as string)
   : null;
 
+const getSupabaseConfigError = () => {
+  if (!supabaseUrl || !supabaseAnonKey) {
+    return 'Supabase is not configured. Set EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY.';
+  }
+
+  if (!isExpectedSupabaseProject) {
+    return `Supabase is pointed at ${configuredSupabaseHost ?? supabaseUrl}, but this app is locked to ${EXPECTED_SUPABASE_HOST}. Update your env so both the app and SQL use the same project.`;
+  }
+
+  return null;
+};
+
 export async function authenticateDriver(driverCode: string, password: string) {
   if (!supabase) {
     return {
       driver: null as DriverRecord | null,
-      error:
-        'Supabase is not configured. Set EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY.',
+      error: getSupabaseConfigError() ?? 'Supabase is not configured.',
     };
   }
 
@@ -40,6 +81,14 @@ export async function authenticateDriver(driverCode: string, password: string) {
     };
   }
 
+  if (/avatar_url does not exist/i.test(rpcAttempt.error.message ?? '')) {
+    return {
+      driver: null as DriverRecord | null,
+      error:
+        'The Supabase drivers table is missing the `avatar_url` column expected by login. Rerun `triketrack-app/supabase/schema.sql` in the `irkbdinugnasepjowhzr.supabase.co` project, then try again.',
+    };
+  }
+
   return { driver: null as DriverRecord | null, error: rpcAttempt.error.message };
 }
 
@@ -47,7 +96,7 @@ export async function setDriverPassword(driverCode: string, password: string) {
   if (!supabase) {
     return {
       driver: null as DriverRecord | null,
-      error: 'Supabase is not configured. Set EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY.',
+      error: getSupabaseConfigError() ?? 'Supabase is not configured.',
     };
   }
 
@@ -60,6 +109,14 @@ export async function setDriverPassword(driverCode: string, password: string) {
     const isMissingFunction =
       message.includes('Could not find the function public.set_driver_password') ||
       message.includes('schema cache');
+
+    if (/avatar_url does not exist/i.test(message)) {
+      return {
+        driver: null as DriverRecord | null,
+        error:
+          'The Supabase drivers table is missing the `avatar_url` column expected by the auth RPCs. Rerun `triketrack-app/supabase/schema.sql` in the `irkbdinugnasepjowhzr.supabase.co` project, then try again.',
+      };
+    }
 
     if (isMissingFunction) {
       return {
@@ -89,7 +146,7 @@ export async function upsertDriverLocation(params: {
   recordedAt?: string;
 }) {
   if (!supabase) {
-    return { error: 'Supabase is not configured.' };
+    return { error: getSupabaseConfigError() ?? 'Supabase is not configured.' };
   }
 
   const rpcAttempt = await supabase.rpc('upsert_driver_location', {
@@ -137,7 +194,7 @@ export async function upsertDriverLocation(params: {
 
 export async function setDriverLocationOffline(driverId: number) {
   if (!supabase) {
-    return { error: 'Supabase is not configured.' };
+    return { error: getSupabaseConfigError() ?? 'Supabase is not configured.' };
   }
 
   const rpcAttempt = await supabase.rpc('set_driver_location_offline', {
@@ -525,28 +582,43 @@ export async function uploadDriverAvatar(_params: {
   ext?: string;
 }) {
   if (!supabase) {
-    return { publicUrl: null as string | null, error: 'Supabase is not configured.' };
+    return {
+      publicUrl: null as string | null,
+      error: getSupabaseConfigError() ?? 'Supabase is not configured.',
+      warning: null as string | null,
+    };
   }
 
   try {
-    const response = await fetch(_params.localUri);
-    const blob = await response.blob();
     const extension =
       _params.ext ??
       _params.localUri.split('.').pop()?.split('?')[0]?.toLowerCase() ??
       'jpg';
     const normalizedExt = extension === 'jpeg' ? 'jpg' : extension;
     const filePath = `driver-${_params.driverId}/avatar.${normalizedExt}`;
+    const base64Payload = await FileSystemLegacy.readAsStringAsync(_params.localUri, {
+      encoding: 'base64',
+    });
+    const fileBytes = Uint8Array.from(atob(base64Payload), (char) => char.charCodeAt(0));
 
     const { error: uploadError } = await supabase.storage
       .from('driver-avatars')
-      .upload(filePath, blob, {
+      .upload(filePath, fileBytes, {
         upsert: true,
-        contentType: _params.contentType ?? blob.type ?? `image/${normalizedExt}`,
+        contentType: _params.contentType ?? `image/${normalizedExt}`,
       });
 
     if (uploadError) {
-      return { publicUrl: null as string | null, error: uploadError.message };
+      const message = uploadError.message ?? 'Unable to upload avatar.';
+      if (/bucket not found/i.test(message)) {
+        return {
+          publicUrl: null as string | null,
+          error: null as string | null,
+          warning:
+            `Avatar upload is not fully configured yet. The \`driver-avatars\` bucket was not found in ${getSupabaseProjectLabel()}, so the photo is saved only on this device for now. Run \`triketrack-app/supabase/storage_bucket.sql\` in that same Supabase project to sync avatars across devices.`,
+        };
+      }
+      return { publicUrl: null as string | null, error: message, warning: null as string | null };
     }
 
     const {
@@ -565,15 +637,20 @@ export async function uploadDriverAvatar(_params: {
         .eq('driver_id', _params.driverId);
 
       if (updateError) {
-        return { publicUrl: null as string | null, error: updateError.message };
+        return {
+          publicUrl: null as string | null,
+          error: updateError.message,
+          warning: null as string | null,
+        };
       }
     }
 
-    return { publicUrl, error: null as string | null };
+    return { publicUrl, error: null as string | null, warning: null as string | null };
   } catch (error) {
     return {
       publicUrl: null as string | null,
       error: error instanceof Error ? error.message : 'Unable to upload avatar.',
+      warning: null as string | null,
     };
   }
 }

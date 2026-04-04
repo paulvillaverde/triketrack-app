@@ -1,17 +1,14 @@
-import { Alert, Pressable, Text, View } from 'react-native';
-import { Feather } from '@expo/vector-icons';
-import { Avatar } from '../ui';
+import { Pressable, Text, View } from 'react-native';
+import { Avatar, AppIcon } from '../ui';
 
 type HomeDashboardSheetProps = {
   isDriverOnline: boolean;
   onGoOnline: () => void;
   onGoOffline: () => void;
+  onOpenNotifications: () => void;
+  unreadNotificationCount: number;
   isResolvingAccurateLocation: boolean;
   tripOpenPending: boolean;
-  firstFixDurationMs: number | null;
-  displayAccuracyMeters: number | null;
-  locationFreshnessSeconds: number;
-  gpsDebugText: string;
   profileName: string;
   profileDriverCode: string;
   profilePlateNumber: string;
@@ -28,12 +25,10 @@ export function HomeDashboardSheet({
   isDriverOnline,
   onGoOnline,
   onGoOffline,
+  onOpenNotifications,
+  unreadNotificationCount,
   isResolvingAccurateLocation,
   tripOpenPending,
-  firstFixDurationMs,
-  displayAccuracyMeters,
-  locationFreshnessSeconds,
-  gpsDebugText,
   profileName,
   profileDriverCode,
   profilePlateNumber,
@@ -52,21 +47,29 @@ export function HomeDashboardSheet({
         <View style={localStyles.statusActions}>
           <Pressable
             style={localStyles.statusIconButton}
-            onPress={() => Alert.alert('Notifications', 'No notifications yet.')}
+            onPress={onOpenNotifications}
           >
-            <Feather name="bell" size={16} color="#0F172A" />
+            <AppIcon name="bell" size={16} color="#0F172A" />
+            {unreadNotificationCount > 0 ? (
+              <View style={localStyles.notificationBadge}>
+                <Text style={localStyles.notificationBadgeText}>
+                  {unreadNotificationCount > 99 ? '99+' : unreadNotificationCount}
+                </Text>
+              </View>
+            ) : null}
           </Pressable>
           <Pressable
             style={[
               localStyles.statusToggle,
               isDriverOnline ? localStyles.statusToggleOn : localStyles.statusToggleOff,
+              !isDriverOnline && localStyles.statusToggleLocked,
             ]}
+            hitSlop={10}
+            disabled={!isDriverOnline}
             onPress={() => {
               if (isDriverOnline) {
                 onGoOffline();
-                return;
               }
-              onGoOnline();
             }}
           >
             <View
@@ -83,15 +86,15 @@ export function HomeDashboardSheet({
 
       {!isDriverOnline ? (
         <View style={localStyles.offlineBanner}>
-          <Feather name="cloud-off" size={14} color="#FFFFFF" />
+          <AppIcon name="cloud-off" size={14} color="#FFFFFF" />
           <Text style={localStyles.offlineBannerText}>
-            You are offline. Go online to start trips.
+            You are offline. Use the route action to go online and start trips.
           </Text>
         </View>
       ) : null}
       {isDriverOnline && isResolvingAccurateLocation ? (
         <View style={localStyles.locationWarmupBanner}>
-          <Feather name="crosshair" size={14} color="#FFFFFF" />
+          <AppIcon name="crosshair" size={14} color="#FFFFFF" />
           <Text style={localStyles.locationWarmupBannerText}>
             Getting a stable GPS fix...
           </Text>
@@ -99,20 +102,12 @@ export function HomeDashboardSheet({
       ) : null}
       {isDriverOnline && tripOpenPending ? (
         <View style={localStyles.tripGateBanner}>
-          <Feather name="navigation" size={14} color="#FFFFFF" />
+          <AppIcon name="navigation" size={14} color="#FFFFFF" />
           <Text style={localStyles.tripGateBannerText}>
             Waiting for GPS before opening trip...
           </Text>
         </View>
       ) : null}
-      {isDriverOnline &&
-      (firstFixDurationMs !== null || displayAccuracyMeters !== null || locationFreshnessSeconds > 0) ? (
-        <View style={localStyles.gpsDebugBadge}>
-          <Feather name="crosshair" size={12} color="#0F172A" />
-          <Text style={localStyles.gpsDebugText}>{gpsDebugText}</Text>
-        </View>
-      ) : null}
-
       <View style={[localStyles.dashboardSheet, { bottom: 100 + (insetsBottom || 0) }]}>
         <View style={localStyles.sheetHeaderRow}>
           <View style={localStyles.avatarChip}>
@@ -133,18 +128,18 @@ export function HomeDashboardSheet({
           <View style={localStyles.metricRow}>
             <View style={localStyles.metricCard}>
               <View style={localStyles.metricPesoIconWrap}>
-                <Text style={localStyles.metricPesoIconText}>{'\u20B1'}</Text>
+                <AppIcon name="dollar-sign" size={15} color="#57c7a8" />
               </View>
               <Text style={localStyles.metricLabel}>Total earned</Text>
               <Text style={localStyles.metricValue}>{formatPeso(totalEarnings)}</Text>
             </View>
             <View style={localStyles.metricCard}>
-              <Feather name="file-text" size={18} color="#57c7a8" />
+              <AppIcon name="map" size={18} color="#57c7a8" />
               <Text style={localStyles.metricLabel}>Total trips</Text>
               <Text style={localStyles.metricValue}>{totalTrips}</Text>
             </View>
             <View style={localStyles.metricCard}>
-              <Feather name="map-pin" size={18} color="#57c7a8" />
+              <AppIcon name="map-pin" size={18} color="#57c7a8" />
               <Text style={localStyles.metricLabel}>Total distance</Text>
               <Text style={localStyles.metricValue}>{distanceSummaryKm} km</Text>
             </View>

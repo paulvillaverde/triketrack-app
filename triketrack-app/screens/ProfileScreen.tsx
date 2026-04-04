@@ -1,11 +1,10 @@
 import { useEffect, useState } from 'react';
 import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
-import { Feather } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import { BottomTab, HomeNavigationCard } from '../components/navigation/HomeNavigationCard';
 import { EditProfileModal, SupportModal, TermsOfUseModal } from '../components/modals';
 import { InfoRow } from '../components/rows/InfoRow';
-import { Avatar } from '../components/ui';
+import { AppIcon, Avatar } from '../components/ui';
 
 type ProfileScreenProps = {
   onLogout?: () => void;
@@ -127,7 +126,7 @@ export function ProfileScreen({
             <View style={localStyles.avatarContainer}>
               <Avatar name={profileName} imageUri={profileImageUri} style={localStyles.avatar} />
               <Pressable style={localStyles.avatarEditBadge} onPress={changeAvatar}>
-                <Feather name="edit-2" size={16} color="#111827" />
+                <AppIcon name="edit-2" size={16} color="#111827" />
               </Pressable>
             </View>
           </View>
@@ -175,17 +174,17 @@ export function ProfileScreen({
 
             <Pressable style={localStyles.linkRow} onPress={() => setTermsModalVisible(true)}>
               <Text style={localStyles.linkText}>Terms of use</Text>
-              <Feather name="chevron-right" size={16} color="#94A3B8" />
+              <AppIcon name="chevron-right" size={16} color="#94A3B8" />
             </Pressable>
 
             <Pressable style={localStyles.linkRow} onPress={() => setSupportModalVisible(true)}>
               <Text style={localStyles.linkText}>Support</Text>
-              <Feather name="chevron-right" size={16} color="#94A3B8" />
+              <AppIcon name="chevron-right" size={16} color="#94A3B8" />
             </Pressable>
           </View>
 
           <Pressable style={localStyles.logoutButton} onPress={onLogout}>
-            <Feather name="log-out" size={16} color="#FFFFFF" />
+            <AppIcon name="log-out" size={16} color="#FFFFFF" />
             <Text style={localStyles.logoutText}>Log out</Text>
           </Pressable>
         </ScrollView>

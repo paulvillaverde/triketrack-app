@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
-import { Feather } from '@expo/vector-icons';
 import { BottomTab, HomeNavigationCard } from '../components/navigation/HomeNavigationCard';
 import { SubmitAppealModal } from '../components/modals';
+import { AppIcon } from '../components/ui';
 import { listViolations, submitViolationAppeal } from '../supabase';
 
 type ViolationScreenProps = {
@@ -167,7 +167,7 @@ export function ViolationScreen({
         <ScrollView contentContainerStyle={localStyles.scrollContent} showsVerticalScrollIndicator={false}>
           <View style={localStyles.headerRow}>
             <Pressable style={localStyles.iconGhost} onPress={() => onNavigate?.('home')}>
-              <Feather name="chevron-left" size={18} color="#111827" />
+              <AppIcon name="chevron-left" size={18} color="#111827" />
             </Pressable>
             <Text style={localStyles.headerTitle}>Violation History</Text>
             <View style={localStyles.iconGhost} />
@@ -181,7 +181,7 @@ export function ViolationScreen({
               placeholderTextColor="#98A3B3"
               style={localStyles.searchInput}
             />
-            <Feather name="search" size={16} color="#9CA3AF" />
+            <AppIcon name="search" size={16} color="#9CA3AF" />
           </View>
 
           <Text style={localStyles.listSub}>Showing all your violation records</Text>
@@ -246,11 +246,11 @@ export function ViolationScreen({
                     <Text style={localStyles.invoiceMetaSub}>{item.id}</Text>
                   </View>
                   <View style={[localStyles.statusChip, { backgroundColor: statusColor }]}>
-                    <Feather name={isResolved ? 'check' : 'x'} size={14} color="#FFFFFF" />
+                    <AppIcon name={isResolved ? 'check' : 'x'} size={14} color="#FFFFFF" />
                     <Text style={localStyles.statusChipText}>{statusLabel}</Text>
                   </View>
                   <Pressable style={localStyles.stateActionWrap}>
-                    <Feather
+                    <AppIcon
                       name={isResolved ? 'check-circle' : 'alert-circle'}
                       size={16}
                       color={isResolved ? '#57c7a8' : '#EF4444'}
@@ -261,14 +261,14 @@ export function ViolationScreen({
                 <View style={localStyles.infoRow}>
                   <View style={localStyles.infoItem}>
                     <View style={localStyles.infoHead}>
-                      <Feather name="calendar" size={12} color="#6B7280" />
+                      <AppIcon name="calendar" size={12} color="#6B7280" />
                       <Text style={localStyles.infoHeadText}>Date</Text>
                     </View>
                     <Text style={localStyles.infoValue}>{datePart}</Text>
                   </View>
                   <View style={localStyles.infoItem}>
                     <View style={localStyles.infoHead}>
-                      <Feather name="clock" size={12} color="#6B7280" />
+                      <AppIcon name="clock" size={12} color="#6B7280" />
                       <Text style={localStyles.infoHeadText}>Time</Text>
                     </View>
                     <Text style={localStyles.infoValue}>{timePart}</Text>

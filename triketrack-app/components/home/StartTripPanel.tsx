@@ -1,4 +1,5 @@
-import { Pressable, Text, View } from 'react-native';
+import { LayoutChangeEvent, Pressable, Text, View } from 'react-native';
+import { AppIcon } from '../ui';
 
 type StartTripPanelProps = {
   styles: Record<string, any>;
@@ -17,6 +18,7 @@ type StartTripPanelProps = {
   isTripStarted: boolean;
   onOpenSimulation?: () => void;
   onTripButtonPress: () => void | Promise<void>;
+  onLayout?: (event: LayoutChangeEvent) => void;
 };
 
 export function StartTripPanel({
@@ -36,9 +38,12 @@ export function StartTripPanel({
   isTripStarted,
   onOpenSimulation,
   onTripButtonPress,
+  onLayout,
 }: StartTripPanelProps) {
+  const showSimulationAction = enableTripSimulation && !isTripStarted && !!onOpenSimulation;
+
   return (
-    <View style={[styles.routeTripPanel, { bottom: 104 + (insetsBottom || 0) }]}>
+    <View style={[styles.routeTripPanel, { bottom: 104 + (insetsBottom || 0) }]} onLayout={onLayout}>
       <View style={styles.routeGeofenceStatusRow}>
         <Text style={styles.routeGeofenceStatusLabel}>Obrero Geofence</Text>
         <View
@@ -80,7 +85,18 @@ export function StartTripPanel({
 
       <View style={localStyles.navigationMetaRow}>
         <Text style={localStyles.navigationMetaText}>Speed {speedKmh.toFixed(1)} km/h</Text>
-        <Text style={localStyles.navigationMetaText}>Auto-reroute on</Text>
+        <View style={localStyles.metaActionsRow}>
+          <View style={localStyles.metaStatusChip}>
+            <AppIcon name="navigation" size={12} color="#147D64" />
+            <Text style={localStyles.metaStatusChipText}>Auto-reroute on</Text>
+          </View>
+          {showSimulationAction ? (
+            <Pressable style={localStyles.simulationChip} onPress={onOpenSimulation}>
+              <AppIcon name="activity" size={12} color="#2D7DF6" />
+              <Text style={localStyles.simulationChipText}>Simulation</Text>
+            </Pressable>
+          ) : null}
+        </View>
       </View>
 
       {farePickerOpen ? (
@@ -108,15 +124,6 @@ export function StartTripPanel({
             </Pressable>
           ))}
         </View>
-      ) : null}
-
-      {enableTripSimulation && !isTripStarted ? (
-        <Pressable
-          style={[styles.routeStartTripButton, localStyles.simulationButton]}
-          onPress={onOpenSimulation}
-        >
-          <Text style={styles.routeStartTripText}>Start Simulation</Text>
-        </Pressable>
       ) : null}
 
       <Pressable style={styles.routeStartTripButton} onPress={onTripButtonPress}>

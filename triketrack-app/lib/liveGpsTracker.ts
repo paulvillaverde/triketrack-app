@@ -13,33 +13,25 @@ type StartLiveGpsTrackerParams = {
   onSeed: (sample: LiveGpsSample) => void;
   onUpdate: (sample: LiveGpsSample) => void;
   onError?: (error: unknown) => void;
-  minMoveMeters?: number;
   initialTimeoutMs?: number;
   watchIntervalMs?: number;
-  lastKnownMaxAgeMs?: number;
-  lastKnownRequiredAccuracyMeters?: number;
-};
-
-const distanceMetersBetween = (from: LiveGpsSample, to: LiveGpsSample) => {
-  const toRad = (value: number) => (value * Math.PI) / 180;
-  const earthRadiusMeters = 6371000;
-  const dLat = toRad(to.latitude - from.latitude);
-  const dLon = toRad(to.longitude - from.longitude);
-  const lat1 = toRad(from.latitude);
-  const lat2 = toRad(to.latitude);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return earthRadiusMeters * c;
+  distanceIntervalMeters?: number;
+  staleSampleThresholdMs?: number;
+  accuracy?: Location.Accuracy;
 };
 
 const toLiveGpsSample = (location: Location.LocationObject): LiveGpsSample => ({
   latitude: location.coords.latitude,
   longitude: location.coords.longitude,
   accuracy: location.coords.accuracy,
-  heading: location.coords.heading,
-  speed: location.coords.speed,
+  heading:
+    typeof location.coords.heading === 'number' && Number.isFinite(location.coords.heading)
+      ? location.coords.heading
+      : null,
+  speed:
+    typeof location.coords.speed === 'number' && Number.isFinite(location.coords.speed)
+      ? location.coords.speed
+      : null,
   timestampMs: location.timestamp,
 });
 
@@ -48,27 +40,39 @@ export async function startLiveGpsTracker(params: StartLiveGpsTrackerParams) {
     onSeed,
     onUpdate,
     onError,
-    minMoveMeters = 4,
     initialTimeoutMs = 4000,
     watchIntervalMs = 1000,
-    lastKnownMaxAgeMs = 15000,
-    lastKnownRequiredAccuracyMeters = 250,
+    distanceIntervalMeters = 1,
+    staleSampleThresholdMs = 4000,
+    accuracy = Location.Accuracy.BestForNavigation,
   } = params;
 
   let cancelled = false;
   let subscription: Location.LocationSubscription | null = null;
-  let lastMovementSample: LiveGpsSample | null = null;
+  let firstFreshSampleEmitted = false;
+  let latestSampleTimestampMs = 0;
 
-  const emitMovementIfNeeded = (sample: LiveGpsSample) => {
-    if (!lastMovementSample) {
-      lastMovementSample = sample;
+  const isFreshEnough = (sample: LiveGpsSample) =>
+    sample.timestampMs > 0 && Date.now() - sample.timestampMs <= staleSampleThresholdMs;
+
+  const emitIfFresh = (sample: LiveGpsSample, mode: 'seed' | 'update') => {
+    if (!isFreshEnough(sample)) {
       return;
     }
 
-    if (distanceMetersBetween(lastMovementSample, sample) >= minMoveMeters) {
-      lastMovementSample = sample;
-      onUpdate(sample);
+    if (sample.timestampMs < latestSampleTimestampMs) {
+      return;
     }
+
+    latestSampleTimestampMs = sample.timestampMs;
+
+    if (!firstFreshSampleEmitted || mode === 'seed') {
+      firstFreshSampleEmitted = true;
+      onSeed(sample);
+      return;
+    }
+
+    onUpdate(sample);
   };
 
   try {
@@ -87,23 +91,8 @@ export async function startLiveGpsTracker(params: StartLiveGpsTrackerParams) {
       };
     }
 
-    try {
-      const lastKnownLocation = await Location.getLastKnownPositionAsync({
-        maxAge: lastKnownMaxAgeMs,
-        requiredAccuracy: lastKnownRequiredAccuracyMeters,
-      });
-
-      if (lastKnownLocation && !cancelled) {
-        const sample = toLiveGpsSample(lastKnownLocation as Location.LocationObject);
-        onSeed(sample);
-        lastMovementSample = sample;
-      }
-    } catch (error) {
-      onError?.(error);
-    }
-
     const initialLocationPromise = Location.getCurrentPositionAsync({
-      accuracy: Location.Accuracy.BestForNavigation,
+      accuracy,
       mayShowUserSettingsDialog: true,
     }).catch((error) => {
       onError?.(error);
@@ -112,9 +101,9 @@ export async function startLiveGpsTracker(params: StartLiveGpsTrackerParams) {
 
     subscription = await Location.watchPositionAsync(
       {
-        accuracy: Location.Accuracy.BestForNavigation,
+        accuracy,
         timeInterval: watchIntervalMs,
-        distanceInterval: 1,
+        distanceInterval: distanceIntervalMeters,
         mayShowUserSettingsDialog: true,
       },
       (location) => {
@@ -122,7 +111,7 @@ export async function startLiveGpsTracker(params: StartLiveGpsTrackerParams) {
           return;
         }
 
-        emitMovementIfNeeded(toLiveGpsSample(location));
+        emitIfFresh(toLiveGpsSample(location), 'update');
       },
     );
 
@@ -133,10 +122,7 @@ export async function startLiveGpsTracker(params: StartLiveGpsTrackerParams) {
 
     if (firstCurrentLocation && !cancelled) {
       const sample = toLiveGpsSample(firstCurrentLocation);
-      onSeed(sample);
-      if (!lastMovementSample) {
-        lastMovementSample = sample;
-      }
+      emitIfFresh(sample, 'seed');
     }
   } catch (error) {
     onError?.(error);

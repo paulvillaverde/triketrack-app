@@ -1,4 +1,4 @@
-import { Image, StyleProp, StyleSheet, Text, TextStyle, View, ViewStyle } from 'react-native';
+import { Image, ImageStyle, StyleProp, StyleSheet, Text, TextStyle, View, ViewStyle } from 'react-native';
 
 type AvatarProps = {
   name: string;
@@ -42,11 +42,23 @@ export function Avatar({ name, imageUri, size, style, textStyle }: AvatarProps) 
     : {};
 
   const fontSize = size ? Math.max(12, Math.round(size * 0.42)) : 16;
+  const flattenedStyle = StyleSheet.flatten(style) as ViewStyle | undefined;
+  const resolvedBorderRadius =
+    typeof flattenedStyle?.borderRadius === 'number'
+      ? flattenedStyle.borderRadius
+      : size
+        ? size / 2
+        : 999;
+  const imageStyle: ImageStyle = {
+    width: '100%',
+    height: '100%',
+    borderRadius: resolvedBorderRadius,
+  };
 
   return (
     <View style={[styles.container, baseStyle, { backgroundColor }, style]}>
       {imageUri ? (
-        <Image source={{ uri: imageUri }} style={styles.image} />
+        <Image source={{ uri: imageUri }} style={imageStyle} resizeMode="cover" />
       ) : (
         <Text style={[styles.initial, { fontSize }, textStyle]}>{initial}</Text>
       )}
@@ -59,10 +71,6 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
     alignItems: 'center',
     justifyContent: 'center',
-  },
-  image: {
-    width: '100%',
-    height: '100%',
   },
   initial: {
     color: '#FFFFFF',

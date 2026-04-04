@@ -5,6 +5,14 @@ export type LatLngPoint = {
 
 const ROAD_MATCH_API_BASE_URL =
   process.env.EXPO_PUBLIC_ROAD_MATCH_API_BASE_URL ?? 'https://router.project-osrm.org';
+const OPENROUTESERVICE_API_BASE_URL =
+  process.env.EXPO_PUBLIC_ORS_API_BASE_URL?.trim() ?? 'https://api.openrouteservice.org';
+const OPENROUTESERVICE_API_KEY = process.env.EXPO_PUBLIC_ORS_API_KEY?.trim() ?? '';
+const OPENROUTESERVICE_PROFILE = 'driving-car';
+const OPENROUTESERVICE_DIRECTIONS_MAX_POINTS = 50;
+const GOOGLE_ROADS_API_BASE_URL = 'https://roads.googleapis.com/v1';
+const GOOGLE_ROADS_API_KEY = process.env.EXPO_PUBLIC_GOOGLE_ROADS_API_KEY?.trim() ?? '';
+const GOOGLE_ROADS_MAX_POINTS_PER_REQUEST = 100;
 
 export const dedupeSequentialPoints = (points: LatLngPoint[]) => {
   if (points.length <= 1) {
@@ -124,6 +132,42 @@ const quadraticBezierPoint = (
       t * t * end.longitude,
   };
 };
+
+const chunkDirectionsPoints = (points: LatLngPoint[]) => {
+  const cleanPoints = dedupeSequentialPoints(points);
+  if (cleanPoints.length <= OPENROUTESERVICE_DIRECTIONS_MAX_POINTS) {
+    return [cleanPoints];
+  }
+
+  const chunks: LatLngPoint[][] = [];
+  const step = OPENROUTESERVICE_DIRECTIONS_MAX_POINTS - 1;
+  for (let index = 0; index < cleanPoints.length; index += step) {
+    const chunk = cleanPoints.slice(index, index + OPENROUTESERVICE_DIRECTIONS_MAX_POINTS);
+    if (chunk.length >= 2) {
+      chunks.push(chunk);
+    }
+  }
+
+  return chunks;
+};
+
+const mapCoordinatePairsToPoints = (coordinates?: number[][] | null) =>
+  dedupeSequentialPoints(
+    (coordinates ?? [])
+      .filter(
+        (point): point is number[] =>
+          Array.isArray(point) &&
+          point.length >= 2 &&
+          typeof point[0] === 'number' &&
+          Number.isFinite(point[0]) &&
+          typeof point[1] === 'number' &&
+          Number.isFinite(point[1]),
+      )
+      .map((point) => ({
+        latitude: point[1],
+        longitude: point[0],
+      })),
+  );
 
 export const smoothDisplayedRoutePath = (points: LatLngPoint[]) => {
   const deduped = dedupeSequentialPoints(points);
@@ -268,6 +312,64 @@ export const fetchRoutedRoadPath = async (points: LatLngPoint[]) => {
   }
 };
 
+export const fetchOpenRouteServiceRoadPath = async (points: LatLngPoint[]) => {
+  if (!OPENROUTESERVICE_API_KEY) {
+    return null;
+  }
+
+  const cleanPoints = dedupeSequentialPoints(points);
+  if (cleanPoints.length < 2) {
+    return null;
+  }
+
+  const chunks = chunkDirectionsPoints(cleanPoints);
+  const mergedRoute: LatLngPoint[] = [];
+
+  for (const chunk of chunks) {
+    try {
+      const response = await fetch(
+        `${OPENROUTESERVICE_API_BASE_URL}/v2/directions/${OPENROUTESERVICE_PROFILE}/geojson`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: OPENROUTESERVICE_API_KEY,
+            Accept: 'application/geo+json, application/json',
+            'Content-Type': 'application/json; charset=utf-8',
+          },
+          body: JSON.stringify({
+            coordinates: chunk.map((point) => [point.longitude, point.latitude]),
+            instructions: false,
+            geometry_simplify: false,
+          }),
+        },
+      );
+
+      if (!response.ok) {
+        return null;
+      }
+
+      const json = (await response.json()) as {
+        features?: Array<{
+          geometry?: {
+            coordinates?: number[][];
+          };
+        }>;
+      };
+      const chunkRoute = mapCoordinatePairsToPoints(json.features?.[0]?.geometry?.coordinates ?? null);
+      if (chunkRoute.length < 2) {
+        return null;
+      }
+
+      mergedRoute.push(...chunkRoute);
+    } catch {
+      return null;
+    }
+  }
+
+  const cleanMergedRoute = dedupeSequentialPoints(mergedRoute);
+  return cleanMergedRoute.length >= 2 ? cleanMergedRoute : null;
+};
+
 export const fetchMatchedRoadPath = async (points: LatLngPoint[]) => {
   const cleanPoints = dedupeSequentialPoints(points);
   if (cleanPoints.length < 2) {
@@ -306,6 +408,109 @@ export const fetchMatchedRoadPath = async (points: LatLngPoint[]) => {
   }
 };
 
+export const fetchPreferredRoadPath = async (points: LatLngPoint[]) => {
+  const cleanPoints = dedupeSequentialPoints(points);
+  if (cleanPoints.length < 2) {
+    return null;
+  }
+
+  return (
+    (await fetchOpenRouteServiceRoadPath(cleanPoints)) ??
+    (await fetchMatchedRoadPath(cleanPoints)) ??
+    (await fetchRoutedRoadPath(cleanPoints))
+  );
+};
+
+const buildRoadsApiChunks = (points: LatLngPoint[]) => {
+  const cleanPoints = dedupeSequentialPoints(points);
+  if (cleanPoints.length <= GOOGLE_ROADS_MAX_POINTS_PER_REQUEST) {
+    return [cleanPoints];
+  }
+
+  const chunks: LatLngPoint[][] = [];
+  const step = GOOGLE_ROADS_MAX_POINTS_PER_REQUEST - 1;
+  for (let index = 0; index < cleanPoints.length; index += step) {
+    const chunk = cleanPoints.slice(index, index + GOOGLE_ROADS_MAX_POINTS_PER_REQUEST);
+    if (chunk.length >= 2) {
+      chunks.push(chunk);
+    }
+  }
+
+  return chunks;
+};
+
+export const fetchGoogleSnappedRoadPath = async (points: LatLngPoint[]) => {
+  if (!GOOGLE_ROADS_API_KEY) {
+    return null;
+  }
+
+  const cleanPoints = dedupeSequentialPoints(points);
+  if (cleanPoints.length < 2) {
+    return null;
+  }
+
+  const chunks = buildRoadsApiChunks(cleanPoints);
+  const snappedPoints: LatLngPoint[] = [];
+
+  for (const chunk of chunks) {
+    const params = new URLSearchParams({
+      path: chunk.map((point) => `${point.latitude},${point.longitude}`).join('|'),
+      interpolate: 'true',
+      key: GOOGLE_ROADS_API_KEY,
+    });
+
+    try {
+      const response = await fetch(`${GOOGLE_ROADS_API_BASE_URL}/snapToRoads?${params.toString()}`);
+      if (!response.ok) {
+        return null;
+      }
+
+      const json = (await response.json()) as {
+        snappedPoints?: Array<{
+          location?: {
+            latitude?: number;
+            longitude?: number;
+          };
+        }>;
+      };
+
+      const chunkResult =
+        json.snappedPoints
+          ?.map((point) => point.location)
+          .filter(
+            (
+              location,
+            ): location is {
+              latitude: number;
+              longitude: number;
+            } =>
+              Boolean(
+                location &&
+                  typeof location.latitude === 'number' &&
+                  Number.isFinite(location.latitude) &&
+                  typeof location.longitude === 'number' &&
+                  Number.isFinite(location.longitude),
+              ),
+          )
+          .map((location) => ({
+            latitude: location.latitude,
+            longitude: location.longitude,
+          })) ?? [];
+
+      if (chunkResult.length < 2) {
+        return null;
+      }
+
+      snappedPoints.push(...chunkResult);
+    } catch {
+      return null;
+    }
+  }
+
+  const cleanSnappedPoints = dedupeSequentialPoints(snappedPoints);
+  return cleanSnappedPoints.length >= 2 ? cleanSnappedPoints : null;
+};
+
 export const snapActualPathToRoad = async (points: LatLngPoint[]) => {
   const cleanPoints = dedupeSequentialPoints(points);
   if (cleanPoints.length < 2) {
@@ -313,8 +518,8 @@ export const snapActualPathToRoad = async (points: LatLngPoint[]) => {
   }
 
   const snappedPath =
-    (await fetchMatchedRoadPath(cleanPoints)) ??
-    (await fetchRoutedRoadPath(cleanPoints)) ??
+    (await fetchGoogleSnappedRoadPath(cleanPoints)) ??
+    (await fetchPreferredRoadPath(cleanPoints)) ??
     cleanPoints;
 
   return smoothDisplayedRoutePath(snappedPath);

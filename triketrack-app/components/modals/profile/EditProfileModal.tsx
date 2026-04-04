@@ -1,5 +1,5 @@
 import { Modal, Pressable, Text, TextInput, View } from 'react-native';
-import { Feather } from '@expo/vector-icons';
+import { AppIcon } from '../../ui';
 import { profileModalStyles } from './profileModalStyles';
 import { Avatar } from '../../ui';
 
@@ -71,7 +71,7 @@ export function EditProfileModal({
             <>
               <Text style={profileModalStyles.modalLabel}>Avatar</Text>
               <Pressable style={profileModalStyles.uploadIconButton} onPress={pickProfileImage}>
-                <Feather name="folder" size={18} color="#57c7a8" />
+                <AppIcon name="folder" size={18} color="#57c7a8" />
               </Pressable>
             </>
           ) : null}

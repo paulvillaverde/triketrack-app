@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
 import { Alert, Animated, Easing, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
-import { Feather } from '@expo/vector-icons';
 import MapView, {
   AnimatedRegion,
   Circle,
@@ -9,14 +8,22 @@ import MapView, {
   Polyline,
   PROVIDER_GOOGLE,
 } from 'react-native-maps';
+import * as Location from 'expo-location';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNetInfo } from '@react-native-community/netinfo';
 import { BottomTab, HomeNavigationCard } from '../components/navigation/HomeNavigationCard';
 import { HomeDashboardSheet } from '../components/home/HomeDashboardSheet';
 import { StartTripPanel } from '../components/home/StartTripPanel';
-import { DriverAvatarMarker } from '../components/maps/DriverAvatarMarker';
+import { TripNavigationPanel } from '../components/home/TripNavigationPanel';
+import { AppleMapPinMarker } from '../components/maps/AppleMapPinMarker';
 import { GeofenceViolationBanner } from '../components/maps/GeofenceViolationBanner';
-import { OutsideGeofenceModal } from '../components/modals';
+import {
+  NotificationCenterModal,
+  OutsideGeofenceModal,
+  TripSummaryModal,
+  type NotificationCenterItem,
+} from '../components/modals';
+import { AppIcon } from '../components/ui';
 import { getMotionDurationMs, shortestAngleDelta } from '../lib/mapTracking';
 import {
   dedupeSequentialPoints,
@@ -35,14 +42,21 @@ import {
   DARK_MAP_STYLE,
   ENABLE_TRIP_SIMULATION,
   FAST_START_REQUIRED_ACCURACY_METERS,
+  ACTIVE_CAMERA_ACCURACY_METERS,
+  ACTIVE_LOCATION_ACCURACY,
+  GPS_DISTANCE_INTERVAL_METERS,
+  GPS_STALE_SAMPLE_THRESHOLD_MS,
   formatPeso,
   HIGH_CONFIDENCE_ACCURACY_METERS,
+  IDLE_CAMERA_ACCURACY_METERS,
+  IDLE_GPS_DISTANCE_INTERVAL_METERS,
+  IDLE_GPS_STALE_SAMPLE_THRESHOLD_MS,
+  IDLE_LOCATION_ACCURACY,
+  IDLE_WATCH_LOCATION_INTERVAL_MS,
   INITIAL_LOCATION_TIMEOUT_MS,
   INITIAL_VISIBLE_ACCURACY_METERS,
   isPointInsidePolygon,
   isValidCoordinate,
-  LAST_KNOWN_MAX_AGE_MS,
-  LAST_KNOWN_REQUIRED_ACCURACY_METERS,
   MAP_TYPE_OPTIONS,
   MAX_ACCEPTED_ACCURACY_METERS,
   MAX_ACCEPTED_SPEED_KMH,
@@ -57,8 +71,10 @@ import {
   NORMAL_CAMERA,
   OBRERO_GEOFENCE,
   ROAD_MATCH_BATCH_SIZE,
+  ROAD_MATCH_OVERLAP_POINTS,
   type MapTypeOption,
   TRIP_CAMERA_FOLLOW_INTERVAL_MS,
+  WEAK_GPS_RECOVERY_ACCURACY_METERS,
   WATCH_LOCATION_INTERVAL_MS,
 } from './homeScreenShared';
 
@@ -72,21 +88,31 @@ type HomeScreenProps = {
   onGoOnline: () => void;
   onGoOffline: () => void;
   onBackToHome: () => void;
+  onRequestTripNavigation?: () => void;
+  onExitTripNavigation?: () => void;
   onOpenSimulation?: () => void;
   locationEnabled: boolean;
   tripOpenPending?: boolean;
   onLocationVisibilityChange?: (visible: boolean) => void;
+  notifications: NotificationCenterItem[];
+  unreadNotificationCount: number;
+  onMarkNotificationRead: (notificationId: string) => void;
+  onMarkAllNotificationsRead: () => void;
   onTripComplete: (payload: {
     fare: number;
     distanceKm: number;
     durationSeconds: number;
     routePath: Array<{ latitude: number; longitude: number }>;
     endLocation: { latitude: number; longitude: number } | null;
+    rawTelemetry?: import('../lib/tripPathReconstruction').RawTripTelemetryPoint[];
   }) => void;
   onTripStart?: (payload: { startLocation: { latitude: number; longitude: number } | null }) => void;
   onTripPointRecord?: (payload: {
     latitude: number;
     longitude: number;
+    speed?: number | null;
+    heading?: number | null;
+    accuracy?: number | null;
     recordedAt: string;
   }) => void;
   onGeofenceExit?: (payload: { location: { latitude: number; longitude: number } | null }) => void;
@@ -101,6 +127,7 @@ type HomeScreenProps = {
   mapTypeOption: MapTypeOption;
   onChangeMapTypeOption: (value: MapTypeOption) => void;
   styles: Record<string, any>;
+  tripNavigationMode?: boolean;
 };
 
 
@@ -112,10 +139,16 @@ export function HomeScreen({
   onGoOnline,
   onGoOffline,
   onBackToHome,
+  onRequestTripNavigation,
+  onExitTripNavigation,
   onOpenSimulation,
   locationEnabled,
   tripOpenPending = false,
   onLocationVisibilityChange,
+  notifications,
+  unreadNotificationCount,
+  onMarkNotificationRead,
+  onMarkAllNotificationsRead,
   onTripComplete,
   onTripStart,
   onTripPointRecord,
@@ -131,6 +164,7 @@ export function HomeScreen({
   mapTypeOption,
   onChangeMapTypeOption,
   styles,
+  tripNavigationMode = false,
 }: HomeScreenProps) {
   const mapRef = useRef<MapView | null>(null);
   const markerRef = useRef<any>(null);
@@ -140,14 +174,23 @@ export function HomeScreen({
   const [coords, setCoords] = useState<{ latitude: number; longitude: number } | null>(null);
   const [farePickerOpen, setFarePickerOpen] = useState(false);
   const [showOutsideGeofenceModal, setShowOutsideGeofenceModal] = useState(false);
+  const [showNotificationCenter, setShowNotificationCenter] = useState(false);
+  const [currentAreaLabel, setCurrentAreaLabel] = useState('Live route tracking');
   const [selectedFare, setSelectedFare] = useState(10);
   const [isTripStarted, setIsTripStarted] = useState(false);
   const [isSimulatingTrip, setIsSimulatingTrip] = useState(false);
+  const [tripPanelHeight, setTripPanelHeight] = useState(0);
+  const [tripSummary, setTripSummary] = useState<{
+    durationText: string;
+    distanceText: string;
+    speedText: string;
+    statusText: string;
+  } | null>(null);
+  const [completedTripPreviewPath, setCompletedTripPreviewPath] = useState<LatLngPoint[]>([]);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [distanceKm, setDistanceKm] = useState(0);
   const [speedKmh, setSpeedKmh] = useState(0);
   const [isResolvingAccurateLocation, setIsResolvingAccurateLocation] = useState(false);
-  const [shouldTrackMarkerViewChanges, setShouldTrackMarkerViewChanges] = useState(true);
   const [displayAccuracyMeters, setDisplayAccuracyMeters] = useState<number | null>(null);
   const [firstFixDurationMs, setFirstFixDurationMs] = useState<number | null>(null);
   const [lastLocationTimestampMs, setLastLocationTimestampMs] = useState<number | null>(null);
@@ -164,6 +207,7 @@ export function HomeScreen({
   const lastTrackPointRef = useRef(lastTrackPoint);
   const lastRawTrackPointRef = useRef<LatLngPoint | null>(null);
   const pendingRawPointsRef = useRef<LatLngPoint[]>([]);
+  const roadMatchCarryoverRef = useRef<LatLngPoint[]>([]);
   const recentAcceptedPointsRef = useRef<LatLngPoint[]>([]);
   const routePointsRef = useRef<Array<LatLngPoint>>([]);
   const travelPathRef = useRef<Array<LatLngPoint>>([]);
@@ -200,11 +244,41 @@ export function HomeScreen({
   const hasLoggedJumpSampleRef = useRef(false);
   const lastDisplayPointRef = useRef<LatLngPoint | null>(null);
   const movementConfirmationCountRef = useRef(0);
+  const lastGeocodeAtRef = useRef(0);
+  const lastGeocodedPointRef = useRef<LatLngPoint | null>(null);
 
   const isDarkMap = mapTypeOption === 'dark';
   const activeMapType: 'standard' | 'satellite' = mapTypeOption === 'satellite' ? 'satellite' : 'standard';
   const hasValidCoords = isValidCoordinate(coords);
   const isNetworkAvailable = Boolean(netInfo.isConnected && netInfo.isInternetReachable !== false);
+  const tripPanelBottom = (isTripStarted ? 26 : 104) + (insets.bottom || 0);
+  const activeTripPanelHeight = isTripStarted ? Math.max(tripPanelHeight, 240) : Math.max(tripPanelHeight, 242);
+  const mapControlsBottom = tripPanelBottom + activeTripPanelHeight + 18;
+  const topControlTop = Platform.OS === 'android' ? (insets.top || 0) + 12 : Math.max((insets.top || 0) + 6, 52);
+  const homeMapTypeTop = !isDriverOnline
+    ? 108
+    : tripOpenPending
+      ? 214
+      : isResolvingAccurateLocation
+        ? 162
+        : 66;
+  const isDedicatedTripNavigation = isTripScreen && tripNavigationMode;
+  const shouldShowTripNavigationMode = isTripScreen && (tripNavigationMode || isTripStarted);
+  const isHighPriorityTracking = locationEnabled && (isDriverOnline || isTripStarted);
+  const trackerAccuracy: Location.Accuracy = isHighPriorityTracking
+    ? ACTIVE_LOCATION_ACCURACY
+    : IDLE_LOCATION_ACCURACY;
+  const trackerWatchIntervalMs = isHighPriorityTracking
+    ? WATCH_LOCATION_INTERVAL_MS
+    : IDLE_WATCH_LOCATION_INTERVAL_MS;
+  const trackerDistanceIntervalMeters = isHighPriorityTracking
+    ? GPS_DISTANCE_INTERVAL_METERS
+    : IDLE_GPS_DISTANCE_INTERVAL_METERS;
+  const trackerStaleSampleThresholdMs = isHighPriorityTracking
+    ? GPS_STALE_SAMPLE_THRESHOLD_MS
+    : IDLE_GPS_STALE_SAMPLE_THRESHOLD_MS;
+  const isLowGpsAccuracy =
+    displayAccuracyMeters !== null && displayAccuracyMeters > ACTIVE_CAMERA_ACCURACY_METERS;
 
   const mapTypeLabel = (value: MapTypeOption) => {
     if (value === 'satellite') return 'Satellite';
@@ -260,29 +334,6 @@ export function HomeScreen({
   }, [hasValidCoords, onLocationVisibilityChange]);
 
   useEffect(() => {
-    setShouldTrackMarkerViewChanges(true);
-    const timeout = setTimeout(() => {
-      setShouldTrackMarkerViewChanges(false);
-    }, 1800);
-
-    return () => clearTimeout(timeout);
-  }, [profileImageUri, profileName]);
-
-  useEffect(() => {
-    if (!hasValidCoords) {
-      return;
-    }
-
-    console.info('[HomeScreen] Rendering driver marker at', coords);
-    setShouldTrackMarkerViewChanges(true);
-    const timeout = setTimeout(() => {
-      setShouldTrackMarkerViewChanges(false);
-    }, 1800);
-
-    return () => clearTimeout(timeout);
-  }, [coords, hasValidCoords]);
-
-  useEffect(() => {
     if (!hasValidCoords) {
       markerInitializedRef.current = false;
       lastAnimatedMarkerPointRef.current = null;
@@ -330,6 +381,7 @@ export function HomeScreen({
       setFirstFixDurationMs(null);
       setLastLocationTimestampMs(null);
       setLocationFreshnessSeconds(0);
+      setCurrentAreaLabel('Live route tracking');
       setHasGeofenceViolation(false);
       firstFixStartedAtRef.current = null;
       firstFixCapturedRef.current = false;
@@ -341,6 +393,8 @@ export function HomeScreen({
       hasLoggedLowAccuracyRef.current = false;
       hasLoggedInvalidSampleRef.current = false;
       hasLoggedJumpSampleRef.current = false;
+      lastGeocodedPointRef.current = null;
+      lastGeocodeAtRef.current = 0;
     }
   }, [locationEnabled]);
 
@@ -359,6 +413,54 @@ export function HomeScreen({
     return () => clearInterval(timer);
   }, [lastLocationTimestampMs]);
 
+  useEffect(() => {
+    if (!isTripScreen || !coords) {
+      if (!isTripStarted) {
+        setCurrentAreaLabel('Live route tracking');
+      }
+      return;
+    }
+
+    const now = Date.now();
+    const lastPoint = lastGeocodedPointRef.current;
+    const movedEnough = !lastPoint || distanceBetweenKm(lastPoint, coords) >= 0.05;
+    const waitedEnough = now - lastGeocodeAtRef.current >= 15000;
+
+    if (!movedEnough && !waitedEnough) {
+      return;
+    }
+
+    let cancelled = false;
+    lastGeocodeAtRef.current = now;
+
+    void (async () => {
+      try {
+        const results = await Location.reverseGeocodeAsync(coords);
+        if (cancelled) {
+          return;
+        }
+
+        const first = results[0];
+        const pieces = [
+          first?.street,
+          first?.district ?? first?.subregion,
+          first?.city,
+        ].filter((value): value is string => Boolean(value && value.trim().length > 0));
+
+        if (pieces.length > 0) {
+          setCurrentAreaLabel(pieces.slice(0, 2).join(', '));
+          lastGeocodedPointRef.current = coords;
+        }
+      } catch {
+        // Keep the last known area label if reverse geocoding is unavailable.
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [coords, isTripScreen, isTripStarted]);
+
   const fallbackCenter = {
     latitude: 7.0849408,
     longitude: 125.6121403,
@@ -375,6 +477,17 @@ export function HomeScreen({
 
     return () => clearInterval(timer);
   }, [isTripStarted]);
+
+  const hasAutoStartedTripNavigationRef = useRef(false);
+
+  useEffect(() => {
+    if (!isDedicatedTripNavigation || isTripStarted || hasAutoStartedTripNavigationRef.current) {
+      return;
+    }
+
+    hasAutoStartedTripNavigationRef.current = true;
+    void beginTripSession(coords ?? latestActualCoordsRef.current ?? null);
+  }, [coords, isDedicatedTripNavigation, isTripStarted]);
 
   useEffect(() => {
     if (!isTripScreen) {
@@ -567,9 +680,11 @@ export function HomeScreen({
   const getStabilizedPoint = ({
     point,
     accuracy,
+    speedKmh,
   }: {
     point: LatLngPoint;
     accuracy?: number | null;
+    speedKmh?: number | null;
   }) => {
     const previousAccepted = lastAcceptedSampleRef.current?.point ?? null;
     if (!previousAccepted) {
@@ -578,25 +693,61 @@ export function HomeScreen({
     }
 
     const movedKm = distanceBetweenKm(previousAccepted, point);
-    if (movedKm >= 0.02) {
+    if (movedKm >= 0.018) {
       recentAcceptedPointsRef.current = [point];
       return point;
     }
 
-    const blendFactor =
+    const nextBuffer = [...recentAcceptedPointsRef.current.slice(-3), point];
+    recentAcceptedPointsRef.current = nextBuffer;
+
+    const weightedAverage = nextBuffer.reduce<{
+      latitude: number;
+      longitude: number;
+      weight: number;
+    }>(
+      (sum, entry, index) => {
+        const weight = index + 1;
+        return {
+          latitude: sum.latitude + entry.latitude * weight,
+          longitude: sum.longitude + entry.longitude * weight,
+          weight: sum.weight + weight,
+        };
+      },
+      { latitude: 0, longitude: 0, weight: 0 },
+    );
+
+    const averagedPoint = {
+      latitude: weightedAverage.latitude / weightedAverage.weight,
+      longitude: weightedAverage.longitude / weightedAverage.weight,
+    };
+
+    const accuracyBlend =
       typeof accuracy === 'number' && Number.isFinite(accuracy)
         ? accuracy <= HIGH_CONFIDENCE_ACCURACY_METERS
           ? 0.9
           : accuracy <= MAX_ACCEPTED_ACCURACY_METERS
-            ? 0.72
-            : 0.55
-        : 0.7;
+            ? 0.76
+            : 0.5
+        : 0.72;
+    const motionBlend =
+      speedKmh !== null && typeof speedKmh === 'number'
+        ? speedKmh >= 24
+          ? 0.94
+          : speedKmh >= 10
+            ? 0.84
+            : 0.7
+        : 0.66;
+    const blendFactor = Math.max(accuracyBlend, motionBlend);
 
     const stabilizedPoint = {
-      latitude: previousAccepted.latitude + (point.latitude - previousAccepted.latitude) * blendFactor,
-      longitude: previousAccepted.longitude + (point.longitude - previousAccepted.longitude) * blendFactor,
+      latitude:
+        previousAccepted.latitude + (averagedPoint.latitude - previousAccepted.latitude) * blendFactor,
+      longitude:
+        previousAccepted.longitude + (averagedPoint.longitude - previousAccepted.longitude) * blendFactor,
     };
-    recentAcceptedPointsRef.current = [stabilizedPoint];
+
+    recentAcceptedPointsRef.current = [...nextBuffer.slice(0, -1), stabilizedPoint];
     return stabilizedPoint;
   };
 
@@ -674,14 +825,27 @@ export function HomeScreen({
   }) => {
     const sampleTimestampMs = timestampMs ?? Date.now();
     const previousAccepted = lastAcceptedSampleRef.current;
+    const speedKmh =
+      typeof speed === 'number' && Number.isFinite(speed) && speed >= 0 ? speed * 3.6 : null;
     const accuracyLimit = previousAccepted
       ? MAX_ACCEPTED_ACCURACY_METERS
       : INITIAL_VISIBLE_ACCURACY_METERS;
+    const canUseWeakGpsRecovery =
+      Boolean(previousAccepted) &&
+      typeof accuracy === 'number' &&
+      Number.isFinite(accuracy) &&
+      accuracy > accuracyLimit &&
+      accuracy <= WEAK_GPS_RECOVERY_ACCURACY_METERS &&
+      sampleTimestampMs - (previousAccepted?.timestampMs ?? 0) >= (isHighPriorityTracking ? 1800 : 2500);
     if (
       typeof accuracy === 'number' &&
       Number.isFinite(accuracy) &&
-      accuracy > accuracyLimit
+      accuracy > accuracyLimit &&
+      !canUseWeakGpsRecovery
     ) {
+      setDisplayAccuracyMeters(accuracy);
+      setLastLocationTimestampMs(sampleTimestampMs);
+      setIsResolvingAccurateLocation(false);
       if (
         !lastAcceptedSampleRef.current &&
         !hasValidCoords &&
@@ -724,6 +888,8 @@ export function HomeScreen({
       const gapKm = distanceBetweenKm(previousAccepted.point, rawPoint);
       const elapsedSec = Math.max((sampleTimestampMs - previousAccepted.timestampMs) / 1000, 0);
       if (gapKm > MAX_LOCATION_JUMP_KM && elapsedSec <= 3) {
+        setDisplayAccuracyMeters(typeof accuracy === 'number' ? accuracy : null);
+        setLastLocationTimestampMs(sampleTimestampMs);
         if (!hasLoggedJumpSampleRef.current) {
           hasLoggedJumpSampleRef.current = true;
           console.warn('[HomeScreen] Rejected GPS jump sample.', {
@@ -741,14 +907,24 @@ export function HomeScreen({
     let stablePoint = getStabilizedPoint({
       point: rawPoint,
       accuracy,
+      speedKmh,
     });
-    const speedKmh =
-      typeof speed === 'number' && Number.isFinite(speed) && speed >= 0 ? speed * 3.6 : null;
+    if (canUseWeakGpsRecovery && previousAccepted) {
+      stablePoint = {
+        latitude: previousAccepted.point.latitude + (stablePoint.latitude - previousAccepted.point.latitude) * 0.22,
+        longitude:
+          previousAccepted.point.longitude + (stablePoint.longitude - previousAccepted.point.longitude) * 0.22,
+      };
+    }
     const lastDisplayPoint = lastDisplayPointRef.current ?? previousAccepted?.point ?? null;
     if (!isTripStartedRef.current && !isSimulatingTripRef.current && lastDisplayPoint) {
       const displayGapKm = distanceBetweenKm(lastDisplayPoint, stablePoint);
+      const accuracyBufferKm =
+        typeof accuracy === 'number' && Number.isFinite(accuracy)
+          ? Math.max((accuracy / 1000) * 0.35, MIN_TRACK_MOVE_KM * 0.45)
+          : MIN_TRACK_MOVE_KM;
       const likelyStationary =
-        displayGapKm < MIN_TRACK_MOVE_KM ||
+        displayGapKm < accuracyBufferKm ||
         (speedKmh !== null && speedKmh <= MAX_STATIONARY_SPEED_KMH);
 
       if (likelyStationary) {
@@ -788,23 +964,33 @@ export function HomeScreen({
     if (!isTripStartedRef.current) {
       updateMarkerPosition(stablePoint);
     }
+    const cameraAccuracyThreshold = isHighPriorityTracking
+      ? ACTIVE_CAMERA_ACCURACY_METERS
+      : IDLE_CAMERA_ACCURACY_METERS;
+    const canRecenterCamera =
+      typeof accuracy !== 'number' ||
+      !Number.isFinite(accuracy) ||
+      accuracy <= cameraAccuracyThreshold;
     if (mapRef.current && !hasCenteredRef.current) {
-      mapRef.current.animateCamera(
-        {
-          center: stablePoint,
-          zoom: isTripScreen ? 18 : 16,
-          heading: 0,
-          pitch: 0,
-        },
-        { duration: 450 },
-      );
-      hasCenteredRef.current = true;
-      setHasCentered(true);
+      if (canRecenterCamera) {
+        mapRef.current.animateCamera(
+          {
+            center: stablePoint,
+            zoom: isTripScreen ? 18 : 16,
+            heading: 0,
+            pitch: 0,
+          },
+          { duration: 450 },
+        );
+        hasCenteredRef.current = true;
+        setHasCentered(true);
+      }
     } else if (
       mapRef.current &&
       !isSimulatingTripRef.current &&
       !isTripStartedRef.current &&
-      Date.now() - lastCameraFollowAtRef.current >= 800
+      canRecenterCamera &&
+      Date.now() - lastCameraFollowAtRef.current >= (isHighPriorityTracking ? 700 : 1500)
     ) {
       lastCameraFollowAtRef.current = Date.now();
       mapRef.current.animateCamera(
@@ -818,9 +1004,14 @@ export function HomeScreen({
       );
     }
 
-    if (typeof heading === 'number' && Number.isFinite(heading) && heading >= 0) {
-      liveHeadingRef.current = heading;
-      setHeadingDeg(heading);
+      if (typeof heading === 'number' && Number.isFinite(heading) && heading >= 0) {
+      const shouldUseHeading =
+        (speedKmh !== null && speedKmh >= 6) ||
+        (previousAccepted ? distanceBetweenKm(previousAccepted.point, stablePoint) >= 0.004 : false);
+      if (shouldUseHeading) {
+        liveHeadingRef.current = heading;
+        setHeadingDeg(heading);
+      }
     }
     if (
       typeof speed === 'number' &&
@@ -866,7 +1057,12 @@ export function HomeScreen({
 
     roadSnapQueueRef.current = roadSnapQueueRef.current
       .then(async () => {
-        const inputPoints = anchorPoint ? [anchorPoint, ...batchPoints] : batchPoints;
+        const overlapPoints = roadMatchCarryoverRef.current;
+        const inputPoints = dedupeSequentialPoints([
+          ...(anchorPoint ? [anchorPoint] : []),
+          ...overlapPoints,
+          ...batchPoints,
+        ]);
         if (inputPoints.length < 2) {
           return;
         }
@@ -880,6 +1076,9 @@ export function HomeScreen({
 
         if (!isNetworkAvailable) {
           const latestRawPoint = rawSegment[rawSegment.length - 1];
+          roadMatchCarryoverRef.current = rawSegment.slice(
+            Math.max(rawSegment.length - ROAD_MATCH_OVERLAP_POINTS, 0),
+          );
           appendRouteSegment(rawSegment);
           updateMarkerPosition(latestRawPoint);
           snappedCoordsRef.current = latestRawPoint;
@@ -890,14 +1089,18 @@ export function HomeScreen({
         }
 
         const latestRawPoint = rawSegment[rawSegment.length - 1];
+        const roadMatchedSegment =
+          rawSegment.length >= MIN_ROAD_MATCH_POINTS
+            ? await fetchMatchedRoadPath(rawSegment)
+            : null;
         const snappedStartPoint = anchorPoint
           ? (await fetchNearestRoadPoint(anchorPoint)) ?? anchorPoint
           : rawSegment[0];
         const snappedEndPoint = (await fetchNearestRoadPoint(latestRawPoint)) ?? latestRawPoint;
         const snappedWaypoints = dedupeSequentialPoints([snappedStartPoint, snappedEndPoint]);
-        const matchedSegment =
+        const routedSegment =
           snappedWaypoints.length >= 2 ? await fetchRoutedRoadPath(snappedWaypoints) : null;
-        let segment = dedupeSequentialPoints(matchedSegment ?? snappedWaypoints);
+        let segment = dedupeSequentialPoints(roadMatchedSegment ?? routedSegment ?? snappedWaypoints);
 
         if (segment.length >= 2) {
           const latestSnappedPoint = segment[segment.length - 1];
@@ -906,15 +1109,18 @@ export function HomeScreen({
           const looksOverRouted =
             rawSegmentDistanceKm > 0 &&
             snappedDistanceKm > Math.max(rawSegmentDistanceKm * 1.45, rawSegmentDistanceKm + 0.02);
-          const endpointTooFar = endpointOffsetKm > 0.03;
+          const endpointTooFar = endpointOffsetKm > (roadMatchedSegment ? 0.02 : 0.03);
           if (looksOverRouted || endpointTooFar) {
-            segment = snappedWaypoints;
+            segment = dedupeSequentialPoints(routedSegment ?? snappedWaypoints);
           }
         }
 
         if (segment.length < 2) {
           const fallbackPoint = batchPoints[batchPoints.length - 1];
           if (rawSegment.length >= 2) {
+            roadMatchCarryoverRef.current = rawSegment.slice(
+              Math.max(rawSegment.length - ROAD_MATCH_OVERLAP_POINTS, 0),
+            );
             appendRouteSegment(rawSegment);
             const latestRawPoint = rawSegment[rawSegment.length - 1];
             updateMarkerPosition(latestRawPoint);
@@ -935,6 +1141,9 @@ export function HomeScreen({
         }
 
         const segmentDistanceKm = polylineDistanceKm(segment);
+        roadMatchCarryoverRef.current = rawSegment.slice(
+          Math.max(rawSegment.length - ROAD_MATCH_OVERLAP_POINTS, 0),
+        );
 
         appendRouteSegment(segment);
         lastTrackPointRef.current = latestPoint;
@@ -957,12 +1166,14 @@ export function HomeScreen({
             Date.now() - lastCameraFollowAtRef.current >= TRIP_CAMERA_FOLLOW_INTERVAL_MS
           ) {
             lastCameraFollowAtRef.current = Date.now();
+            const nextHeading =
+              isDedicatedTripNavigation && liveHeadingRef.current !== null ? liveHeadingRef.current : 0;
             mapRef.current.animateCamera(
               {
                 center: latestPoint,
-                zoom: 18,
-                heading: 0,
-                pitch: 0,
+                zoom: isDedicatedTripNavigation ? 18.6 : 18,
+                heading: nextHeading,
+                pitch: isDedicatedTripNavigation ? 52 : 0,
               },
               { duration: 450 },
             );
@@ -1018,6 +1229,12 @@ export function HomeScreen({
       onTripPointRecord?.({
         latitude: rawTrackPoint.latitude,
         longitude: rawTrackPoint.longitude,
+        speed: speedFromGpsKmh,
+        heading:
+          typeof coordinate.heading === 'number' && Number.isFinite(coordinate.heading)
+            ? coordinate.heading
+            : null,
+        accuracy: gpsAccuracyMeters,
         recordedAt: new Date().toISOString(),
       });
 
@@ -1063,18 +1280,24 @@ export function HomeScreen({
         flushBufferedRoadPoints();
       }
 
+      const canFollowTripCamera =
+        gpsAccuracyMeters === null || gpsAccuracyMeters <= ACTIVE_CAMERA_ACCURACY_METERS;
+
       if (
         mapRef.current &&
+        canFollowTripCamera &&
         Date.now() - lastCameraFollowAtRef.current >= TRIP_CAMERA_FOLLOW_INTERVAL_MS
       ) {
         const displayPoint = snappedCoordsRef.current ?? next;
         lastCameraFollowAtRef.current = Date.now();
+        const nextHeading =
+          isDedicatedTripNavigation && liveHeadingRef.current !== null ? liveHeadingRef.current : 0;
         mapRef.current.animateCamera(
           {
             center: displayPoint,
-            zoom: 18,
-            heading: 0,
-            pitch: 0,
+            zoom: isDedicatedTripNavigation ? 18.6 : 18,
+            heading: nextHeading,
+            pitch: isDedicatedTripNavigation ? 52 : 0,
           },
           { duration: 400 },
         );
@@ -1122,11 +1345,11 @@ export function HomeScreen({
 
     void (async () => {
       const tracker = await startLiveGpsTracker({
-        minMoveMeters: MIN_TRACK_MOVE_KM * 1000,
         initialTimeoutMs: INITIAL_LOCATION_TIMEOUT_MS,
-        watchIntervalMs: WATCH_LOCATION_INTERVAL_MS,
-        lastKnownMaxAgeMs: LAST_KNOWN_MAX_AGE_MS,
-        lastKnownRequiredAccuracyMeters: LAST_KNOWN_REQUIRED_ACCURACY_METERS,
+        accuracy: trackerAccuracy,
+        watchIntervalMs: trackerWatchIntervalMs,
+        distanceIntervalMeters: trackerDistanceIntervalMeters,
+        staleSampleThresholdMs: trackerStaleSampleThresholdMs,
         onSeed: (sample) => {
           if (cancelled) {
             return;
@@ -1199,12 +1422,20 @@ export function HomeScreen({
       locationWatchRef.current = null;
       setIsResolvingAccurateLocation(false);
     };
-  }, [locationEnabled]);
+  }, [
+    locationEnabled,
+    trackerAccuracy,
+    trackerDistanceIntervalMeters,
+    trackerStaleSampleThresholdMs,
+    trackerWatchIntervalMs,
+  ]);
 
   const minutesText = `${Math.floor(elapsedSeconds / 60)}:${String(elapsedSeconds % 60).padStart(2, '0')}`;
   const kmText = distanceKm.toFixed(2);
 
   const beginTripSession = async (startLocation = coords) => {
+    setTripSummary(null);
+    setCompletedTripPreviewPath([]);
     setIsTripStarted(true);
     onTripStart?.({
       startLocation: startLocation ? { latitude: startLocation.latitude, longitude: startLocation.longitude } : null,
@@ -1216,6 +1447,7 @@ export function HomeScreen({
     lastTrackPointRef.current = startLocation;
     lastRawTrackPointRef.current = startLocation;
     pendingRawPointsRef.current = [];
+    roadMatchCarryoverRef.current = [];
     setRoutePoints([]);
     setTravelPath([]);
     setStartConnectorPoints([]);
@@ -1243,9 +1475,9 @@ export function HomeScreen({
       mapRef.current.animateCamera(
         {
           center: startLocation,
-          zoom: 18,
-          heading: 0,
-          pitch: 0,
+          zoom: isDedicatedTripNavigation ? 18.6 : 18,
+          heading: isDedicatedTripNavigation && liveHeadingRef.current !== null ? liveHeadingRef.current : 0,
+          pitch: isDedicatedTripNavigation ? 52 : 0,
         },
         { duration: 850 },
       );
@@ -1265,6 +1497,11 @@ export function HomeScreen({
     const completedDistanceKm =
       distanceKm > 0 ? distanceKm : polylineDistanceKm(completedRoutePath);
     const restoredActualPoint = latestActualCoordsRef.current;
+    const completedDurationSeconds = elapsedSeconds;
+    const averageSpeed =
+      completedDurationSeconds > 0
+        ? completedDistanceKm / (completedDurationSeconds / 3600)
+        : speedKmh;
 
     if (simulationTimeoutRef.current) {
       clearTimeout(simulationTimeoutRef.current);
@@ -1273,10 +1510,20 @@ export function HomeScreen({
 
     setIsTripStarted(false);
     setIsSimulatingTrip(false);
+    setCompletedTripPreviewPath(completedRoutePath);
+    setTripSummary({
+      durationText: `${Math.floor(completedDurationSeconds / 60)}:${String(
+        completedDurationSeconds % 60,
+      ).padStart(2, '0')}`,
+      distanceText: `${completedDistanceKm.toFixed(2)} km`,
+      speedText: `${Math.max(0, averageSpeed).toFixed(1)} km/h`,
+      statusText: isSimulatingTripRef.current ? 'Simulation completed' : 'Trip saved successfully',
+    });
     setLastTrackPoint(null);
     lastTrackPointRef.current = null;
     lastRawTrackPointRef.current = null;
     pendingRawPointsRef.current = [];
+    roadMatchCarryoverRef.current = [];
     setRoutePoints([]);
     setTravelPath([]);
     setStartConnectorPoints([]);
@@ -1310,20 +1557,30 @@ export function HomeScreen({
     onTripComplete({
       fare: selectedFare,
       distanceKm: completedDistanceKm,
-      durationSeconds: elapsedSeconds,
+      durationSeconds: completedDurationSeconds,
       routePath: completedRoutePath,
       endLocation,
     });
 
     if (openTripHistory) {
-      setTimeout(() => {
-        onNavigate?.('trip');
-      }, 250);
+      return;
     }
   };
 
   const handleTripButtonPress = async () => {
     if (!isTripStarted) {
+      if (isTripScreen && !tripNavigationMode) {
+        if (!locationEnabled) {
+          Alert.alert('Location required', 'Allow location access before starting a trip.');
+          return;
+        }
+        if (!isDriverOnline) {
+          Alert.alert('Go online first', 'Use the route action to go online before starting a trip.');
+          return;
+        }
+        onRequestTripNavigation?.();
+        return;
+      }
       await beginTripSession(coords);
       return;
     }
@@ -1359,17 +1616,17 @@ export function HomeScreen({
         if (!point) {
           setIsSimulatingTrip(false);
           simulationTimeoutRef.current = null;
-          void finishTripSession({ openTripHistory: true });
+          void finishTripSession();
           return;
         }
 
         const nextRoutePath = simulationPoints.slice(0, index + 1);
         simulationPointsRef.current = nextRoutePath;
         setSimulationRouteProgress(nextRoutePath);
+        const previousPoint = simulationPoints[index - 1] ?? point;
+        const segmentHeading = headingBetweenDeg(previousPoint, point);
 
         if (index > 0) {
-          const previousPoint = simulationPoints[index - 1] ?? point;
-          const segmentHeading = headingBetweenDeg(previousPoint, point);
           liveHeadingRef.current = segmentHeading;
           setHeadingDeg(segmentHeading);
           setDistanceKm(polylineDistanceKm(nextRoutePath));
@@ -1382,9 +1639,9 @@ export function HomeScreen({
           mapRef.current.animateCamera(
             {
               center: point,
-              zoom: 18,
-              heading: 0,
-              pitch: 0,
+              zoom: isDedicatedTripNavigation ? 18.6 : 18,
+              heading: isDedicatedTripNavigation ? segmentHeading : 0,
+              pitch: isDedicatedTripNavigation ? 52 : 0,
             },
             { duration: 650 },
           );
@@ -1407,11 +1664,6 @@ export function HomeScreen({
     inputRange: [0, 1],
     outputRange: [0.7, 1],
   });
-  const gpsDebugText = [
-    firstFixDurationMs !== null ? `Fix ${Math.max(0, Math.round(firstFixDurationMs / 100) / 10)}s` : 'Fix --',
-    displayAccuracyMeters !== null ? `Acc ${Math.round(displayAccuracyMeters)}m` : 'Acc --',
-    `Fresh ${locationFreshnessSeconds}s`,
-  ].join('  •  ');
   const handleAdjustZoom = async (delta: number) => {
     if (!mapRef.current) {
       return;
@@ -1432,13 +1684,26 @@ export function HomeScreen({
     mapRef.current.animateCamera(
       {
         center: coords,
-        zoom: isTripStarted ? 18 : 15,
-        heading: 0,
-        pitch: 0,
+        zoom: isTripStarted ? (isDedicatedTripNavigation ? 18.6 : 18) : 15,
+        heading: isDedicatedTripNavigation && liveHeadingRef.current !== null ? liveHeadingRef.current : 0,
+        pitch: isDedicatedTripNavigation && isTripStarted ? 52 : 0,
       },
       { duration: 450 },
     );
   };
+  const tripRouteForDisplay =
+    isTripScreen && !isTripStarted && completedTripPreviewPath.length > 1
+      ? completedTripPreviewPath
+      : travelPath;
+  const tripHeaderTitle = isTripStarted ? 'Trip in Progress' : 'Trip started';
+  const tripHeaderSubtitle = currentAreaLabel || 'Live route tracking';
+  const tripStatusTone = isLowGpsAccuracy
+    ? 'GPS recovering'
+    : isSimulatingTrip
+      ? 'Simulation running'
+      : isTripStarted
+        ? 'Tracking live'
+        : 'Waiting for movement';
 
   return (
     <View style={styles.homeScreen}>
@@ -1473,13 +1738,13 @@ export function HomeScreen({
             <Circle
               center={coords}
               radius={Math.max(displayAccuracyMeters, 6)}
-              strokeColor="rgba(45, 125, 246, 0.35)"
-              fillColor="rgba(45, 125, 246, 0.12)"
+              strokeColor="rgba(45, 125, 246, 0.24)"
+              fillColor="rgba(45, 125, 246, 0.08)"
             />
           ) : null}
-          {isTripScreen && travelPath.length > 1 ? (
+          {isTripScreen && tripRouteForDisplay.length > 1 ? (
             <Polyline
-              coordinates={travelPath}
+              coordinates={tripRouteForDisplay}
               strokeColor="#2D7DF6"
               strokeWidth={6}
               lineCap="round"
@@ -1501,20 +1766,15 @@ export function HomeScreen({
             ref={markerRef}
             coordinate={animatedMarkerCoordinate as any}
             title="Your Location"
-            anchor={{ x: 0.5, y: 0.82 }}
+            anchor={{ x: 0.5, y: 1 }}
             centerOffset={{ x: 0, y: 0 }}
-            tracksViewChanges={Platform.OS === 'android' ? true : shouldTrackMarkerViewChanges}
+            flat={false}
+            zIndex={30}
+            tracksViewChanges={Platform.OS === 'android'}
           >
-            <DriverAvatarMarker
-              heading={headingAnim.interpolate({
-                inputRange: [-360, 360],
-                outputRange: ['-360deg', '360deg'],
-                })}
-                profileName={profileName}
-                profileImageUri={profileImageUri}
-              />
-            </MarkerAnimated>
-          ) : null}
+            <AppleMapPinMarker color="#38BDF8" iconName="radio" size="md" />
+          </MarkerAnimated>
+        ) : null}
         </MapView>
 
         {hasGeofenceViolation ? (
@@ -1528,12 +1788,11 @@ export function HomeScreen({
         <Pressable
           style={[
             localStyles.mapTypeToggle,
-            isTripScreen && localStyles.mapTypeToggleTrip,
-            !isTripScreen && !isDriverOnline && localStyles.mapTypeToggleOffline,
+            { top: isTripScreen ? topControlTop : homeMapTypeTop },
           ]}
           onPress={() => onChangeMapTypeOption(nextMapTypeOption(mapTypeOption))}
         >
-          <Feather
+          <AppIcon
             name={mapTypeOption === 'dark' ? 'moon' : mapTypeOption === 'satellite' ? 'globe' : 'map'}
             size={16}
             color="#0F172A"
@@ -1543,16 +1802,45 @@ export function HomeScreen({
           </Text>
         </Pressable>
 
+        {shouldShowTripNavigationMode ? (
+          <View style={[localStyles.tripNavigationHeader, { top: topControlTop }]}>
+            <View style={localStyles.tripNavigationHeaderMain}>
+              <Text style={localStyles.tripNavigationTitle}>{tripHeaderTitle}</Text>
+              <Text style={localStyles.tripNavigationSubtitle} numberOfLines={1}>
+                {tripHeaderSubtitle}
+              </Text>
+            </View>
+            <View style={localStyles.tripNavigationHeaderStatus}>
+              <AppIcon
+                name={isLowGpsAccuracy ? 'alert-circle' : 'navigation'}
+                size={14}
+                color={isLowGpsAccuracy ? '#9A3412' : '#147D64'}
+                active
+              />
+              <Text
+                style={[
+                  localStyles.tripNavigationHeaderStatusText,
+                  isLowGpsAccuracy
+                    ? localStyles.tripNavigationHeaderStatusTextWarning
+                    : localStyles.tripNavigationHeaderStatusTextActive,
+                ]}
+              >
+                {tripStatusTone}
+              </Text>
+            </View>
+          </View>
+        ) : null}
+
         {isTripScreen && locationEnabled && isDriverOnline ? (
-          <View style={localStyles.mapControls}>
+          <View style={[localStyles.mapControls, { bottom: mapControlsBottom }]}>
             <Pressable style={localStyles.mapControlButton} onPress={() => handleAdjustZoom(1)}>
-              <Feather name="plus" size={18} color="#0F172A" />
+              <AppIcon name="plus" size={18} color="#0F172A" />
             </Pressable>
             <Pressable style={localStyles.mapControlButton} onPress={() => handleAdjustZoom(-1)}>
-              <Feather name="minus" size={18} color="#0F172A" />
+              <AppIcon name="minus" size={18} color="#0F172A" />
             </Pressable>
             <Pressable style={localStyles.mapControlButton} onPress={handleTrackLocation}>
-              <Feather name="crosshair" size={17} color="#0F172A" />
+              <AppIcon name="crosshair" size={17} color="#0F172A" />
             </Pressable>
           </View>
         ) : null}
@@ -1562,12 +1850,10 @@ export function HomeScreen({
             isDriverOnline={isDriverOnline}
             onGoOnline={onGoOnline}
             onGoOffline={onGoOffline}
+            onOpenNotifications={() => setShowNotificationCenter(true)}
+            unreadNotificationCount={unreadNotificationCount}
             isResolvingAccurateLocation={isResolvingAccurateLocation}
             tripOpenPending={tripOpenPending}
-            firstFixDurationMs={firstFixDurationMs}
-            displayAccuracyMeters={displayAccuracyMeters}
-            locationFreshnessSeconds={locationFreshnessSeconds}
-            gpsDebugText={gpsDebugText}
             profileName={profileName}
             profileDriverCode={profileDriverCode}
             profilePlateNumber={profilePlateNumber}
@@ -1581,36 +1867,55 @@ export function HomeScreen({
           />
         ) : (
           <>
-            <Pressable style={styles.routeBackButton} onPress={onBackToHome}>
-              <Feather name="chevron-left" size={20} color="#030318" />
-            </Pressable>
-            <StartTripPanel
-              styles={styles}
-              localStyles={localStyles}
-              insetsBottom={insets.bottom || 0}
-              isInsideGeofence={isInsideGeofence}
-              minutesText={minutesText}
-              kmText={kmText}
-              selectedFare={selectedFare}
-              fareOptions={fareOptions}
-              farePickerOpen={farePickerOpen}
-              setFarePickerOpen={setFarePickerOpen}
-              setSelectedFare={setSelectedFare}
-              speedKmh={speedKmh}
-              enableTripSimulation={ENABLE_TRIP_SIMULATION}
-              isTripStarted={isTripStarted}
-              onOpenSimulation={onOpenSimulation}
-              onTripButtonPress={handleTripButtonPress}
-            />
+            {!shouldShowTripNavigationMode ? (
+              <>
+                <Pressable style={[styles.routeBackButton, { top: topControlTop }]} onPress={onBackToHome}>
+                  <AppIcon name="chevron-left" size={20} color="#030318" />
+                </Pressable>
+                <StartTripPanel
+                  styles={styles}
+                  localStyles={localStyles}
+                  insetsBottom={insets.bottom || 0}
+                  isInsideGeofence={isInsideGeofence}
+                  minutesText={minutesText}
+                  kmText={kmText}
+                  selectedFare={selectedFare}
+                  fareOptions={fareOptions}
+                  farePickerOpen={farePickerOpen}
+                  setFarePickerOpen={setFarePickerOpen}
+                  setSelectedFare={setSelectedFare}
+                  speedKmh={speedKmh}
+                  enableTripSimulation={ENABLE_TRIP_SIMULATION}
+                  isTripStarted={isTripStarted}
+                  onOpenSimulation={onOpenSimulation}
+                  onTripButtonPress={handleTripButtonPress}
+                  onLayout={(event) => setTripPanelHeight(event.nativeEvent.layout.height)}
+                />
+              </>
+            ) : (
+              <TripNavigationPanel
+                styles={styles}
+                localStyles={localStyles}
+                insetsBottom={insets.bottom || 0}
+                minutesText={minutesText}
+                kmText={kmText}
+                speedKmh={speedKmh}
+                isInsideGeofence={isInsideGeofence}
+                isLowGpsAccuracy={isLowGpsAccuracy}
+                isSimulatingTrip={isSimulatingTrip}
+                onEndTripPress={handleTripButtonPress}
+                onLayout={(event) => setTripPanelHeight(event.nativeEvent.layout.height)}
+              />
+            )}
           </>
         )}
       </View>
 
-      {!isTripScreen ? (
+      {!shouldShowTripNavigationMode ? (
         <HomeNavigationCard
-          activeTab="home"
+          activeTab={isTripScreen ? 'trip' : 'home'}
           onNavigate={onNavigate}
-          showCenterRoute
+          showCenterRoute={!isTripScreen}
           styles={styles}
         />
       ) : null}
@@ -1619,6 +1924,28 @@ export function HomeScreen({
         visible={showOutsideGeofenceModal}
         onRequestClose={() => setShowOutsideGeofenceModal(false)}
         onAcknowledge={() => setShowOutsideGeofenceModal(false)}
+      />
+      <NotificationCenterModal
+        visible={showNotificationCenter}
+        onRequestClose={() => setShowNotificationCenter(false)}
+        notifications={notifications}
+        unreadCount={unreadNotificationCount}
+        onPressNotification={onMarkNotificationRead}
+        onMarkAllRead={onMarkAllNotificationsRead}
+      />
+      <TripSummaryModal
+        visible={Boolean(tripSummary)}
+        durationText={tripSummary?.durationText ?? '0:00'}
+        distanceText={tripSummary?.distanceText ?? '0.00 km'}
+        speedText={tripSummary?.speedText ?? '0.0 km/h'}
+        statusText={tripSummary?.statusText ?? 'Trip saved successfully'}
+        onClose={() => {
+          setTripSummary(null);
+          setCompletedTripPreviewPath([]);
+          if (tripNavigationMode) {
+            onExitTripNavigation?.();
+          }
+        }}
       />
     </View>
   );
@@ -1663,6 +1990,28 @@ const localStyles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#E6ECF2',
     backgroundColor: '#FFFFFF',
+    position: 'relative',
+    overflow: 'visible',
+  },
+  notificationBadge: {
+    position: 'absolute',
+    top: -5,
+    right: -5,
+    minWidth: 18,
+    height: 18,
+    paddingHorizontal: 4,
+    borderRadius: 9,
+    backgroundColor: '#EF4444',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderColor: '#FFFFFF',
+  },
+  notificationBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 9,
+    lineHeight: 11,
+    fontFamily: 'CircularStdMedium500',
   },
   statusToggle: {
     width: 46,
@@ -1676,6 +2025,9 @@ const localStyles = StyleSheet.create({
   },
   statusToggleOff: {
     backgroundColor: '#CBD5E1',
+  },
+  statusToggleLocked: {
+    opacity: 0.72,
   },
   statusToggleThumb: {
     width: 20,
@@ -1893,15 +2245,12 @@ const localStyles = StyleSheet.create({
     width: '31%',
     marginHorizontal: 0,
   },
-  simulationButton: {
-    marginBottom: 10,
-    backgroundColor: '#2D7DF6',
-  },
   navigationMetaRow: {
-    marginBottom: 10,
+    marginBottom: 14,
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
+    gap: 10,
   },
   navigationMetaText: {
     fontSize: 11,
@@ -1909,12 +2258,50 @@ const localStyles = StyleSheet.create({
     color: '#475569',
     fontFamily: 'CircularStdMedium500',
   },
+  metaActionsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: 8,
+    flexShrink: 1,
+  },
+  metaStatusChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 10,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#E6F8F1',
+  },
+  metaStatusChipText: {
+    fontSize: 10,
+    lineHeight: 12,
+    color: '#147D64',
+    fontFamily: 'CircularStdMedium500',
+  },
+  simulationChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    height: 28,
+    paddingHorizontal: 10,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+    backgroundColor: '#F8FBFF',
+  },
+  simulationChipText: {
+    fontSize: 10,
+    lineHeight: 12,
+    color: '#2D7DF6',
+    fontFamily: 'CircularStdMedium500',
+  },
   mapTypeToggle: {
     position: 'absolute',
-    top: 58,
     right: 14,
-    height: 36,
-    borderRadius: 18,
+    minHeight: 48,
+    borderRadius: 20,
     paddingHorizontal: 12,
     backgroundColor: 'rgba(255,255,255,0.92)',
     borderWidth: 1,
@@ -1928,12 +2315,6 @@ const localStyles = StyleSheet.create({
     shadowOffset: { width: 0, height: 2 },
     elevation: 3,
   },
-  mapTypeToggleTrip: {
-    top: 66,
-  },
-  mapTypeToggleOffline: {
-    top: 108,
-  },
   mapTypeToggleText: {
     fontSize: 12,
     lineHeight: 14,
@@ -1943,24 +2324,182 @@ const localStyles = StyleSheet.create({
   mapControls: {
     position: 'absolute',
     right: 14,
-    top: 114,
     gap: 8,
-    zIndex: 10,
+    zIndex: 14,
   },
   mapControlButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 12,
+    width: 42,
+    height: 42,
+    borderRadius: 14,
     borderWidth: 1,
     borderColor: '#E2E8F0',
     backgroundColor: 'rgba(255,255,255,0.94)',
     alignItems: 'center',
     justifyContent: 'center',
     shadowColor: '#000',
-    shadowOpacity: 0.08,
-    shadowRadius: 6,
-    shadowOffset: { width: 0, height: 2 },
-    elevation: 3,
+    shadowOpacity: 0.1,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 4,
+  },
+  tripNavigationHeader: {
+    position: 'absolute',
+    left: 16,
+    right: 92,
+    minHeight: 64,
+    borderRadius: 22,
+    backgroundColor: 'rgba(255,255,255,0.96)',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    justifyContent: 'center',
+    shadowColor: '#0F172A',
+    shadowOpacity: 0.12,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 7,
+  },
+  tripNavigationHeaderMain: {
+    paddingRight: 6,
+  },
+  tripNavigationTitle: {
+    fontSize: 19,
+    lineHeight: 22,
+    color: '#0F172A',
+    fontFamily: 'CircularStdMedium500',
+  },
+  tripNavigationSubtitle: {
+    marginTop: 4,
+    fontSize: 12,
+    lineHeight: 15,
+    color: '#64748B',
+    fontFamily: 'CircularStdMedium500',
+  },
+  tripNavigationHeaderStatus: {
+    marginTop: 10,
+    alignSelf: 'flex-start',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: '#EFF6FF',
+  },
+  tripNavigationHeaderStatusText: {
+    fontSize: 11,
+    lineHeight: 13,
+    fontFamily: 'CircularStdMedium500',
+  },
+  tripNavigationHeaderStatusTextActive: {
+    color: '#147D64',
+  },
+  tripNavigationHeaderStatusTextWarning: {
+    color: '#9A3412',
+  },
+  tripNavigationPanel: {
+    position: 'absolute',
+    left: 16,
+    right: 16,
+    backgroundColor: 'rgba(255,255,255,0.98)',
+    borderRadius: 26,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    paddingBottom: 16,
+    shadowColor: '#0F172A',
+    shadowOpacity: 0.14,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 10,
+  },
+  tripNavigationHandle: {
+    alignSelf: 'center',
+    width: 44,
+    height: 5,
+    borderRadius: 999,
+    backgroundColor: '#CBD5E1',
+    marginBottom: 14,
+  },
+  tripNavigationStatsRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  tripNavigationStatCard: {
+    flex: 1,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    backgroundColor: '#F8FAFC',
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  tripNavigationStatValue: {
+    fontSize: 18,
+    lineHeight: 21,
+    color: '#0F172A',
+    fontFamily: 'CircularStdMedium500',
+  },
+  tripNavigationStatLabel: {
+    marginTop: 4,
+    fontSize: 11,
+    lineHeight: 13,
+    color: '#64748B',
+    fontFamily: 'CircularStdMedium500',
+  },
+  tripNavigationStatusRow: {
+    marginTop: 12,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  tripNavigationStatusChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 11,
+    paddingVertical: 8,
+    borderRadius: 999,
+  },
+  tripNavigationStatusPrimary: {
+    backgroundColor: '#E8FBF6',
+  },
+  tripNavigationStatusPrimaryText: {
+    color: '#147D64',
+    fontSize: 12,
+    lineHeight: 14,
+    fontFamily: 'CircularStdMedium500',
+  },
+  tripNavigationStatusInside: {
+    backgroundColor: '#ECFDF5',
+  },
+  tripNavigationStatusOutside: {
+    backgroundColor: '#FEF2F2',
+  },
+  tripNavigationStatusGoodGps: {
+    backgroundColor: '#EFF6FF',
+  },
+  tripNavigationStatusWeakGps: {
+    backgroundColor: '#FFF7ED',
+  },
+  tripNavigationStatusText: {
+    fontSize: 12,
+    lineHeight: 14,
+    fontFamily: 'CircularStdMedium500',
+  },
+  tripNavigationStatusTextInside: {
+    color: '#047857',
+  },
+  tripNavigationStatusTextOutside: {
+    color: '#B91C1C',
+  },
+  tripNavigationStatusTextGoodGps: {
+    color: '#1D4ED8',
+  },
+  tripNavigationStatusTextWeakGps: {
+    color: '#9A3412',
   },
   navMarkerWrap: {
     alignItems: 'center',

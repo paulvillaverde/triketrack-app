@@ -7,6 +7,9 @@ export type OfflineTripPoint = {
   driver_id: number;
   latitude: number;
   longitude: number;
+  speed: number | null;
+  heading: number | null;
+  accuracy: number | null;
   recorded_at: string;
   synced: 0 | 1;
 };
@@ -54,6 +57,9 @@ export async function initOfflineTripStorage() {
       driver_id INTEGER NOT NULL,
       latitude REAL NOT NULL,
       longitude REAL NOT NULL,
+      speed REAL,
+      heading REAL,
+      accuracy REAL,
       recorded_at TEXT NOT NULL,
       synced INTEGER NOT NULL DEFAULT 0
     );
@@ -85,6 +91,18 @@ export async function initOfflineTripStorage() {
     CREATE INDEX IF NOT EXISTS idx_${SESSIONS_TABLE_NAME}_complete_sync
       ON ${SESSIONS_TABLE_NAME} (completed_synced, status, started_at);
   `);
+
+  for (const statement of [
+    `ALTER TABLE ${POINTS_TABLE_NAME} ADD COLUMN speed REAL`,
+    `ALTER TABLE ${POINTS_TABLE_NAME} ADD COLUMN heading REAL`,
+    `ALTER TABLE ${POINTS_TABLE_NAME} ADD COLUMN accuracy REAL`,
+  ]) {
+    try {
+      await db.execAsync(statement);
+    } catch {
+      // Column already exists on upgraded devices.
+    }
+  }
 }
 
 export async function insertOfflineTripPoint(params: {
@@ -93,6 +111,9 @@ export async function insertOfflineTripPoint(params: {
   driverId: number;
   latitude: number;
   longitude: number;
+  speed?: number | null;
+  heading?: number | null;
+  accuracy?: number | null;
   recordedAt: string;
 }) {
   const db = await getDb();
@@ -103,14 +124,20 @@ export async function insertOfflineTripPoint(params: {
       driver_id,
       latitude,
       longitude,
+      speed,
+      heading,
+      accuracy,
       recorded_at,
       synced
-    ) VALUES (?, ?, ?, ?, ?, ?, 0)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
     params.localTripId,
     params.serverTripId ?? null,
     params.driverId,
     params.latitude,
     params.longitude,
+    params.speed ?? null,
+    params.heading ?? null,
+    params.accuracy ?? null,
     params.recordedAt,
   );
 }
@@ -137,7 +164,7 @@ export async function attachServerTripIdToOfflineTrip(localTripId: string, serve
 export async function getUnsyncedOfflineTripPoints(limit = 500) {
   const db = await getDb();
   const rows = await db.getAllAsync<OfflineTripPoint>(
-    `SELECT id, local_trip_id, server_trip_id, driver_id, latitude, longitude, recorded_at, synced
+    `SELECT id, local_trip_id, server_trip_id, driver_id, latitude, longitude, speed, heading, accuracy, recorded_at, synced
      FROM ${POINTS_TABLE_NAME}
      WHERE synced = 0
      ORDER BY recorded_at ASC, id ASC
@@ -283,7 +310,7 @@ export async function getOfflineTripSession(localTripId: string) {
 export async function getOfflineTripPointsByLocalTripId(localTripId: string) {
   const db = await getDb();
   return db.getAllAsync<OfflineTripPoint>(
-    `SELECT id, local_trip_id, server_trip_id, driver_id, latitude, longitude, recorded_at, synced
+    `SELECT id, local_trip_id, server_trip_id, driver_id, latitude, longitude, speed, heading, accuracy, recorded_at, synced
      FROM ${POINTS_TABLE_NAME}
      WHERE local_trip_id = ?
      ORDER BY recorded_at ASC, id ASC`,

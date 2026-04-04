@@ -12,10 +12,10 @@ import {
   StatusBar as RNStatusBar,
 } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
-import { Feather } from '@expo/vector-icons';
 import { useFonts } from '@expo-google-fonts/poppins';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
+import * as Contacts from 'expo-contacts';
 import * as Location from 'expo-location';
 import {
   authenticateDriver,
@@ -44,28 +44,43 @@ import {
   markOfflineTripSessionStartedSynced,
   markOfflineTripPointsSynced,
 } from './lib/offlineTripStorage';
-import { snapActualPathToRoad } from './lib/roadPath';
+import { reconstructCompletedTripPath, type RawTripTelemetryPoint } from './lib/tripPathReconstruction';
+import { smoothDisplayedRoutePath } from './lib/roadPath';
 import { LoginScreen } from './screens/LoginScreen';
 import { GetStartedScreen } from './screens/GetStartedScreen';
 import { HomeScreen, type MapTypeOption } from './screens/HomeScreen';
 import { StartTripScreen } from './screens/StartTripScreen';
+import { TripNavigationScreen } from './screens/TripNavigationScreen';
 import { SimulationScreen } from './screens/SimulationScreen';
 import { TripScreen } from './screens/TripScreen';
 import { ViolationScreen } from './screens/ViolationScreen';
 import { ProfileScreen } from './screens/ProfileScreen';
 import { CreatePasswordScreen } from './screens/CreatePasswordScreen';
-import { EnableLocationModal } from './components/modals';
+import { PermissionOnboardingScreen } from './screens/PermissionOnboardingScreen';
+import { TripActionModal, type NotificationCenterItem } from './components/modals';
+import { AppIcon, type AppIconName } from './components/ui';
 
 type Screen =
   | 'getStarted'
   | 'login'
   | 'createPassword'
+  | 'permissionPhone'
+  | 'permissionLocation'
   | 'home'
   | 'startTrip'
+  | 'tripNavigation'
   | 'simulation'
   | 'trip'
   | 'violation'
   | 'profile';
+
+type PermissionOnboardingStatus = 'granted' | 'skipped';
+
+type PermissionOnboardingState = {
+  phoneAccess: PermissionOnboardingStatus;
+  locationAccess: PermissionOnboardingStatus;
+  completedAt: string;
+};
 
 type TripHistoryItem = {
   id: string;
@@ -77,6 +92,13 @@ type TripHistoryItem = {
   status: 'ONGOING' | 'COMPLETED' | 'FLAGGED';
   compliance: number;
   routePath: Array<{ latitude: number; longitude: number }>;
+};
+
+type NotificationDraft = {
+  category: 'account' | 'profile' | 'trip' | 'violation';
+  title: string;
+  message: string;
+  icon: AppIconName;
 };
 
 const createDemoTrip = (): TripHistoryItem => {
@@ -189,6 +211,10 @@ const SCREEN_CONTENT: Record<Screen, { title: string; subtitle: string }> = {
     title: '',
     subtitle: '',
   },
+  tripNavigation: {
+    title: '',
+    subtitle: '',
+  },
   simulation: {
     title: '',
     subtitle: '',
@@ -215,11 +241,22 @@ const SCREEN_CONTENT: Record<Screen, { title: string; subtitle: string }> = {
     subtitle:
       'Enter your driver code first, then create your password\nto activate your account login.',
   },
+  permissionPhone: {
+    title: '',
+    subtitle: '',
+  },
+  permissionLocation: {
+    title: '',
+    subtitle: '',
+  },
 };
 
 export default function App() {
   const PROFILE_STORAGE_KEY = 'triketrack_profile_v2_';
   const TRIP_HISTORY_STORAGE_KEY = 'triketrack_trip_history_v1';
+  const NOTIFICATION_STORAGE_KEY = 'triketrack_notifications_v1_';
+  const PERMISSION_ONBOARDING_STORAGE_KEY = 'triketrack_permission_onboarding_v1';
+  const ALWAYS_SHOW_PERMISSION_ONBOARDING = true;
   const [fontsLoaded] = useFonts({
     CircularStdMedium500: require('./assets/fonts/circular-std-medium-500.ttf'),
     NissanOpti: require('./assets/fonts/NissanOpti.otf'),
@@ -227,7 +264,10 @@ export default function App() {
   const [screen, setScreen] = useState<Screen>('getStarted');
   const [routeLocationEnabled, setRouteLocationEnabled] = useState(false);
   const [isDriverOnline, setIsDriverOnline] = useState(false);
-  const [showEnableLocationModal, setShowEnableLocationModal] = useState(false);
+  const [showTripActionModal, setShowTripActionModal] = useState(false);
+  const [permissionOnboardingState, setPermissionOnboardingState] = useState<PermissionOnboardingState | null>(null);
+  const [pendingPhoneAccessStatus, setPendingPhoneAccessStatus] = useState<PermissionOnboardingStatus>('granted');
+  const [isPermissionOnboardingSubmitting, setIsPermissionOnboardingSubmitting] = useState(false);
   const [mapTypeOption, setMapTypeOption] = useState<MapTypeOption>('default');
   const [totalEarnings, setTotalEarnings] = useState(0);
   const [totalTrips, setTotalTrips] = useState(0);
@@ -250,6 +290,9 @@ export default function App() {
   const [profileImageUri, setProfileImageUri] = useState<string | null>(null);
   const [profileHydrated, setProfileHydrated] = useState(false);
   const [tripHistoryHydrated, setTripHistoryHydrated] = useState(false);
+  const tripHistoryRef = useRef<TripHistoryItem[]>([]);
+  const [notifications, setNotifications] = useState<NotificationCenterItem[]>([]);
+  const [notificationsHydrated, setNotificationsHydrated] = useState(false);
   const content = useMemo(() => SCREEN_CONTENT[screen], [screen]);
   const liveTrackingSubscriptionRef = useRef<Location.LocationSubscription | null>(null);
   const lastLiveSyncPointRef = useRef<{ latitude: number; longitude: number } | null>(null);
@@ -295,6 +338,202 @@ export default function App() {
         previous.longitude !== point.longitude
       );
     });
+  };
+
+  const normalizeSavedRoutePath = (
+    nextPath: Array<{ latitude: number; longitude: number }>,
+    fallbackPath: Array<{ latitude: number; longitude: number }> = [],
+  ) => {
+    const normalizedNext = smoothDisplayedRoutePath(dedupeSequentialRoutePoints(nextPath));
+    if (normalizedNext.length > 1) {
+      return normalizedNext;
+    }
+
+    const normalizedFallback = smoothDisplayedRoutePath(dedupeSequentialRoutePoints(fallbackPath));
+    return normalizedFallback;
+  };
+
+  const mapTripRecordToHistoryItem = (
+    trip: {
+      id: string | number;
+      trip_date: string;
+      duration_seconds?: number | null;
+      distance_km?: number | null;
+      fare?: number | null;
+      status: string;
+      route_points?: Array<{ latitude: number; longitude: number }>;
+    },
+    fallbackRoutePath: Array<{ latitude: number; longitude: number }> = [],
+  ): TripHistoryItem => {
+    const mins = Math.floor((trip.duration_seconds ?? 0) / 60);
+    const secs = (trip.duration_seconds ?? 0) % 60;
+    const durationLabel = mins > 0 ? `${mins} min` : `${secs} sec`;
+    const idSuffix = String(trip.id).split('-')[0]?.toUpperCase() ?? String(trip.id);
+    return {
+      id: `TRIP-${idSuffix}`,
+      tripDate: trip.trip_date,
+      duration: durationLabel,
+      distance: `${Number(trip.distance_km ?? 0).toFixed(2)} km`,
+      fare: `\u20B1${Number(trip.fare ?? 0).toFixed(2)}`,
+      violations: '0',
+      status: trip.status === 'ONGOING' ? 'ONGOING' : 'COMPLETED',
+      compliance: 100,
+      routePath: normalizeSavedRoutePath(trip.route_points ?? [], fallbackRoutePath),
+    };
+  };
+
+  useEffect(() => {
+    tripHistoryRef.current = tripHistory;
+  }, [tripHistory]);
+
+  const pushNotification = ({ category, title, message, icon }: NotificationDraft) => {
+    setNotifications((prev) => [
+      {
+        id: `${category}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        category,
+        title,
+        message,
+        icon,
+        createdAt: new Date().toISOString(),
+        read: false,
+      },
+      ...prev,
+    ].slice(0, 60));
+  };
+
+  const markNotificationRead = (notificationId: string) => {
+    setNotifications((prev) =>
+      prev.map((item) =>
+        item.id === notificationId
+          ? {
+              ...item,
+              read: true,
+            }
+          : item,
+      ),
+    );
+  };
+
+  const markAllNotificationsRead = () => {
+    setNotifications((prev) =>
+      prev.map((item) =>
+        item.read
+          ? item
+          : {
+              ...item,
+              read: true,
+            },
+      ),
+    );
+  };
+
+  const unreadNotificationCount = notifications.reduce(
+    (count, item) => count + (item.read ? 0 : 1),
+    0,
+  );
+
+  const loadPermissionOnboardingState = async () => {
+    if (ALWAYS_SHOW_PERMISSION_ONBOARDING) {
+      return null;
+    }
+    try {
+      const raw = await AsyncStorage.getItem(PERMISSION_ONBOARDING_STORAGE_KEY);
+      if (!raw) {
+        return null;
+      }
+
+      const parsed = JSON.parse(raw) as Partial<PermissionOnboardingState>;
+      if (
+        parsed.phoneAccess !== 'granted' &&
+        parsed.phoneAccess !== 'skipped'
+      ) {
+        return null;
+      }
+      if (
+        parsed.locationAccess !== 'granted' &&
+        parsed.locationAccess !== 'skipped'
+      ) {
+        return null;
+      }
+      if (typeof parsed.completedAt !== 'string') {
+        return null;
+      }
+
+      return {
+        phoneAccess: parsed.phoneAccess,
+        locationAccess: parsed.locationAccess,
+        completedAt: parsed.completedAt,
+      } satisfies PermissionOnboardingState;
+    } catch {
+      return null;
+    }
+  };
+
+  const refreshLocationAvailability = async () => {
+    try {
+      const { status } = await Location.getForegroundPermissionsAsync();
+      if (status !== 'granted') {
+        setRouteLocationEnabled(false);
+        return false;
+      }
+
+      const servicesEnabled = await Location.hasServicesEnabledAsync();
+      setRouteLocationEnabled(servicesEnabled);
+      return servicesEnabled;
+    } catch {
+      setRouteLocationEnabled(false);
+      return false;
+    }
+  };
+
+  const requestLocationAccessFromOnboarding = async () => {
+    try {
+      let permissionStatus = (await Location.getForegroundPermissionsAsync()).status;
+      if (permissionStatus !== 'granted') {
+        permissionStatus = (await Location.requestForegroundPermissionsAsync()).status;
+      }
+
+      if (permissionStatus !== 'granted') {
+        setRouteLocationEnabled(false);
+        return { granted: false, servicesEnabled: false };
+      }
+
+      let servicesEnabled = await Location.hasServicesEnabledAsync();
+      if (!servicesEnabled && Platform.OS === 'android') {
+        try {
+          await Location.enableNetworkProviderAsync();
+        } catch {
+          // User may dismiss the system dialog and continue onboarding.
+        }
+        servicesEnabled = await Location.hasServicesEnabledAsync();
+      }
+
+      setRouteLocationEnabled(servicesEnabled);
+      return { granted: true, servicesEnabled };
+    } catch {
+      setRouteLocationEnabled(false);
+      return { granted: false, servicesEnabled: false };
+    }
+  };
+
+  const completePermissionOnboarding = async (
+    phoneAccess: PermissionOnboardingStatus,
+    locationAccess: PermissionOnboardingStatus,
+  ) => {
+    const nextState: PermissionOnboardingState = {
+      phoneAccess,
+      locationAccess,
+      completedAt: new Date().toISOString(),
+    };
+
+    setPermissionOnboardingState(nextState);
+    if (!ALWAYS_SHOW_PERMISSION_ONBOARDING) {
+      await AsyncStorage.setItem(
+        PERMISSION_ONBOARDING_STORAGE_KEY,
+        JSON.stringify(nextState),
+      );
+    }
+    setScreen('home');
   };
 
   const syncOfflineTripPoints = async () => {
@@ -353,11 +592,24 @@ export default function App() {
           }
 
           const tripPoints = await getOfflineTripPointsByLocalTripId(session.local_trip_id);
-          const rawRoutePoints = tripPoints.map((point) => ({
-            latitude: point.latitude,
-            longitude: point.longitude,
-          }));
-          const routePoints = await snapActualPathToRoad(rawRoutePoints);
+          const reconstruction = await reconstructCompletedTripPath(
+            tripPoints.map((point) => ({
+              latitude: point.latitude,
+              longitude: point.longitude,
+              speed: point.speed,
+              heading: point.heading,
+              accuracy: point.accuracy,
+              recordedAt: point.recorded_at,
+            })),
+          );
+          console.info('[TripReconstruction] Offline session reconstruction.', {
+            localTripId: session.local_trip_id,
+            status: reconstruction.status,
+            provider: reconstruction.matchedProvider,
+            rawAcceptedPoints: reconstruction.rawAcceptedPath.length,
+            reconstructedPoints: reconstruction.reconstructedPath.length,
+          });
+          const routePoints = reconstruction.reconstructedPath;
           const endPoint =
             session.end_latitude !== null && session.end_longitude !== null
               ? { latitude: session.end_latitude, longitude: session.end_longitude }
@@ -541,6 +793,54 @@ export default function App() {
   }, [driverDbId]);
 
   useEffect(() => {
+    if (driverDbId === null) {
+      setNotifications([]);
+      setNotificationsHydrated(false);
+      return;
+    }
+
+    const loadNotifications = async () => {
+      try {
+        const raw = await AsyncStorage.getItem(`${NOTIFICATION_STORAGE_KEY}${driverDbId}`);
+        if (!raw) {
+          setNotifications([]);
+          return;
+        }
+
+        const parsed = JSON.parse(raw) as Array<Partial<NotificationCenterItem>>;
+        if (!Array.isArray(parsed)) {
+          setNotifications([]);
+          return;
+        }
+
+        const normalized = parsed
+          .filter(
+            (item): item is NotificationCenterItem =>
+              typeof item.id === 'string' &&
+              typeof item.title === 'string' &&
+              typeof item.message === 'string' &&
+              typeof item.createdAt === 'string' &&
+              typeof item.icon === 'string' &&
+              typeof item.read === 'boolean' &&
+              (item.category === 'account' ||
+                item.category === 'profile' ||
+                item.category === 'trip' ||
+                item.category === 'violation'),
+          )
+          .slice(0, 60);
+
+        setNotifications(normalized);
+      } catch {
+        setNotifications([]);
+      } finally {
+        setNotificationsHydrated(true);
+      }
+    };
+
+    void loadNotifications();
+  }, [driverDbId]);
+
+  useEffect(() => {
     const loadTripHistory = async () => {
       try {
         const raw = await AsyncStorage.getItem(TRIP_HISTORY_STORAGE_KEY);
@@ -572,7 +872,7 @@ export default function App() {
             : [];
           return {
             ...item,
-            routePath,
+            routePath: normalizeSavedRoutePath(routePath),
           };
         });
 
@@ -618,6 +918,19 @@ export default function App() {
       // Ignore write failures to avoid blocking UI.
     });
   }, [profileName, profileDriverCode, profileContact, profilePlateNumber, profileImageUri, profileHydrated, driverDbId]);
+
+  useEffect(() => {
+    if (!notificationsHydrated || driverDbId === null) {
+      return;
+    }
+
+    AsyncStorage.setItem(
+      `${NOTIFICATION_STORAGE_KEY}${driverDbId}`,
+      JSON.stringify(notifications),
+    ).catch(() => {
+      // Ignore write failures to avoid blocking UI.
+    });
+  }, [driverDbId, notifications, notificationsHydrated]);
 
   useEffect(() => {
     if (!isDriverOnline || !routeLocationEnabled) {
@@ -787,8 +1100,14 @@ export default function App() {
       return false;
     }
 
-    const enabled = await ensureLocationEnabled();
+    const enabled = await refreshLocationAvailability();
     if (!enabled) {
+      Alert.alert(
+        'Location Required',
+        permissionOnboardingState?.locationAccess === 'skipped'
+          ? 'Location access was skipped during setup. Turn on location permission and device services in Settings before going online.'
+          : 'Turn on location permission and device services before going online.',
+      );
       setIsDriverOnline(false);
       setIsWaitingForTripLocation(false);
       return false;
@@ -853,6 +1172,14 @@ export default function App() {
     try {
       hasShownTrackingPermissionErrorRef.current = false;
       setIsDriverOnline(true);
+      pushNotification({
+        category: 'trip',
+        title: 'You are now online',
+        message: options?.openTripScreen
+          ? 'Trip tools are ready. You can start or manage a trip from the route flow.'
+          : 'Live trip operations are ready. Your location will keep updating while you stay online.',
+        icon: 'radio',
+      });
       queueTripOpen();
 
       void (async () => {
@@ -916,7 +1243,14 @@ export default function App() {
     setProfilePlateNumber(driver.plate_number);
     setProfileImageUri(driver.avatar_url ?? null);
     setDriverDbId(driver.id);
-    setScreen('home');
+    setPendingPhoneAccessStatus('granted');
+
+    const savedPermissionOnboarding = ALWAYS_SHOW_PERMISSION_ONBOARDING
+      ? null
+      : await loadPermissionOnboardingState();
+    setPermissionOnboardingState(savedPermissionOnboarding);
+    await refreshLocationAvailability();
+    setScreen(savedPermissionOnboarding ? 'home' : 'permissionPhone');
   };
 
   const handleCreatePassword = async (driverCode: string, password: string) => {
@@ -949,23 +1283,15 @@ export default function App() {
         return;
       }
 
-      const mapped: TripHistoryItem[] = trips.map((t) => {
-        const mins = Math.floor((t.duration_seconds ?? 0) / 60);
-        const secs = (t.duration_seconds ?? 0) % 60;
-        const durationLabel = mins > 0 ? `${mins} min` : `${secs} sec`;
-        const idSuffix = String(t.id).split('-')[0]?.toUpperCase() ?? String(t.id);
-        return {
-          id: `TRIP-${idSuffix}`,
-          tripDate: t.trip_date,
-          duration: durationLabel,
-          distance: `${Number(t.distance_km ?? 0).toFixed(2)} km`,
-          fare: `\u20B1${Number(t.fare ?? 0).toFixed(2)}`,
-          violations: '0',
-          status: t.status === 'ONGOING' ? 'ONGOING' : 'COMPLETED',
-          compliance: 100,
-          routePath: t.route_points ?? [],
-        };
-      });
+      const previousRoutesById = new Map(
+        tripHistoryRef.current.map((item) => [item.id, item.routePath]),
+      );
+      const mapped: TripHistoryItem[] = trips.map((t) =>
+        mapTripRecordToHistoryItem(
+          t,
+          previousRoutesById.get(`TRIP-${String(t.id).split('-')[0]?.toUpperCase() ?? String(t.id)}`) ?? [],
+        ),
+      );
 
       setTripHistory(mapped);
       const totals = computeTripTotals(mapped);
@@ -988,18 +1314,95 @@ export default function App() {
     });
   }, [tripHistory, tripHistoryHydrated]);
 
+  const handlePhoneOnboardingContinue = () => {
+    void (async () => {
+      setIsPermissionOnboardingSubmitting(true);
+      let phoneAccess: PermissionOnboardingStatus = 'skipped';
+
+      try {
+        const isContactsAvailable = await Contacts.isAvailableAsync();
+        if (isContactsAvailable) {
+          const response = await Contacts.requestPermissionsAsync();
+          phoneAccess = response.status === 'granted' ? 'granted' : 'skipped';
+        }
+      } catch {
+        phoneAccess = 'skipped';
+      }
+
+      setPendingPhoneAccessStatus(phoneAccess);
+      setIsPermissionOnboardingSubmitting(false);
+      setScreen('permissionLocation');
+    })();
+  };
+
+  const handlePhoneOnboardingSkip = () => {
+    setPendingPhoneAccessStatus('skipped');
+    setScreen('permissionLocation');
+  };
+
+  const handleLocationOnboardingContinue = async () => {
+    setIsPermissionOnboardingSubmitting(true);
+    const result = await requestLocationAccessFromOnboarding();
+    if (result.granted && !result.servicesEnabled) {
+      Alert.alert(
+        'Location Services Off',
+        'Location permission was granted, but your device location services are still off. You can enable them later from Settings before going online.',
+      );
+    }
+    if (!result.granted) {
+      Alert.alert(
+        'Location Access Skipped',
+        'You can still continue, but trips will need location access enabled before you go online.',
+      );
+    }
+    await completePermissionOnboarding(
+      pendingPhoneAccessStatus,
+      result.granted && result.servicesEnabled ? 'granted' : 'skipped',
+    );
+    setIsPermissionOnboardingSubmitting(false);
+  };
+
+  const handleLocationOnboardingSkip = async () => {
+    setIsPermissionOnboardingSubmitting(true);
+    setRouteLocationEnabled(false);
+    await completePermissionOnboarding(pendingPhoneAccessStatus, 'skipped');
+    setIsPermissionOnboardingSubmitting(false);
+  };
+
+  const openTripActionModal = () => {
+    setShowTripActionModal(true);
+  };
+
+  const confirmTripActionModal = async () => {
+    setShowTripActionModal(false);
+    if (isDriverOnline) {
+      setScreen('startTrip');
+      return;
+    }
+    await handleGoOnline({ openTripScreen: true });
+  };
+
+  const tripActionModalContent = isDriverOnline
+    ? {
+        title: 'Open trip activity?',
+        description:
+          'You are already online. Open the trip workspace now to start or manage your current trip activity.',
+        confirmLabel: 'Open Trip',
+      }
+    : {
+        title: 'Go online and open trip tools?',
+        description:
+          'You’re about to start trip activity. We’ll put you online first, then open the trip workspace so you can begin when you’re ready.',
+        confirmLabel: 'Go Online',
+      };
+
   const handleMainTabNavigate = async (tab: 'home' | 'route' | 'trip' | 'violation' | 'profile') => {
     if (tab === 'home') {
       setScreen('home');
       return;
     }
     if (tab === 'route') {
-      if (!routeLocationEnabled) {
-        setShowEnableLocationModal(true);
-        return;
-      }
-
-      await handleGoOnline({ openTripScreen: true });
+      openTripActionModal();
       return;
     }
     if (tab === 'trip') {
@@ -1015,54 +1418,16 @@ export default function App() {
     }
   };
 
-  const ensureLocationEnabled = async () => {
-    try {
-      let permissionStatus = (await Location.getForegroundPermissionsAsync()).status;
-      if (permissionStatus !== 'granted') {
-        permissionStatus = (await Location.requestForegroundPermissionsAsync()).status;
-      }
-
-      if (permissionStatus !== 'granted') {
-        Alert.alert('Location Needed', 'Location permission is required to continue.');
-        setRouteLocationEnabled(false);
-        return false;
-      }
-
-      let servicesEnabled = await Location.hasServicesEnabledAsync();
-
-      if (!servicesEnabled && Platform.OS === 'android') {
-        try {
-          await Location.enableNetworkProviderAsync();
-        } catch {
-          // User may dismiss the system dialog.
-        }
-        servicesEnabled = await Location.hasServicesEnabledAsync();
-      }
-
-      if (!servicesEnabled) {
-        Alert.alert(
-          'Turn On Location',
-          'Please enable device location services, then tap Go Online again.',
-        );
-        setRouteLocationEnabled(false);
-        return false;
-      }
-
-      setRouteLocationEnabled(true);
-      return true;
-    } catch {
-      Alert.alert('Location Error', 'Unable to enable location right now. Please try again.');
-      setRouteLocationEnabled(false);
-      return false;
-    }
-  };
-
   const handleTrackingLogout = () => {
     setDriverDbId(null);
     setActiveTripDbId(null);
     setActiveLocalTripId(null);
     lastOfflineStoredPointRef.current = null;
     activeTripStartPromiseRef.current = null;
+    setShowTripActionModal(false);
+    setPermissionOnboardingState(null);
+    setPendingPhoneAccessStatus('granted');
+    setRouteLocationEnabled(false);
     setScreen('login');
   };
 
@@ -1071,9 +1436,14 @@ export default function App() {
     setIsHomeLocationVisible(false);
     setScreen('home');
     setIsDriverOnline(false);
+    pushNotification({
+      category: 'trip',
+      title: 'You are now offline',
+      message: 'Trip availability has been paused. Use the route action any time you want to go back online.',
+      icon: 'moon',
+    });
     setActiveLocalTripId(null);
     lastOfflineStoredPointRef.current = null;
-    setRouteLocationEnabled(false);
   };
 
   const clearActiveTripState = () => {
@@ -1089,6 +1459,12 @@ export default function App() {
     }
 
     const localTripId = `trip-${driverDbId}-${Date.now()}`;
+    pushNotification({
+      category: 'trip',
+      title: 'Trip started',
+      message: 'Your live trip is now active and route tracking has started.',
+      icon: 'map',
+    });
     setActiveLocalTripId(localTripId);
     lastOfflineStoredPointRef.current = null;
     const startedAt = new Date().toISOString();
@@ -1154,8 +1530,13 @@ export default function App() {
         locationLabel: 'Obrero geofence',
         details: 'Driver exited the authorized geofence during an active trip.',
       });
-      if (error) {
-        // Keep UI flow unchanged; log via alert only if needed later.
+      if (!error) {
+        pushNotification({
+          category: 'violation',
+          title: 'Violation recorded',
+          message: 'A geofence boundary violation was added to your account for this trip.',
+          icon: 'alert-triangle',
+        });
       }
     })();
   };
@@ -1166,6 +1547,7 @@ export default function App() {
     durationSeconds: number;
     routePath: Array<{ latitude: number; longitude: number }>;
     endLocation: { latitude: number; longitude: number } | null;
+    rawTelemetry?: RawTripTelemetryPoint[];
   }) => {
     const { fare, distanceKm, durationSeconds, endLocation } = payload;
     const routePath = Array.isArray((payload as { routePath?: unknown }).routePath)
@@ -1183,10 +1565,29 @@ export default function App() {
     const mm = String(today.getMonth() + 1).padStart(2, '0');
     const dd = String(today.getDate()).padStart(2, '0');
     const tripDate = `${yyyy}-${mm}-${dd}`;
+    pushNotification({
+      category: 'trip',
+      title: 'Trip completed',
+      message: `Trip saved with ${distanceKm.toFixed(2)} km travelled and ${fare.toFixed(2)} fare recorded.`,
+      icon: 'check-circle',
+    });
 
     if (driverDbId === null) {
       void (async () => {
-        const resolvedRoutePath = await snapActualPathToRoad(routePath);
+        const reconstruction = await reconstructCompletedTripPath(
+          payload.rawTelemetry ??
+            routePath.map((point) => ({
+              ...point,
+              recordedAt: new Date().toISOString(),
+            })),
+        );
+        console.info('[TripReconstruction] Local completed trip reconstruction.', {
+          status: reconstruction.status,
+          provider: reconstruction.matchedProvider,
+          rawAcceptedPoints: reconstruction.rawAcceptedPath.length,
+          reconstructedPoints: reconstruction.reconstructedPath.length,
+        });
+        const resolvedRoutePath = reconstruction.reconstructedPath;
         setTripHistory((prev) => [
           {
             id: `TRIP-${String(1000 + prev.length + 1).padStart(4, '0')}`,
@@ -1211,15 +1612,32 @@ export default function App() {
       const offlineTripPoints = localTripId
         ? await getOfflineTripPointsByLocalTripId(localTripId)
         : [];
-      const persistedRoutePath = dedupeSequentialRoutePoints(
-        offlineTripPoints.map((point) => ({
-          latitude: point.latitude,
-          longitude: point.longitude,
-        })),
+      const reconstruction = await reconstructCompletedTripPath(
+        offlineTripPoints.length > 0
+          ? offlineTripPoints.map((point) => ({
+              latitude: point.latitude,
+              longitude: point.longitude,
+              speed: point.speed,
+              heading: point.heading,
+              accuracy: point.accuracy,
+              recordedAt: point.recorded_at,
+            }))
+          : (payload.rawTelemetry ??
+            routePath.map((point) => ({
+              ...point,
+              recordedAt: new Date().toISOString(),
+            }))),
       );
-      const preferredRawRoutePath =
-        persistedRoutePath.length > routePath.length ? persistedRoutePath : routePath;
-      const resolvedRoutePath = await snapActualPathToRoad(preferredRawRoutePath);
+      console.info('[TripReconstruction] Completed trip reconstruction.', {
+        localTripId,
+        status: reconstruction.status,
+        provider: reconstruction.matchedProvider,
+        rawAcceptedPoints: reconstruction.rawAcceptedPath.length,
+        reconstructedPoints: reconstruction.reconstructedPath.length,
+      });
+      const resolvedRoutePath = reconstruction.reconstructedPath.length > 0
+        ? reconstruction.reconstructedPath
+        : dedupeSequentialRoutePoints(routePath);
 
       setTripHistory((prev) => [
         {
@@ -1323,22 +1741,15 @@ export default function App() {
 
       const refreshed = await listTripsWithRoutePoints(driverDbId, 250);
       if (!refreshed.error) {
+        const previousRoutesById = new Map(
+          tripHistoryRef.current.map((item) => [item.id, item.routePath]),
+        );
         const mapped: TripHistoryItem[] = refreshed.trips.map((t) => {
-          const mins = Math.floor((t.duration_seconds ?? 0) / 60);
-          const secs = (t.duration_seconds ?? 0) % 60;
-          const durationLabel = mins > 0 ? `${mins} min` : `${secs} sec`;
-          const idSuffix = String(t.id).split('-')[0]?.toUpperCase() ?? String(t.id);
-          return {
-            id: `TRIP-${idSuffix}`,
-            tripDate: t.trip_date,
-            duration: durationLabel,
-            distance: `${Number(t.distance_km ?? 0).toFixed(2)} km`,
-            fare: `\u20B1${Number(t.fare ?? 0).toFixed(2)}`,
-            violations: '0',
-            status: t.status === 'ONGOING' ? 'ONGOING' : 'COMPLETED',
-            compliance: 100,
-            routePath: t.route_points ?? [],
-          };
+          const fallbackRoute =
+            previousRoutesById.get(
+              `TRIP-${String(t.id).split('-')[0]?.toUpperCase() ?? String(t.id)}`,
+            ) ?? resolvedRoutePath;
+          return mapTripRecordToHistoryItem(t, fallbackRoute);
         });
         setTripHistory(mapped);
         const totals = computeTripTotals(mapped);
@@ -1364,10 +1775,16 @@ export default function App() {
     },
     onGoOffline: handleTrackingOffline,
     onBackToHome: () => setScreen('home'),
+    onRequestTripNavigation: () => setScreen('tripNavigation'),
+    onExitTripNavigation: () => setScreen('trip'),
     isDriverOnline,
     locationEnabled: routeLocationEnabled,
     tripOpenPending: isWaitingForTripLocation,
     onLocationVisibilityChange: setIsHomeLocationVisible,
+    notifications,
+    unreadNotificationCount,
+    onMarkNotificationRead: markNotificationRead,
+    onMarkAllNotificationsRead: markAllNotificationsRead,
     profileName,
     profileDriverCode,
     profilePlateNumber,
@@ -1376,7 +1793,21 @@ export default function App() {
     onChangeMapTypeOption: setMapTypeOption,
     onOpenSimulation: () => setScreen('simulation'),
     onTripStart: handleTrackingTripStart,
-    onTripPointRecord: ({ latitude, longitude, recordedAt }: { latitude: number; longitude: number; recordedAt: string }) => {
+    onTripPointRecord: ({
+      latitude,
+      longitude,
+      recordedAt,
+      speed,
+      heading,
+      accuracy,
+    }: {
+      latitude: number;
+      longitude: number;
+      recordedAt: string;
+      speed?: number | null;
+      heading?: number | null;
+      accuracy?: number | null;
+    }) => {
       if (driverDbId === null || !activeLocalTripId) {
         return;
       }
@@ -1402,6 +1833,9 @@ export default function App() {
         driverId: driverDbId,
         latitude,
         longitude,
+        speed,
+        heading,
+        accuracy,
         recordedAt,
       });
     },
@@ -1421,10 +1855,32 @@ export default function App() {
           behavior={Platform.select({ ios: 'padding', android: undefined })}
           style={styles.grow}
         >
-        {screen === 'home' ? (
+        {screen === 'permissionPhone' ? (
+          <PermissionOnboardingScreen
+            step={1}
+            kind="phone"
+            title="Allow access to your phone"
+            description="We’ll request your device contacts permission to support account protection and trusted device setup on this phone."
+            onContinue={handlePhoneOnboardingContinue}
+            onSkip={handlePhoneOnboardingSkip}
+            isSubmitting={isPermissionOnboardingSubmitting}
+          />
+        ) : screen === 'permissionLocation' ? (
+          <PermissionOnboardingScreen
+            step={2}
+            kind="location"
+            title="Allow location services"
+            description="Location access improves trip accuracy and address precision so your live trips stay aligned with the road."
+            onContinue={handleLocationOnboardingContinue}
+            onSkip={handleLocationOnboardingSkip}
+            isSubmitting={isPermissionOnboardingSubmitting}
+          />
+        ) : screen === 'home' ? (
           <HomeScreen {...trackingScreenSharedProps} isTripScreen={false} />
         ) : screen === 'startTrip' ? (
           <StartTripScreen {...trackingScreenSharedProps} />
+        ) : screen === 'tripNavigation' ? (
+          <TripNavigationScreen {...trackingScreenSharedProps} />
         ) : screen === 'simulation' ? (
           <SimulationScreen
             profileName={profileName}
@@ -1435,12 +1891,7 @@ export default function App() {
           />
         ) : screen === 'trip' ? (
           <TripScreen
-            onLogout={() => {
-              setDriverDbId(null);
-              setActiveTripDbId(null);
-              activeTripStartPromiseRef.current = null;
-              setScreen('login');
-            }}
+            onLogout={handleTrackingLogout}
             onNavigate={handleMainTabNavigate}
             tripHistory={tripHistory}
             profileName={profileName}
@@ -1452,24 +1903,14 @@ export default function App() {
           />
         ) : screen === 'violation' ? (
           <ViolationScreen
-            onLogout={() => {
-              setDriverDbId(null);
-              setActiveTripDbId(null);
-              activeTripStartPromiseRef.current = null;
-              setScreen('login');
-            }}
+            onLogout={handleTrackingLogout}
             onNavigate={handleMainTabNavigate}
             driverDbId={driverDbId}
             styles={styles}
           />
         ) : screen === 'profile' ? (
         <ProfileScreen
-            onLogout={() => {
-              setDriverDbId(null);
-              setActiveTripDbId(null);
-              activeTripStartPromiseRef.current = null;
-              setScreen('login');
-            }}
+            onLogout={handleTrackingLogout}
             onNavigate={handleMainTabNavigate}
             profileName={profileName}
             profileDriverCode={profileDriverCode}
@@ -1477,6 +1918,17 @@ export default function App() {
             profilePlateNumber={profilePlateNumber}
             profileImageUri={profileImageUri}
             onUpdateProfile={async ({ name, contact, imageUri }) => {
+              const changedFields: string[] = [];
+              if (name !== profileName) {
+                changedFields.push('name');
+              }
+              if (contact !== profileContact) {
+                changedFields.push('contact number');
+              }
+              if (imageUri !== profileImageUri) {
+                changedFields.push('profile photo');
+              }
+
               setProfileName(name);
               setProfileContact(contact);
               setProfileImageUri(imageUri);
@@ -1492,7 +1944,7 @@ export default function App() {
                 return;
               }
 
-              const { publicUrl, error } = await uploadDriverAvatar({
+              const { publicUrl, error, warning } = await uploadDriverAvatar({
                 driverId: driverDbId,
                 localUri: imageUri,
               });
@@ -1503,6 +1955,19 @@ export default function App() {
 
               if (publicUrl) {
                 setProfileImageUri(publicUrl);
+              }
+
+              if (changedFields.length > 0) {
+                pushNotification({
+                  category: 'profile',
+                  title: 'Profile updated',
+                  message: `Updated ${changedFields.join(', ')} in your account details.`,
+                  icon: 'user',
+                });
+              }
+
+              if (warning) {
+                Alert.alert('Avatar Saved Locally', warning);
               }
             }}
             styles={styles}
@@ -1534,7 +1999,7 @@ export default function App() {
                     styles.backButton,
                   ]}
                 >
-                  <Feather name="chevron-left" size={20} color="#030318" />
+                  <AppIcon name="chevron-left" size={20} color="#030318" />
                 </Pressable>
 
                 <Text
@@ -1581,14 +2046,15 @@ export default function App() {
           </ScrollView>
         )}
 
-        <EnableLocationModal
-          visible={showEnableLocationModal}
-          onRequestClose={() => setShowEnableLocationModal(false)}
-          onGrantPermission={async () => {
-            setShowEnableLocationModal(false);
-            await handleGoOnline({ openTripScreen: true });
-          }}
-          onMaybeLater={() => setShowEnableLocationModal(false)}
+        <TripActionModal
+          visible={showTripActionModal}
+          onRequestClose={() => setShowTripActionModal(false)}
+          onConfirm={confirmTripActionModal}
+          onCancel={() => setShowTripActionModal(false)}
+          title={tripActionModalContent.title}
+          description={tripActionModalContent.description}
+          confirmLabel={tripActionModalContent.confirmLabel}
+          cancelLabel="Cancel"
         />
       </KeyboardAvoidingView>
 
@@ -2837,6 +3303,13 @@ const styles = StyleSheet.create({
     backgroundColor: '#57c7a8',
     borderWidth: 0,
     borderColor: 'transparent',
+  },
+  homeCenterRouteButtonActive: {
+    shadowColor: '#57c7a8',
+    shadowOpacity: 0.28,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 5 },
+    elevation: 8,
   },
   homeBottomActiveLine: {
     width: 44,

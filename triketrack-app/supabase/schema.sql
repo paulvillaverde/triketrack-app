@@ -1,6 +1,8 @@
+
 -- Run this in Supabase SQL Editor (SQL -> New query).
--- This is the rollup (all-in-one) version of the schema.
--- This is the only schema file you need to run.
+-- This is the merged rollup schema for the admin dashboard + mobile app.
+-- For best results, run this on a clean/reset database.
+-- Target project: `irkbdinugnasepjowhzr.supabase.co`
 
 create schema if not exists extensions;
 create extension if not exists pgcrypto with schema extensions;
@@ -14,6 +16,74 @@ begin
   return new;
 end;
 $$;
+
+-- ---------- Storage bootstrap ----------
+do $$
+begin
+  insert into storage.buckets (id, name, public)
+  values ('driver-avatars', 'driver-avatars', true)
+  on conflict (id) do nothing;
+exception
+  when undefined_table then null;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'storage'
+      and tablename = 'objects'
+      and policyname = 'public_can_read_driver_avatars'
+  ) then
+    create policy public_can_read_driver_avatars
+    on storage.objects
+    for select
+    to public
+    using (bucket_id = 'driver-avatars');
+  end if;
+exception
+  when undefined_table then null;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'storage'
+      and tablename = 'objects'
+      and policyname = 'public_can_upload_driver_avatars'
+  ) then
+    create policy public_can_upload_driver_avatars
+    on storage.objects
+    for insert
+    to anon, authenticated
+    with check (bucket_id = 'driver-avatars');
+  end if;
+exception
+  when undefined_table then null;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'storage'
+      and tablename = 'objects'
+      and policyname = 'public_can_update_driver_avatars'
+  ) then
+    create policy public_can_update_driver_avatars
+    on storage.objects
+    for update
+    to anon, authenticated
+    using (bucket_id = 'driver-avatars')
+    with check (bucket_id = 'driver-avatars');
+  end if;
+exception
+  when undefined_table then null;
+end $$;
 
 -- ---------- Enums ----------
 do $$
@@ -30,11 +100,108 @@ exception
   when duplicate_object then null;
 end $$;
 
+drop function if exists public.entity_status_from_text(text);
+create or replace function public.entity_status_from_text(p_label text)
+returns public.entity_status
+language plpgsql
+immutable
+as $$
+declare
+  v_status public.entity_status;
+begin
+  select enum_value
+  into v_status
+  from unnest(enum_range(null::public.entity_status)) as enum_value
+  where lower(enum_value::text) = lower(trim(p_label))
+  limit 1;
+
+  if v_status is null then
+    raise exception 'Invalid entity_status value: %', p_label;
+  end if;
+
+  return v_status;
+end;
+$$;
+
 do $$
 begin
   create type public.qr_status as enum ('active', 'inactive', 'revoked', 'expired');
 exception
   when duplicate_object then null;
+end $$;
+
+drop function if exists public.qr_status_from_text(text);
+create or replace function public.qr_status_from_text(p_label text)
+returns public.qr_status
+language plpgsql
+immutable
+as $$
+declare
+  v_status public.qr_status;
+begin
+  select enum_value
+  into v_status
+  from unnest(enum_range(null::public.qr_status)) as enum_value
+  where lower(enum_value::text) = lower(trim(p_label))
+  limit 1;
+
+  if v_status is null then
+    raise exception 'Invalid qr_status value: %', p_label;
+  end if;
+
+  return v_status;
+end;
+$$;
+
+do $$
+begin
+  if exists (
+    select 1
+    from pg_type t
+    join pg_namespace n on n.oid = t.typnamespace
+    where n.nspname = 'public'
+      and t.typname = 'trip_status'
+  ) and (
+    exists (
+      select 1
+      from pg_type t
+      join pg_namespace n on n.oid = t.typnamespace
+      join pg_enum e on e.enumtypid = t.oid
+      where n.nspname = 'public'
+        and t.typname = 'trip_status'
+        and e.enumlabel in ('SCHEDULED', 'ONGOING', 'COMPLETED', 'CANCELLED')
+    )
+    or exists (
+      select 1
+      from (
+        values ('scheduled'), ('ongoing'), ('completed'), ('cancelled')
+      ) as required(label)
+      where not exists (
+        select 1
+        from pg_type t
+        join pg_namespace n on n.oid = t.typnamespace
+        join pg_enum e on e.enumtypid = t.oid
+        where n.nspname = 'public'
+          and t.typname = 'trip_status'
+          and e.enumlabel = required.label
+      )
+    )
+  ) then
+    drop view if exists public.trips_with_week_bucket cascade;
+    drop table if exists public.trip_points cascade;
+    drop table if exists public.passenger_scans cascade;
+    drop table if exists public.reports cascade;
+    drop table if exists public.report_media cascade;
+    drop table if exists public.violations cascade;
+    drop table if exists public.trip_route_points cascade;
+    drop table if exists public.trip_routes cascade;
+    drop table if exists public.mobile_violations cascade;
+    drop table if exists public.violation_appeals cascade;
+    drop table if exists public.trips cascade;
+    drop type public.trip_status;
+  end if;
+exception
+  when undefined_object then null;
 end $$;
 
 do $$
@@ -44,12 +211,58 @@ exception
   when duplicate_object then null;
 end $$;
 
+drop function if exists public.trip_status_from_text(text);
+create or replace function public.trip_status_from_text(p_label text)
+returns public.trip_status
+language plpgsql
+immutable
+as $$
+declare
+  v_status public.trip_status;
+begin
+  select enum_value
+  into v_status
+  from unnest(enum_range(null::public.trip_status)) as enum_value
+  where lower(enum_value::text) = lower(trim(p_label))
+  limit 1;
+
+  if v_status is null then
+    raise exception 'Invalid trip_status value: %', p_label;
+  end if;
+
+  return v_status;
+end;
+$$;
+
 do $$
 begin
   create type public.report_status as enum ('submitted', 'under_review', 'verified', 'resolved', 'dismissed');
 exception
   when duplicate_object then null;
 end $$;
+
+drop function if exists public.report_status_from_text(text);
+create or replace function public.report_status_from_text(p_label text)
+returns public.report_status
+language plpgsql
+immutable
+as $$
+declare
+  v_status public.report_status;
+begin
+  select enum_value
+  into v_status
+  from unnest(enum_range(null::public.report_status)) as enum_value
+  where lower(enum_value::text) = lower(trim(p_label))
+  limit 1;
+
+  if v_status is null then
+    raise exception 'Invalid report_status value: %', p_label;
+  end if;
+
+  return v_status;
+end;
+$$;
 
 do $$
 begin
@@ -58,12 +271,58 @@ exception
   when duplicate_object then null;
 end $$;
 
+drop function if exists public.violation_status_from_text(text);
+create or replace function public.violation_status_from_text(p_label text)
+returns public.violation_status
+language plpgsql
+immutable
+as $$
+declare
+  v_status public.violation_status;
+begin
+  select enum_value
+  into v_status
+  from unnest(enum_range(null::public.violation_status)) as enum_value
+  where lower(enum_value::text) = lower(trim(p_label))
+  limit 1;
+
+  if v_status is null then
+    raise exception 'Invalid violation_status value: %', p_label;
+  end if;
+
+  return v_status;
+end;
+$$;
+
 do $$
 begin
   create type public.violation_source as enum ('system', 'passenger_report', 'admin');
 exception
   when duplicate_object then null;
 end $$;
+
+drop function if exists public.violation_source_from_text(text);
+create or replace function public.violation_source_from_text(p_label text)
+returns public.violation_source
+language plpgsql
+immutable
+as $$
+declare
+  v_status public.violation_source;
+begin
+  select enum_value
+  into v_status
+  from unnest(enum_range(null::public.violation_source)) as enum_value
+  where lower(enum_value::text) = lower(trim(p_label))
+  limit 1;
+
+  if v_status is null then
+    raise exception 'Invalid violation_source value: %', p_label;
+  end if;
+
+  return v_status;
+end;
+$$;
 
 do $$
 begin
@@ -72,7 +331,6 @@ exception
   when duplicate_object then null;
 end $$;
 
--- Mobile app compatibility enums
 do $$
 begin
   create type public.mobile_violation_type as enum ('GEOFENCE_BOUNDARY', 'ROUTE_DEVIATION', 'UNAUTHORIZED_STOP');
@@ -87,12 +345,58 @@ exception
   when duplicate_object then null;
 end $$;
 
+drop function if exists public.mobile_violation_status_from_text(text);
+create or replace function public.mobile_violation_status_from_text(p_label text)
+returns public.mobile_violation_status
+language plpgsql
+immutable
+as $$
+declare
+  v_status public.mobile_violation_status;
+begin
+  select enum_value
+  into v_status
+  from unnest(enum_range(null::public.mobile_violation_status)) as enum_value
+  where lower(enum_value::text) = lower(trim(p_label))
+  limit 1;
+
+  if v_status is null then
+    raise exception 'Invalid mobile_violation_status value: %', p_label;
+  end if;
+
+  return v_status;
+end;
+$$;
+
 do $$
 begin
   create type public.mobile_violation_priority as enum ('HIGH', 'MEDIUM', 'LOW');
 exception
   when duplicate_object then null;
 end $$;
+
+drop function if exists public.mobile_violation_priority_from_text(text);
+create or replace function public.mobile_violation_priority_from_text(p_label text)
+returns public.mobile_violation_priority
+language plpgsql
+immutable
+as $$
+declare
+  v_status public.mobile_violation_priority;
+begin
+  select enum_value
+  into v_status
+  from unnest(enum_range(null::public.mobile_violation_priority)) as enum_value
+  where lower(enum_value::text) = lower(trim(p_label))
+  limit 1;
+
+  if v_status is null then
+    raise exception 'Invalid mobile_violation_priority value: %', p_label;
+  end if;
+
+  return v_status;
+end;
+$$;
 
 do $$
 begin
@@ -101,13 +405,36 @@ exception
   when duplicate_object then null;
 end $$;
 
+drop function if exists public.appeal_status_from_text(text);
+create or replace function public.appeal_status_from_text(p_label text)
+returns public.appeal_status
+language plpgsql
+immutable
+as $$
+declare
+  v_status public.appeal_status;
+begin
+  select enum_value
+  into v_status
+  from unnest(enum_range(null::public.appeal_status)) as enum_value
+  where lower(enum_value::text) = lower(trim(p_label))
+  limit 1;
+
+  if v_status is null then
+    raise exception 'Invalid appeal_status value: %', p_label;
+  end if;
+
+  return v_status;
+end;
+$$;
+
 -- ---------- Master tables ----------
 create table if not exists public.barangays (
   barangay_id bigint generated always as identity primary key,
   barangay_name text not null,
   district text,
   city text not null,
-  status public.entity_status not null default 'active',
+  status public.entity_status not null default public.entity_status_from_text('active'),
   created_at timestamptz not null default now(),
   unique (barangay_name, city)
 );
@@ -116,7 +443,7 @@ create table if not exists public.todas (
   toda_id bigint generated always as identity primary key,
   barangay_id bigint not null references public.barangays(barangay_id) on delete restrict,
   toda_name text not null,
-  status public.entity_status not null default 'active',
+  status public.entity_status not null default public.entity_status_from_text('active'),
   created_at timestamptz not null default now(),
   unique (barangay_id, toda_name)
 );
@@ -127,59 +454,24 @@ create table if not exists public.admin_accounts (
   admin_role public.admin_role not null,
   barangay_id bigint references public.barangays(barangay_id) on delete restrict,
   toda_id bigint references public.todas(toda_id) on delete restrict,
-  status public.entity_status not null default 'active',
-  created_at timestamptz not null default now()
-);
-
-do $$
-begin
-  if not exists (
-    select 1
-    from pg_constraint
-    where conname = 'admin_scope_check'
-      and conrelid = 'public.admin_accounts'::regclass
-  ) then
-    alter table public.admin_accounts
-      add constraint admin_scope_check check (
-        (admin_role = 'superadmin' and barangay_id is null and toda_id is null)
-        or
-        (admin_role = 'barangay_admin' and barangay_id is not null and toda_id is null)
-        or
-        (admin_role = 'toda_admin' and toda_id is not null and barangay_id is null)
-      );
-  end if;
-end $$;
-
-create table if not exists public.drivers (
-  driver_id bigint generated always as identity primary key,
-  toda_id bigint not null references public.todas(toda_id) on delete restrict,
-  tricycle_id bigint,
-  qr_id bigint,
-  driver_code text unique,
-  first_name text not null,
-  last_name text not null,
-  contact_no text,
-  avatar_url text,
-  password_hash text,
-  status public.entity_status not null default 'active',
+  status public.entity_status not null default public.entity_status_from_text('active'),
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+  constraint admin_scope_check check (
+    (admin_role = 'superadmin' and barangay_id is null and toda_id is null)
+    or
+    (admin_role = 'barangay_admin' and barangay_id is not null and toda_id is null)
+    or
+    (admin_role = 'toda_admin' and toda_id is not null and barangay_id is null)
+  )
 );
-
-alter table public.drivers add column if not exists updated_at timestamptz not null default now();
-alter table public.drivers add column if not exists avatar_url text;
-update public.drivers
-set updated_at = coalesce(updated_at, created_at, now())
-where updated_at is null;
 
 create table if not exists public.tricycles (
   tricycle_id bigint generated always as identity primary key,
   toda_id bigint not null references public.todas(toda_id) on delete restrict,
-  driver_id bigint references public.drivers(driver_id) on delete set null,
   plate_no text not null unique,
   reg_no text unique,
   permit_expiration_date date,
-  status public.entity_status not null default 'active',
+  status public.entity_status not null default public.entity_status_from_text('active'),
   created_at timestamptz not null default now()
 );
 
@@ -189,7 +481,7 @@ create table if not exists public.routes (
   origin text not null,
   destination text not null,
   geofence_geojson jsonb,
-  status public.entity_status not null default 'active',
+  status public.entity_status not null default public.entity_status_from_text('active'),
   created_at timestamptz not null default now(),
   unique (toda_id, origin, destination)
 );
@@ -198,63 +490,83 @@ create table if not exists public.qr_codes (
   qr_id bigint generated always as identity primary key,
   tricycle_id bigint not null references public.tricycles(tricycle_id) on delete cascade,
   qr_token text not null unique,
-  status public.qr_status not null default 'active',
+  status public.qr_status not null default public.qr_status_from_text('active'),
   issued_at timestamptz not null default now(),
   expires_at timestamptz,
   created_at timestamptz not null default now()
 );
 
-create table if not exists public.report_types (
-  report_type_id bigint generated always as identity primary key,
-  code text not null unique,
-  label text not null
-);
-
-create table if not exists public.violation_types (
-  violation_type_id bigint generated always as identity primary key,
-  code text not null unique,
-  label text not null
-);
-
 do $$
 begin
-  if not exists (
+  if exists (
     select 1
-    from pg_constraint
-    where conname = 'drivers_tricycle_id_fkey'
-      and conrelid = 'public.drivers'::regclass
+    from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'drivers'
+      and column_name = 'driver_id'
+      and data_type <> 'bigint'
   ) then
-    alter table public.drivers
-      add constraint drivers_tricycle_id_fkey
-      foreign key (tricycle_id) references public.tricycles(tricycle_id) on delete set null;
+    drop table if exists public.driver_locations cascade;
+    drop table if exists public.trip_points cascade;
+    drop table if exists public.trip_routes cascade;
+    drop table if exists public.mobile_violations cascade;
+    drop table if exists public.violation_appeals cascade;
+    drop table if exists public.trips cascade;
+    drop table if exists public.violations cascade;
+    drop table if exists public.drivers cascade;
   end if;
 exception
-  when undefined_table then null;
+  when wrong_object_type then null;
 end $$;
 
-do $$
-begin
-  if not exists (
-    select 1
-    from pg_constraint
-    where conname = 'drivers_qr_id_fkey'
-      and conrelid = 'public.drivers'::regclass
-  ) then
-    alter table public.drivers
-      add constraint drivers_qr_id_fkey
-      foreign key (qr_id) references public.qr_codes(qr_id) on delete set null;
-  end if;
-exception
-  when undefined_table then null;
-end $$;
+create table if not exists public.drivers (
+  driver_id bigint generated always as identity primary key,
+  driver_code text generated always as ('D-' || lpad(driver_id::text, 3, '0')) stored unique,
+  toda_id bigint not null references public.todas(toda_id) on delete restrict,
+  tricycle_id bigint references public.tricycles(tricycle_id) on delete set null,
+  qr_id bigint references public.qr_codes(qr_id) on delete set null,
+  first_name text not null,
+  last_name text not null,
+  contact_no text,
+  avatar_url text,
+  password_hash text,
+  status public.entity_status not null default public.entity_status_from_text('active'),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.drivers add column if not exists contact_no text;
+alter table public.drivers add column if not exists avatar_url text;
+alter table public.drivers add column if not exists password_hash text;
+alter table public.drivers add column if not exists updated_at timestamptz not null default now();
+alter table public.drivers add column if not exists tricycle_id bigint;
+alter table public.drivers add column if not exists qr_id bigint;
+
+update public.drivers
+set updated_at = coalesce(updated_at, created_at, now())
+where updated_at is null;
 
 drop trigger if exists trg_drivers_updated_at on public.drivers;
 create trigger trg_drivers_updated_at
 before update on public.drivers
 for each row execute function public.set_updated_at();
 
-alter table public.drivers add column if not exists driver_code text;
-create unique index if not exists idx_drivers_driver_code_unique on public.drivers (driver_code) where driver_code is not null;
+do $$
+begin
+  if exists (
+    select 1
+    from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'driver_locations'
+      and column_name = 'driver_id'
+      and data_type <> 'bigint'
+  ) then
+    drop table if exists public.driver_locations cascade;
+  end if;
+exception
+  when wrong_object_type then
+    execute 'drop view if exists public.driver_locations cascade';
+end $$;
 
 create table if not exists public.driver_locations (
   driver_id bigint primary key references public.drivers(driver_id) on delete cascade,
@@ -270,14 +582,22 @@ create table if not exists public.driver_locations (
   updated_at timestamptz not null default now()
 );
 
-alter table public.driver_locations add column if not exists is_online boolean not null default true;
-alter table public.driver_locations add column if not exists recorded_at timestamptz not null default now();
-alter table public.driver_locations add column if not exists updated_at timestamptz not null default now();
-
 drop trigger if exists trg_driver_locations_updated_at on public.driver_locations;
 create trigger trg_driver_locations_updated_at
 before update on public.driver_locations
 for each row execute function public.set_updated_at();
+
+create table if not exists public.report_types (
+  report_type_id bigint generated always as identity primary key,
+  code text not null unique,
+  label text not null
+);
+
+create table if not exists public.violation_types (
+  violation_type_id bigint generated always as identity primary key,
+  code text not null unique,
+  label text not null
+);
 
 -- ---------- Trips ----------
 create table if not exists public.trips (
@@ -289,7 +609,7 @@ create table if not exists public.trips (
   trip_end timestamptz,
   duration_minutes integer,
   fare_amount numeric(10, 2),
-  trip_status public.trip_status not null default 'scheduled',
+  trip_status public.trip_status not null default public.trip_status_from_text('scheduled'),
   created_at timestamptz not null default now(),
   constraint trip_time_check check (trip_end is null or trip_end >= trip_start),
   constraint trip_duration_check check (duration_minutes is null or duration_minutes >= 0),
@@ -327,7 +647,7 @@ create table if not exists public.reports (
   report_type_id bigint not null references public.report_types(report_type_id) on delete restrict,
   description text not null,
   reported_at timestamptz not null default now(),
-  status public.report_status not null default 'submitted',
+  status public.report_status not null default public.report_status_from_text('submitted'),
   created_at timestamptz not null default now()
 );
 
@@ -350,8 +670,8 @@ create table if not exists public.violations (
   tricycle_id bigint references public.tricycles(tricycle_id) on delete set null,
   description text,
   detected_at timestamptz not null default now(),
-  source public.violation_source not null default 'system',
-  status public.violation_status not null default 'open',
+  source public.violation_source not null default public.violation_source_from_text('system'),
+  status public.violation_status not null default public.violation_status_from_text('open'),
   created_at timestamptz not null default now(),
   constraint violation_reference_check check (
     trip_id is not null
@@ -360,7 +680,6 @@ create table if not exists public.violations (
     or tricycle_id is not null
   )
 );
-
 -- ---------- Mobile app compatibility tables ----------
 create table if not exists public.trip_route_points (
   trip_id bigint not null references public.trips(trip_id) on delete cascade,
@@ -387,8 +706,8 @@ create table if not exists public.mobile_violations (
   driver_id bigint not null references public.drivers(driver_id) on delete cascade,
   trip_id bigint references public.trips(trip_id) on delete set null,
   type public.mobile_violation_type not null,
-  status public.mobile_violation_status not null default 'OPEN',
-  priority public.mobile_violation_priority not null default 'MEDIUM',
+  status public.mobile_violation_status not null default public.mobile_violation_status_from_text('OPEN'),
+  priority public.mobile_violation_priority not null default public.mobile_violation_priority_from_text('MEDIUM'),
   occurred_at timestamptz not null default now(),
   title text,
   latitude double precision,
@@ -405,7 +724,7 @@ create table if not exists public.violation_appeals (
   driver_id bigint not null references public.drivers(driver_id) on delete cascade,
   reason text not null,
   details text,
-  status public.appeal_status not null default 'SUBMITTED',
+  status public.appeal_status not null default public.appeal_status_from_text('SUBMITTED'),
   submitted_at timestamptz not null default now(),
   reviewed_at timestamptz,
   decision_notes text,
@@ -424,6 +743,7 @@ before update on public.violation_appeals
 for each row execute function public.set_updated_at();
 
 -- ---------- RPCs for driver app ----------
+drop function if exists public.authenticate_driver(text, text);
 create or replace function public.authenticate_driver(p_driver_code text, p_password text)
 returns table (
   id bigint,
@@ -448,7 +768,7 @@ begin
     d.avatar_url
   from public.drivers d
   left join public.tricycles t on t.tricycle_id = d.tricycle_id
-  where d.status = 'active'
+  where d.status = public.entity_status_from_text('active')
     and upper(coalesce(d.driver_code, d.driver_id::text)) = upper(p_driver_code)
     and d.password_hash is not null
     and d.password_hash = extensions.crypt(p_password, d.password_hash)
@@ -456,6 +776,7 @@ begin
 end;
 $$;
 
+drop function if exists public.set_driver_password(text, text);
 create or replace function public.set_driver_password(p_driver_code text, p_password text)
 returns table (
   id bigint,
@@ -477,7 +798,7 @@ begin
       password_hash = extensions.crypt(p_password, extensions.gen_salt('bf')),
       updated_at = now()
     where upper(coalesce(d.driver_code, d.driver_id::text)) = upper(p_driver_code)
-      and d.status = 'active'
+      and d.status = public.entity_status_from_text('active')
     returning d.driver_id, d.driver_code, d.first_name, d.last_name, d.contact_no, d.tricycle_id, d.avatar_url
   )
   select
@@ -492,6 +813,7 @@ begin
 end;
 $$;
 
+drop function if exists public.set_driver_avatar(bigint, text);
 create or replace function public.set_driver_avatar(
   p_driver_id bigint,
   p_avatar_url text
@@ -509,13 +831,14 @@ begin
     avatar_url = p_avatar_url,
     updated_at = now()
   where driver_id = p_driver_id
-    and status = 'active'
+    and status = public.entity_status_from_text('active')
   returning avatar_url into v_avatar_url;
 
   return v_avatar_url;
 end;
 $$;
 
+drop function if exists public.upsert_driver_location(bigint, text, double precision, double precision, double precision, double precision, double precision, timestamptz);
 create or replace function public.upsert_driver_location(
   p_driver_id bigint,
   p_driver_code text,
@@ -570,6 +893,7 @@ begin
 end;
 $$;
 
+drop function if exists public.set_driver_location_offline(bigint);
 create or replace function public.set_driver_location_offline(p_driver_id bigint)
 returns void
 language plpgsql
@@ -584,7 +908,7 @@ begin
   where driver_id = p_driver_id;
 end;
 $$;
-
+drop function if exists public.start_trip(bigint, double precision, double precision);
 create or replace function public.start_trip(
   p_driver_id bigint,
   p_start_lat double precision default null,
@@ -604,7 +928,7 @@ begin
   select d.tricycle_id, d.toda_id, r.route_id
   into v_tricycle_id, v_toda_id, v_route_id
   from public.drivers d
-  left join public.routes r on r.toda_id = d.toda_id and r.status = 'active'
+  left join public.routes r on r.toda_id = d.toda_id and r.status = public.entity_status_from_text('active')
   where d.driver_id = p_driver_id
   order by r.route_id asc
   limit 1;
@@ -615,9 +939,9 @@ begin
 
   if v_route_id is null and v_toda_id is not null then
     insert into public.routes (toda_id, origin, destination, status)
-    values (v_toda_id, 'Test Route', 'Live GPS Tracking', 'active')
+    values (v_toda_id, 'Test Route', 'Live GPS Tracking', public.entity_status_from_text('active'))
     on conflict (toda_id, origin, destination) do update
-      set status = 'active'
+      set status = public.entity_status_from_text('active')
     returning route_id into v_route_id;
   end if;
 
@@ -625,7 +949,7 @@ begin
     select r.route_id
     into v_route_id
     from public.routes r
-    where r.status = 'active'
+    where r.status = public.entity_status_from_text('active')
     order by r.route_id asc
     limit 1;
   end if;
@@ -635,7 +959,7 @@ begin
   end if;
 
   insert into public.trips (driver_id, tricycle_id, route_id, trip_start, trip_status, fare_amount, duration_minutes)
-  values (p_driver_id, v_tricycle_id, v_route_id, now(), 'ongoing', 0, 0)
+  values (p_driver_id, v_tricycle_id, v_route_id, now(), public.trip_status_from_text('ongoing'), 0, 0)
   returning trip_id into v_trip_id;
 
   if p_start_lat is not null and p_start_lng is not null then
@@ -662,6 +986,7 @@ begin
 end;
 $$;
 
+drop function if exists public.complete_trip(bigint, double precision, double precision, numeric, numeric, integer, jsonb);
 create or replace function public.complete_trip(
   p_trip_id bigint,
   p_end_lat double precision,
@@ -684,7 +1009,7 @@ begin
     trip_end = now(),
     fare_amount = coalesce(p_fare, 0),
     duration_minutes = greatest(coalesce(ceil(coalesce(p_duration_seconds, 0) / 60.0), 0), 0),
-    trip_status = 'completed'
+    trip_status = public.trip_status_from_text('completed')
   where trip_id = p_trip_id
   returning driver_id into v_driver_id;
 
@@ -725,7 +1050,8 @@ begin
 end;
 $$;
 
-create or replace view public.trips_with_week_bucket as
+drop view if exists public.trips_with_week_bucket;
+create view public.trips_with_week_bucket as
 select
   t.trip_id as id,
   t.driver_id,
@@ -822,12 +1148,14 @@ create index if not exists idx_violation_appeals_violation on public.violation_a
 
 create unique index if not exists uq_qr_codes_active_per_tricycle
 on public.qr_codes (tricycle_id)
-where status = 'active';
+where status = public.qr_status_from_text('active');
 
 create unique index if not exists ux_active_appeal_per_violation
 on public.violation_appeals (violation_id)
-where status in ('SUBMITTED', 'UNDER_REVIEW');
-
+where status in (
+  public.appeal_status_from_text('SUBMITTED'),
+  public.appeal_status_from_text('UNDER_REVIEW')
+);
 -- ---------- Seed lookup data ----------
 insert into public.report_types (code, label)
 values
@@ -885,6 +1213,42 @@ begin
   end if;
 end $$;
 
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'driver_locations'
+      and policyname = 'authenticated_can_insert_driver_locations'
+  ) then
+    create policy authenticated_can_insert_driver_locations
+    on public.driver_locations
+    for insert
+    to authenticated, anon
+    with check (true);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'driver_locations'
+      and policyname = 'authenticated_can_update_driver_locations'
+  ) then
+    create policy authenticated_can_update_driver_locations
+    on public.driver_locations
+    for update
+    to authenticated, anon
+    using (true)
+    with check (true);
+  end if;
+end $$;
+
+-- ---------- Storage ----------
 do $$
 begin
   insert into storage.buckets (id, name, public)
@@ -946,41 +1310,7 @@ begin
   end if;
 end $$;
 
-do $$
-begin
-  if not exists (
-    select 1
-    from pg_policies
-    where schemaname = 'public'
-      and tablename = 'driver_locations'
-      and policyname = 'authenticated_can_insert_driver_locations'
-  ) then
-    create policy authenticated_can_insert_driver_locations
-    on public.driver_locations
-    for insert
-    to authenticated, anon
-    with check (true);
-  end if;
-end $$;
-
-do $$
-begin
-  if not exists (
-    select 1
-    from pg_policies
-    where schemaname = 'public'
-      and tablename = 'driver_locations'
-      and policyname = 'authenticated_can_update_driver_locations'
-  ) then
-    create policy authenticated_can_update_driver_locations
-    on public.driver_locations
-    for update
-    to authenticated, anon
-    using (true)
-    with check (true);
-  end if;
-end $$;
-
+-- ---------- Realtime + Grants ----------
 do $$
 begin
   begin

@@ -1,9 +1,8 @@
 import { Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
-import { Feather } from '@expo/vector-icons';
 import { BottomTab, HomeNavigationCard } from '../components/navigation/HomeNavigationCard';
 import { VIOLATION_ITEMS } from './ViolationScreen';
 import { MetricTile } from '../components/tiles/MetricTile';
-import { Avatar } from '../components/ui';
+import { AppIcon, Avatar } from '../components/ui';
 
 type DashboardHomeScreenProps = {
   onLogout?: () => void;
@@ -82,7 +81,7 @@ export function DashboardHomeScreen({
               </View>
             </View>
             <Pressable style={localStyles.bellButton} onPress={onLogout}>
-              <Feather name="bell" size={17} color="#1F2937" />
+              <AppIcon name="bell" size={17} color="#1F2937" />
             </Pressable>
           </View>
 
@@ -133,7 +132,7 @@ export function DashboardHomeScreen({
                 <View key={trip.id} style={[localStyles.row, idx === recentTrips.length - 1 && localStyles.rowLast]}>
                   <View style={localStyles.rowLeft}>
                     <View style={localStyles.rowIcon}>
-                      <Feather name="navigation" size={13} color="#159A63" />
+                      <AppIcon name="navigation" size={13} color="#159A63" />
                     </View>
                     <View>
                       <Text style={localStyles.rowTitle}>Trip #{trip.id.replace(/^TRIP-/, '')}</Text>
@@ -165,7 +164,7 @@ export function DashboardHomeScreen({
                       item.status !== 'RESOLVED' && localStyles.rowIconWarning,
                     ]}
                   >
-                    <Feather
+                    <AppIcon
                       name={item.status === 'RESOLVED' ? 'check-circle' : 'alert-triangle'}
                       size={13}
                       color={item.status === 'RESOLVED' ? '#15803D' : '#B45309'}

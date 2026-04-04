@@ -1,9 +1,8 @@
 import { useState } from 'react';
 import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
-import { Feather } from '@expo/vector-icons';
 import { BottomTab, HomeNavigationCard } from '../components/navigation/HomeNavigationCard';
 import { OutsideGeofenceModal } from '../components/modals';
-import { Avatar } from '../components/ui';
+import { AppIcon, Avatar } from '../components/ui';
 
 type HomeScreenProps = {
   onLogout?: () => void;
@@ -105,7 +104,7 @@ export function HomeScreen({
           <View style={localStyles.previewBadge}>
             <Text style={localStyles.previewBadgeText}>Web Preview</Text>
           </View>
-          <Feather name="map" size={34} color="#57c7a8" />
+          <AppIcon name="map" size={34} color="#57c7a8" />
           <Text style={localStyles.mapFallbackTitle}>Native map is available on mobile</Text>
           <Text style={localStyles.mapFallbackSub}>
             This web fallback keeps the app runnable without `react-native-maps`.
@@ -113,7 +112,7 @@ export function HomeScreen({
         </View>
 
         <Pressable style={localStyles.mapTypeToggle} onPress={() => onChangeMapTypeOption(nextMapTypeOption(mapTypeOption))}>
-          <Feather
+          <AppIcon
             name={mapTypeOption === 'dark' ? 'moon' : mapTypeOption === 'satellite' ? 'globe' : 'map'}
             size={16}
             color="#0F172A"
@@ -130,7 +129,7 @@ export function HomeScreen({
                   style={localStyles.statusIconButton}
                   onPress={() => Alert.alert('Notifications', 'No notifications yet.')}
                 >
-                  <Feather name="bell" size={16} color="#0F172A" />
+                  <AppIcon name="bell" size={16} color="#0F172A" />
                 </Pressable>
                 <Pressable
                   style={[
@@ -157,7 +156,7 @@ export function HomeScreen({
 
             {!isDriverOnline ? (
               <View style={localStyles.offlineBanner}>
-                <Feather name="cloud-off" size={14} color="#FFFFFF" />
+                <AppIcon name="cloud-off" size={14} color="#FFFFFF" />
                 <Text style={localStyles.offlineBannerText}>You are offline. Go online to start trips.</Text>
               </View>
             ) : null}
@@ -197,7 +196,7 @@ export function HomeScreen({
         ) : (
           <>
             <Pressable style={localStyles.routeBackButton} onPress={onBackToHome}>
-              <Feather name="chevron-left" size={20} color="#030318" />
+              <AppIcon name="chevron-left" size={20} color="#030318" />
             </Pressable>
 
             <View style={localStyles.tripPanel}>

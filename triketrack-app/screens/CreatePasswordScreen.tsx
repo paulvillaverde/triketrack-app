@@ -1,7 +1,6 @@
 import { useState } from 'react';
 import { Alert, Pressable, Text, View } from 'react-native';
-import { Feather } from '@expo/vector-icons';
-import { AnimatedButton, InputField } from '../components/ui';
+import { AnimatedButton, AppIcon, InputField } from '../components/ui';
 
 type CreatePasswordScreenProps = {
   onBackToLogin: () => void;
@@ -44,7 +43,7 @@ export function CreatePasswordScreen({
   return (
     <View style={styles.loginFormContainer}>
       <InputField
-        icon={<Feather name="credit-card" size={16} color="#111827" />}
+        icon={<AppIcon name="credit-card" size={16} color="#111827" />}
         placeholder="Driver Code"
         value={driverCode}
         onChangeText={setDriverCode}
@@ -53,27 +52,27 @@ export function CreatePasswordScreen({
         styles={styles}
       />
       <InputField
-        icon={<Feather name="lock" size={16} color="#111827" />}
+        icon={<AppIcon name="lock" size={16} color="#111827" />}
         placeholder="Create password"
         secureTextEntry={passwordHidden}
         value={password}
         onChangeText={setPassword}
         trailingIcon={
           <Pressable onPress={() => setPasswordHidden((prev) => !prev)}>
-            <Feather name={passwordHidden ? 'eye-off' : 'eye'} size={16} color="#111827" />
+            <AppIcon name={passwordHidden ? 'eye-off' : 'eye'} size={16} color="#111827" />
           </Pressable>
         }
         styles={styles}
       />
       <InputField
-        icon={<Feather name="lock" size={16} color="#111827" />}
+        icon={<AppIcon name="lock" size={16} color="#111827" />}
         placeholder="Confirm password"
         secureTextEntry={confirmPasswordHidden}
         value={confirmPassword}
         onChangeText={setConfirmPassword}
         trailingIcon={
           <Pressable onPress={() => setConfirmPasswordHidden((prev) => !prev)}>
-            <Feather name={confirmPasswordHidden ? 'eye-off' : 'eye'} size={16} color="#111827" />
+            <AppIcon name={confirmPasswordHidden ? 'eye-off' : 'eye'} size={16} color="#111827" />
           </Pressable>
         }
         styles={styles}

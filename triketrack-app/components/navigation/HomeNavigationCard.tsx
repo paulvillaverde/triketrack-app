@@ -1,8 +1,8 @@
 import { Platform, Pressable, Text, View } from 'react-native';
-import { Feather } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Svg, { Path } from 'react-native-svg';
 import { useMemo, useState } from 'react';
+import { AppIcon } from '../ui';
 
 export type BottomTab = 'home' | 'route' | 'trip' | 'violation' | 'profile';
 
@@ -23,6 +23,7 @@ export function HomeNavigationCard({
   const basePaddingBottom = Platform.OS === 'android' ? 10 : 20;
   const [layout, setLayout] = useState<{ width: number; height: number } | null>(null);
   const iconColor = (tab: BottomTab) => (activeTab === tab ? '#57c7a8' : '#9AA0A6');
+  const routeIsActive = activeTab === 'route';
   const textStyle = (tab: BottomTab) =>
     activeTab === tab ? styles.homeBottomTextActive : styles.homeBottomText;
   const slotStyle = showCenterRoute ? styles.homeBottomSlot : styles.homeBottomSlotNoCenter;
@@ -76,7 +77,7 @@ export function HomeNavigationCard({
               activeTab === 'home' && styles.homeBottomActiveLineVisible,
             ]}
           />
-          <Feather name="home" size={18} color={iconColor('home')} />
+          <AppIcon name="home" size={18} color={iconColor('home')} active={activeTab === 'home'} />
           <Text style={textStyle('home')}>Home</Text>
         </Pressable>
       </View>
@@ -88,14 +89,20 @@ export function HomeNavigationCard({
               activeTab === 'trip' && styles.homeBottomActiveLineVisible,
             ]}
           />
-          <Feather name="map" size={18} color={iconColor('trip')} />
+          <AppIcon name="map" size={18} color={iconColor('trip')} active={activeTab === 'trip'} />
           <Text style={textStyle('trip')}>Trip</Text>
         </Pressable>
       </View>
       {showCenterRoute ? (
         <View style={styles.homeBottomCenterSlot}>
-          <Pressable style={styles.homeCenterRouteButton} onPress={() => onNavigate?.('route')}>
-            <Feather name="navigation" size={22} color="#FFFFFF" />
+          <Pressable
+            style={[
+              styles.homeCenterRouteButton,
+              routeIsActive && styles.homeCenterRouteButtonActive,
+            ]}
+            onPress={() => onNavigate?.('route')}
+          >
+            <AppIcon name="navigation" size={22} color="#FFFFFF" active={routeIsActive} />
           </Pressable>
         </View>
       ) : null}
@@ -107,7 +114,7 @@ export function HomeNavigationCard({
               activeTab === 'violation' && styles.homeBottomActiveLineVisible,
             ]}
           />
-          <Feather name="alert-octagon" size={18} color={iconColor('violation')} />
+          <AppIcon name="alert-octagon" size={18} color={iconColor('violation')} active={activeTab === 'violation'} />
           <Text style={textStyle('violation')}>Violation</Text>
         </Pressable>
       </View>
@@ -119,7 +126,7 @@ export function HomeNavigationCard({
               activeTab === 'profile' && styles.homeBottomActiveLineVisible,
             ]}
           />
-          <Feather name="user" size={18} color={iconColor('profile')} />
+          <AppIcon name="user" size={18} color={iconColor('profile')} active={activeTab === 'profile'} />
           <Text style={textStyle('profile')}>Profile</Text>
         </Pressable>
       </View>
