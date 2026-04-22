@@ -38,6 +38,7 @@ const ICON_MAP = {
   'refresh-cw': { outline: 'refresh-outline', filled: 'refresh' },
   search: { outline: 'search-outline', filled: 'search' },
   tag: { outline: 'pricetag-outline', filled: 'pricetag' },
+  trash: { outline: 'trash-outline', filled: 'trash' },
   user: { outline: 'person-outline', filled: 'person' },
   x: { outline: 'close-outline', filled: 'close' },
 } as const;

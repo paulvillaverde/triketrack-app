@@ -1,12 +1,14 @@
 import { useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { AnimatedButton, AppIcon, InputField } from '../components/ui';
+import { MAXIM_UI_SUBTLE_DARK, MAXIM_UI_TEXT_DARK } from './homeScreenShared';
 
 type LoginScreenProps = {
   onCreatePassword: () => void;
   onLogin: (driverCode: string, password: string) => void;
   isAuthenticating?: boolean;
   styles: Record<string, any>;
+  isDarkMode?: boolean;
 };
 
 export function LoginScreen({
@@ -14,6 +16,7 @@ export function LoginScreen({
   onLogin,
   isAuthenticating = false,
   styles,
+  isDarkMode = false,
 }: LoginScreenProps) {
   const [driverCode, setDriverCode] = useState('');
   const [password, setPassword] = useState('');
@@ -22,8 +25,9 @@ export function LoginScreen({
   return (
     <View style={styles.loginFormContainer}>
       <InputField
-        icon={<AppIcon name="credit-card" size={16} color="#111827" />}
+        icon={<AppIcon name="credit-card" size={16} color={isDarkMode ? MAXIM_UI_TEXT_DARK : '#111827'} />}
         placeholder="Driver Code"
+        placeholderTextColor={isDarkMode ? MAXIM_UI_SUBTLE_DARK : undefined}
         value={driverCode}
         onChangeText={setDriverCode}
         autoCapitalize="characters"
@@ -31,14 +35,19 @@ export function LoginScreen({
         styles={styles}
       />
       <InputField
-        icon={<AppIcon name="lock" size={16} color="#111827" />}
+        icon={<AppIcon name="lock" size={16} color={isDarkMode ? MAXIM_UI_TEXT_DARK : '#111827'} />}
         placeholder="Password"
+        placeholderTextColor={isDarkMode ? MAXIM_UI_SUBTLE_DARK : undefined}
         secureTextEntry={passwordHidden}
         value={password}
         onChangeText={setPassword}
         trailingIcon={
           <Pressable onPress={() => setPasswordHidden((prev) => !prev)}>
-            <AppIcon name={passwordHidden ? 'eye-off' : 'eye'} size={16} color="#111827" />
+            <AppIcon
+              name={passwordHidden ? 'eye-off' : 'eye'}
+              size={16}
+              color={isDarkMode ? MAXIM_UI_TEXT_DARK : '#111827'}
+            />
           </Pressable>
         }
         styles={styles}

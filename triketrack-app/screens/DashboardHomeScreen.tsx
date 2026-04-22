@@ -1,4 +1,5 @@
 import { Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BottomTab, HomeNavigationCard } from '../components/navigation/HomeNavigationCard';
 import { VIOLATION_ITEMS } from './ViolationScreen';
 import { MetricTile } from '../components/tiles/MetricTile';
@@ -60,6 +61,7 @@ export function DashboardHomeScreen({
   profileImageUri,
   styles,
 }: DashboardHomeScreenProps) {
+  const insets = useSafeAreaInsets();
   const hoursOnline = (totalMinutes / 60).toFixed(1);
   const recentTrips = tripHistory.slice(0, 3);
   const recentViolations = VIOLATION_ITEMS.slice(0, 3);
@@ -67,7 +69,16 @@ export function DashboardHomeScreen({
   return (
     <View style={styles.homeScreen}>
       <View style={styles.homeContentArea}>
-        <ScrollView contentContainerStyle={localStyles.scrollContent} showsVerticalScrollIndicator={false}>
+        <ScrollView
+          contentContainerStyle={[
+            localStyles.scrollContent,
+            {
+              paddingTop: 10 + (insets.top || 0),
+              paddingBottom: 150 + (insets.bottom || 0),
+            },
+          ]}
+          showsVerticalScrollIndicator={false}
+        >
           <View style={localStyles.headerCard}>
             <View style={localStyles.headerLeft}>
               <Avatar name={profileName} imageUri={profileImageUri} style={localStyles.headerAvatar} />

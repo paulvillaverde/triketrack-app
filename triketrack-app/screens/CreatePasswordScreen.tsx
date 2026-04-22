@@ -1,12 +1,14 @@
 import { useState } from 'react';
 import { Alert, Pressable, Text, View } from 'react-native';
 import { AnimatedButton, AppIcon, InputField } from '../components/ui';
+import { MAXIM_UI_SUBTLE_DARK, MAXIM_UI_TEXT_DARK } from './homeScreenShared';
 
 type CreatePasswordScreenProps = {
   onBackToLogin: () => void;
   onSubmit: (driverCode: string, password: string) => Promise<void> | void;
   isSubmitting?: boolean;
   styles: Record<string, any>;
+  isDarkMode?: boolean;
 };
 
 export function CreatePasswordScreen({
@@ -14,6 +16,7 @@ export function CreatePasswordScreen({
   onSubmit,
   isSubmitting = false,
   styles,
+  isDarkMode = false,
 }: CreatePasswordScreenProps) {
   const [driverCode, setDriverCode] = useState('');
   const [password, setPassword] = useState('');
@@ -43,8 +46,9 @@ export function CreatePasswordScreen({
   return (
     <View style={styles.loginFormContainer}>
       <InputField
-        icon={<AppIcon name="credit-card" size={16} color="#111827" />}
+        icon={<AppIcon name="credit-card" size={16} color={isDarkMode ? MAXIM_UI_TEXT_DARK : '#111827'} />}
         placeholder="Driver Code"
+        placeholderTextColor={isDarkMode ? MAXIM_UI_SUBTLE_DARK : undefined}
         value={driverCode}
         onChangeText={setDriverCode}
         autoCapitalize="characters"
@@ -52,27 +56,37 @@ export function CreatePasswordScreen({
         styles={styles}
       />
       <InputField
-        icon={<AppIcon name="lock" size={16} color="#111827" />}
+        icon={<AppIcon name="lock" size={16} color={isDarkMode ? MAXIM_UI_TEXT_DARK : '#111827'} />}
         placeholder="Create password"
+        placeholderTextColor={isDarkMode ? MAXIM_UI_SUBTLE_DARK : undefined}
         secureTextEntry={passwordHidden}
         value={password}
         onChangeText={setPassword}
         trailingIcon={
           <Pressable onPress={() => setPasswordHidden((prev) => !prev)}>
-            <AppIcon name={passwordHidden ? 'eye-off' : 'eye'} size={16} color="#111827" />
+            <AppIcon
+              name={passwordHidden ? 'eye-off' : 'eye'}
+              size={16}
+              color={isDarkMode ? MAXIM_UI_TEXT_DARK : '#111827'}
+            />
           </Pressable>
         }
         styles={styles}
       />
       <InputField
-        icon={<AppIcon name="lock" size={16} color="#111827" />}
+        icon={<AppIcon name="lock" size={16} color={isDarkMode ? MAXIM_UI_TEXT_DARK : '#111827'} />}
         placeholder="Confirm password"
+        placeholderTextColor={isDarkMode ? MAXIM_UI_SUBTLE_DARK : undefined}
         secureTextEntry={confirmPasswordHidden}
         value={confirmPassword}
         onChangeText={setConfirmPassword}
         trailingIcon={
           <Pressable onPress={() => setConfirmPasswordHidden((prev) => !prev)}>
-            <AppIcon name={confirmPasswordHidden ? 'eye-off' : 'eye'} size={16} color="#111827" />
+            <AppIcon
+              name={confirmPasswordHidden ? 'eye-off' : 'eye'}
+              size={16}
+              color={isDarkMode ? MAXIM_UI_TEXT_DARK : '#111827'}
+            />
           </Pressable>
         }
         styles={styles}

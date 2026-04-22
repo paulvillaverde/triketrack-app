@@ -3,6 +3,12 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Svg, { Path } from 'react-native-svg';
 import { useMemo, useState } from 'react';
 import { AppIcon } from '../ui';
+import {
+  MAXIM_UI_BORDER_SOFT_DARK,
+  MAXIM_UI_MUTED_DARK,
+  MAXIM_UI_SURFACE_DARK,
+  MAXIM_UI_TEXT_DARK,
+} from '../../screens/homeScreenShared';
 
 export type BottomTab = 'home' | 'route' | 'trip' | 'violation' | 'profile';
 
@@ -10,6 +16,7 @@ type HomeNavigationCardProps = {
   activeTab?: BottomTab;
   onNavigate?: (tab: BottomTab) => void;
   showCenterRoute?: boolean;
+  isLowBatteryMapMode?: boolean;
   styles: Record<string, any>;
 };
 
@@ -17,15 +24,19 @@ export function HomeNavigationCard({
   activeTab = 'home',
   onNavigate,
   showCenterRoute = true,
+  isLowBatteryMapMode = false,
   styles,
 }: HomeNavigationCardProps) {
   const insets = useSafeAreaInsets();
   const basePaddingBottom = Platform.OS === 'android' ? 10 : 20;
   const [layout, setLayout] = useState<{ width: number; height: number } | null>(null);
-  const iconColor = (tab: BottomTab) => (activeTab === tab ? '#57c7a8' : '#9AA0A6');
+  const iconColor = (tab: BottomTab) =>
+    activeTab === tab ? '#57c7a8' : isLowBatteryMapMode ? MAXIM_UI_MUTED_DARK : '#9AA0A6';
   const routeIsActive = activeTab === 'route';
   const textStyle = (tab: BottomTab) =>
-    activeTab === tab ? styles.homeBottomTextActive : styles.homeBottomText;
+    activeTab === tab
+      ? styles.homeBottomTextActive
+      : [styles.homeBottomText, isLowBatteryMapMode ? { color: MAXIM_UI_MUTED_DARK } : null];
   const slotStyle = showCenterRoute ? styles.homeBottomSlot : styles.homeBottomSlotNoCenter;
 
   const backgroundPath = useMemo(() => {
@@ -56,7 +67,17 @@ export function HomeNavigationCard({
 
   return (
     <View
-      style={[styles.homeBottomNav, { paddingBottom: basePaddingBottom + (insets.bottom || 0) }]}
+      style={[
+        styles.homeBottomNav,
+        isLowBatteryMapMode
+          ? {
+              backgroundColor: MAXIM_UI_SURFACE_DARK,
+              borderTopWidth: 1,
+              borderTopColor: MAXIM_UI_BORDER_SOFT_DARK,
+            }
+          : null,
+        { paddingBottom: basePaddingBottom + (insets.bottom || 0) },
+      ]}
       onLayout={(e) => setLayout({ width: e.nativeEvent.layout.width, height: e.nativeEvent.layout.height })}
     >
       {layout && backgroundPath ? (
@@ -66,7 +87,11 @@ export function HomeNavigationCard({
           height={layout.height}
           style={{ position: 'absolute', left: 0, right: 0, bottom: 0, top: 0 }}
         >
-          <Path d={backgroundPath.d} fill="#FFFFFF" fillRule={backgroundPath.fillRule} />
+          <Path
+            d={backgroundPath.d}
+            fill={isLowBatteryMapMode ? MAXIM_UI_SURFACE_DARK : '#FFFFFF'}
+            fillRule={backgroundPath.fillRule}
+          />
         </Svg>
       ) : null}
       <View style={slotStyle}>
@@ -99,10 +124,16 @@ export function HomeNavigationCard({
             style={[
               styles.homeCenterRouteButton,
               routeIsActive && styles.homeCenterRouteButtonActive,
+              isLowBatteryMapMode ? { shadowColor: '#57c7a8' } : null,
             ]}
             onPress={() => onNavigate?.('route')}
           >
-            <AppIcon name="navigation" size={22} color="#FFFFFF" active={routeIsActive} />
+            <AppIcon
+              name="navigation"
+              size={22}
+              color={isLowBatteryMapMode ? MAXIM_UI_TEXT_DARK : '#FFFFFF'}
+              active={routeIsActive}
+            />
           </Pressable>
         </View>
       ) : null}

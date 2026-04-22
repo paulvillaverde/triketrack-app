@@ -6,28 +6,54 @@
     "orientation": "portrait",
     "icon": "./assets/adaptive-icon.png",
     "userInterfaceStyle": "light",
-    "newArchEnabled": true,
+    "newArchEnabled": false,
     "splash": {
       "image": "./assets/adaptive-icon.png",
       "resizeMode": "contain",
-      "backgroundColor": "#ffffff"
+      "backgroundColor": "#57C7A8"
     },
     "ios": {
       "supportsTablet": true
     },
     "android": {
       "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#ffffff"
+        "foregroundImage": "./assets/logo.png",
+        "backgroundColor": "#FFFFFF"
       },
-      "edgeToEdgeEnabled": true,
+      "edgeToEdgeEnabled": false,
       "predictiveBackGestureEnabled": false,
-      "package": "com.anonymous.triketrackapp"
+      "package": "com.anonymous.triketrackapp",
+      "permissions": [
+        "android.permission.READ_CONTACTS",
+        "android.permission.WRITE_CONTACTS",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.READ_CONTACTS",
+        "android.permission.WRITE_CONTACTS",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION"
+      ]
     },
     "web": {
-      "favicon": "./assets/adaptive-icon.png"
+      "favicon": "./assets/adaptive-icon.png",
+      "shortName": "TrikeTrack",
+      "display": "standalone",
+      "themeColor": "#57C7A8",
+      "backgroundColor": "#F5F6F8",
+      "scope": "./",
+      "startUrl": "./"
     },
     "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "compileSdkVersion": 35,
+            "targetSdkVersion": 35,
+            "buildToolsVersion": "35.0.0"
+          }
+        }
+      ],
       "expo-sqlite",
       [
         "expo-contacts",
@@ -40,7 +66,19 @@
         {
           "locationWhenInUsePermission": "Allow TrikeTrack to access your location so trip tracking stays accurate and follows the real road."
         }
-      ]
-    ]
+      ],
+      "@maplibre/maplibre-react-native"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "f68b2845-3772-4020-b6d5-a8adfabf761c"
+      }
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/f68b2845-3772-4020-b6d5-a8adfabf761c"
+    }
   }
 }

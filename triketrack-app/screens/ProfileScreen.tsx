@@ -1,10 +1,26 @@
-import { useEffect, useState } from 'react';
-import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useEffect, useMemo, useState } from 'react';
+import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
+import QRCode from 'qrcode';
+import { SvgXml } from 'react-native-svg';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BottomTab, HomeNavigationCard } from '../components/navigation/HomeNavigationCard';
 import { EditProfileModal, SupportModal, TermsOfUseModal } from '../components/modals';
 import { InfoRow } from '../components/rows/InfoRow';
 import { AppIcon, Avatar } from '../components/ui';
+import { buildPassengerReportUrl, type DriverQrStatus } from '../supabase';
+import {
+  MAXIM_UI_BG_DARK,
+  MAXIM_UI_BORDER_DARK,
+  MAXIM_UI_BORDER_SOFT_DARK,
+  MAXIM_UI_GREEN_SOFT_DARK,
+  MAXIM_UI_MUTED_DARK,
+  MAXIM_UI_SUBTLE_DARK,
+  MAXIM_UI_SURFACE_ALT_DARK,
+  MAXIM_UI_SURFACE_DARK,
+  MAXIM_UI_SURFACE_ELEVATED_DARK,
+  MAXIM_UI_TEXT_DARK,
+} from './homeScreenShared';
 
 type ProfileScreenProps = {
   onLogout?: () => void;
@@ -14,11 +30,19 @@ type ProfileScreenProps = {
   profileContact: string;
   profilePlateNumber: string;
   profileImageUri: string | null;
+  profileQrId?: number | null;
+  profileQrIssuedAt?: string | null;
+  profileQrReportPath?: string | null;
+  profileQrStatus?: DriverQrStatus | null;
+  profileQrError?: string | null;
+  isProfileQrLoading?: boolean;
+  totalViolationCount?: number;
   onUpdateProfile: (payload: {
     name: string;
     contact: string;
     imageUri: string | null;
   }) => void | Promise<void>;
+  isLowBatteryMapMode?: boolean;
   styles: Record<string, any>;
 };
 
@@ -30,9 +54,18 @@ export function ProfileScreen({
   profileContact,
   profilePlateNumber,
   profileImageUri,
+  profileQrId = null,
+  profileQrIssuedAt = null,
+  profileQrReportPath = null,
+  profileQrStatus = null,
+  profileQrError = null,
+  isProfileQrLoading = false,
+  totalViolationCount = 0,
   onUpdateProfile,
+  isLowBatteryMapMode = false,
   styles,
 }: ProfileScreenProps) {
+  const insets = useSafeAreaInsets();
   const [draftName, setDraftName] = useState(profileName);
   const [draftContact, setDraftContact] = useState(profileContact);
   const [draftImageUri, setDraftImageUri] = useState<string | null>(profileImageUri);
@@ -42,12 +75,77 @@ export function ProfileScreen({
   const [termsModalVisible, setTermsModalVisible] = useState(false);
   const [supportModalVisible, setSupportModalVisible] = useState(false);
   const [isSavingProfile, setIsSavingProfile] = useState(false);
+  const [qrSvgXml, setQrSvgXml] = useState<string | null>(null);
+  const [qrRenderError, setQrRenderError] = useState<string | null>(null);
+  const passengerReportQrUrl = useMemo(
+    () => buildPassengerReportUrl(profileQrReportPath),
+    [profileQrReportPath],
+  );
+  const qrIssuedLabel = useMemo(() => {
+    if (!profileQrIssuedAt) {
+      return null;
+    }
+
+    const parsed = new Date(profileQrIssuedAt);
+    if (Number.isNaN(parsed.getTime())) {
+      return null;
+    }
+
+    return parsed.toLocaleDateString('en-PH', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    });
+  }, [profileQrIssuedAt]);
 
   useEffect(() => {
     setDraftName(profileName);
     setDraftContact(profileContact);
     setDraftImageUri(profileImageUri);
   }, [profileName, profileContact, profileImageUri]);
+  const isDarkMode = isLowBatteryMapMode;
+
+  useEffect(() => {
+    let active = true;
+
+    if (!passengerReportQrUrl) {
+      setQrSvgXml(null);
+      setQrRenderError(null);
+      return () => {
+        active = false;
+      };
+    }
+
+    QRCode.toString(passengerReportQrUrl, {
+      type: 'svg',
+      width: 280,
+      margin: 1,
+      color: {
+        dark: '#0F172A',
+        light: '#FFFFFF',
+      },
+    })
+      .then((svgMarkup: string) => {
+        if (!active) {
+          return;
+        }
+
+        setQrSvgXml(svgMarkup);
+        setQrRenderError(null);
+      })
+      .catch(() => {
+        if (!active) {
+          return;
+        }
+
+        setQrSvgXml(null);
+        setQrRenderError('Unable to render the assigned QR code right now.');
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [passengerReportQrUrl]);
 
   const openEditModal = () => {
     setDraftName(profileName);
@@ -117,24 +215,80 @@ export function ProfileScreen({
   };
 
   return (
-    <View style={styles.homeScreen}>
+    <View style={[styles.homeScreen, isDarkMode ? { backgroundColor: MAXIM_UI_BG_DARK } : null]}>
       <View style={styles.homeContentArea}>
-        <ScrollView contentContainerStyle={localStyles.scrollContent} showsVerticalScrollIndicator={false}>
-          <Text style={localStyles.pageTitle}>Profile</Text>
+        <ScrollView
+          contentContainerStyle={[
+            localStyles.scrollContent,
+            {
+              paddingTop: 10 + (insets.top || 0),
+              paddingBottom: 140 + (insets.bottom || 0),
+            },
+            isDarkMode ? { backgroundColor: MAXIM_UI_BG_DARK } : null,
+          ]}
+          showsVerticalScrollIndicator={false}
+        >
+          <Text
+            style={[
+              localStyles.pageTitle,
+              isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+            ]}
+          >
+            Profile
+          </Text>
 
           <View style={localStyles.avatarWrap}>
             <View style={localStyles.avatarContainer}>
               <Avatar name={profileName} imageUri={profileImageUri} style={localStyles.avatar} />
-              <Pressable style={localStyles.avatarEditBadge} onPress={changeAvatar}>
-                <AppIcon name="edit-2" size={16} color="#111827" />
+              <Pressable
+                style={[
+                  localStyles.avatarEditBadge,
+                  isDarkMode
+                    ? {
+                        backgroundColor: MAXIM_UI_SURFACE_ELEVATED_DARK,
+                        borderColor: MAXIM_UI_BORDER_DARK,
+                        shadowOpacity: 0,
+                        elevation: 0,
+                      }
+                    : null,
+                ]}
+                onPress={changeAvatar}
+              >
+                <AppIcon name="edit-2" size={16} color={isDarkMode ? MAXIM_UI_TEXT_DARK : '#111827'} />
               </Pressable>
             </View>
           </View>
-          {isSavingProfile ? <Text style={localStyles.savingText}>Updating profile photo...</Text> : null}
+          {isSavingProfile ? (
+            <Text
+              style={[
+                localStyles.savingText,
+                isDarkMode ? { color: MAXIM_UI_MUTED_DARK } : null,
+              ]}
+            >
+              Updating profile photo...
+            </Text>
+          ) : null}
 
-          <View style={localStyles.card}>
+          <View
+            style={[
+              localStyles.card,
+              isDarkMode
+                ? {
+                    backgroundColor: MAXIM_UI_SURFACE_DARK,
+                    borderColor: MAXIM_UI_BORDER_DARK,
+                  }
+                : null,
+            ]}
+          >
             <View style={localStyles.cardHeader}>
-              <Text style={localStyles.cardTitle}>Personal info</Text>
+              <Text
+                style={[
+                  localStyles.cardTitle,
+                  isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                ]}
+              >
+                Personal info
+              </Text>
             </View>
 
             <InfoRow
@@ -144,8 +298,15 @@ export function ProfileScreen({
               onPress={openEditModal}
               showChevron
               styles={localStyles}
+              isLowBatteryMapMode={isDarkMode}
             />
-            <InfoRow icon="credit-card" label="Driver code" value={profileDriverCode} styles={localStyles} />
+            <InfoRow
+              icon="credit-card"
+              label="Driver code"
+              value={profileDriverCode}
+              styles={localStyles}
+              isLowBatteryMapMode={isDarkMode}
+            />
             <InfoRow
               icon="phone"
               label="Phone number"
@@ -153,34 +314,386 @@ export function ProfileScreen({
               onPress={openEditModal}
               showChevron
               styles={localStyles}
+              isLowBatteryMapMode={isDarkMode}
             />
-            <InfoRow icon="tag" label="Plate number" value={profilePlateNumber} styles={localStyles} />
+            <InfoRow
+              icon="tag"
+              label="Plate number"
+              value={profilePlateNumber}
+              styles={localStyles}
+              isLowBatteryMapMode={isDarkMode}
+            />
             <InfoRow
               icon="map-pin"
               label="Assigned route"
               value="Route 18-B"
               isLast
               styles={localStyles}
+              isLowBatteryMapMode={isDarkMode}
             />
           </View>
 
-          <View style={localStyles.card}>
+          <View
+            style={[
+              localStyles.card,
+              isDarkMode
+                ? {
+                    backgroundColor: MAXIM_UI_SURFACE_DARK,
+                    borderColor: MAXIM_UI_BORDER_DARK,
+                  }
+                : null,
+            ]}
+          >
             <View style={localStyles.cardHeader}>
-              <Text style={localStyles.cardTitle}>Account info</Text>
+              <Text
+                style={[
+                  localStyles.cardTitle,
+                  isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                ]}
+              >
+                Account info
+              </Text>
             </View>
 
-            <InfoRow icon="alert-triangle" label="Total violations" value="10" styles={localStyles} />
-            <InfoRow icon="calendar" label="TODA membership" value="April 2011" styles={localStyles} />
+            <InfoRow
+              icon="alert-triangle"
+              label="Total violations"
+              value={String(totalViolationCount)}
+              styles={localStyles}
+              isLowBatteryMapMode={isDarkMode}
+            />
+            <InfoRow
+              icon="calendar"
+              label="TODA membership"
+              value="April 2011"
+              styles={localStyles}
+              isLowBatteryMapMode={isDarkMode}
+            />
 
-            <Pressable style={localStyles.linkRow} onPress={() => setTermsModalVisible(true)}>
-              <Text style={localStyles.linkText}>Terms of use</Text>
-              <AppIcon name="chevron-right" size={16} color="#94A3B8" />
+            <Pressable
+              style={[
+                localStyles.linkRow,
+                isDarkMode
+                  ? {
+                      backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
+                      borderColor: MAXIM_UI_BORDER_SOFT_DARK,
+                    }
+                  : null,
+              ]}
+              onPress={() => setTermsModalVisible(true)}
+            >
+              <Text
+                style={[
+                  localStyles.linkText,
+                  isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                ]}
+              >
+                Terms of use
+              </Text>
+              <AppIcon
+                name="chevron-right"
+                size={16}
+                color={isDarkMode ? MAXIM_UI_MUTED_DARK : '#94A3B8'}
+              />
             </Pressable>
 
-            <Pressable style={localStyles.linkRow} onPress={() => setSupportModalVisible(true)}>
-              <Text style={localStyles.linkText}>Support</Text>
-              <AppIcon name="chevron-right" size={16} color="#94A3B8" />
+            <Pressable
+              style={[
+                localStyles.linkRow,
+                isDarkMode
+                  ? {
+                      backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
+                      borderColor: MAXIM_UI_BORDER_SOFT_DARK,
+                    }
+                  : null,
+              ]}
+              onPress={() => setSupportModalVisible(true)}
+            >
+              <Text
+                style={[
+                  localStyles.linkText,
+                  isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                ]}
+              >
+                Support
+              </Text>
+              <AppIcon
+                name="chevron-right"
+                size={16}
+                color={isDarkMode ? MAXIM_UI_MUTED_DARK : '#94A3B8'}
+              />
             </Pressable>
+          </View>
+
+          <View
+            style={[
+              localStyles.card,
+              isDarkMode
+                ? {
+                    backgroundColor: MAXIM_UI_SURFACE_DARK,
+                    borderColor: MAXIM_UI_BORDER_DARK,
+                  }
+                : null,
+            ]}
+          >
+            <View style={localStyles.qrHeader}>
+              <View style={localStyles.qrHeaderCopy}>
+                <Text style={[localStyles.qrEyebrow, isDarkMode ? { color: MAXIM_UI_MUTED_DARK } : null]}>
+                  Driver QR Code
+                </Text>
+                <Text
+                  style={[
+                    localStyles.qrTitle,
+                    isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                  ]}
+                >
+                  Passenger Report QR
+                </Text>
+              </View>
+              {profileQrId ? (
+                <View
+                  style={[
+                    localStyles.qrBadge,
+                    isDarkMode ? { backgroundColor: MAXIM_UI_GREEN_SOFT_DARK } : null,
+                  ]}
+                >
+                  <Text style={[localStyles.qrBadgeText, isDarkMode ? { color: '#7CE6C8' } : null]}>
+                    QR #{profileQrId}
+                  </Text>
+                </View>
+              ) : null}
+            </View>
+
+            <Text
+              style={[
+                localStyles.qrDescription,
+                isDarkMode ? { color: MAXIM_UI_MUTED_DARK } : null,
+              ]}
+            >
+              Passengers can scan this code to open the web reporting form linked to your driver
+              account.
+            </Text>
+
+            {isProfileQrLoading && !qrSvgXml && !profileQrError ? (
+              <View
+                style={[
+                  localStyles.qrStateCard,
+                  isDarkMode
+                    ? {
+                        backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
+                        borderColor: MAXIM_UI_BORDER_DARK,
+                      }
+                    : null,
+                ]}
+              >
+                <ActivityIndicator size="small" color="#147D64" />
+                <Text
+                  style={[
+                    localStyles.qrStateTitle,
+                    isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                  ]}
+                >
+                  Loading your assigned QR code...
+                </Text>
+              </View>
+            ) : profileQrError ? (
+              <View
+                style={[
+                  localStyles.qrStateCard,
+                  isDarkMode
+                    ? {
+                        backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
+                        borderColor: MAXIM_UI_BORDER_DARK,
+                      }
+                    : null,
+                ]}
+              >
+                <View style={localStyles.qrStateIconWrapError}>
+                  <AppIcon name="alert-triangle" size={18} color="#B91C1C" active />
+                </View>
+                <Text
+                  style={[
+                    localStyles.qrStateTitle,
+                    isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                  ]}
+                >
+                  Unable to load your QR code
+                </Text>
+                <Text
+                  style={[
+                    localStyles.qrStateBody,
+                    isDarkMode ? { color: MAXIM_UI_MUTED_DARK } : null,
+                  ]}
+                >
+                  {profileQrError}
+                </Text>
+              </View>
+            ) : qrRenderError ? (
+              <View
+                style={[
+                  localStyles.qrStateCard,
+                  isDarkMode
+                    ? {
+                        backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
+                        borderColor: MAXIM_UI_BORDER_DARK,
+                      }
+                    : null,
+                ]}
+              >
+                <View style={localStyles.qrStateIconWrapError}>
+                  <AppIcon name="alert-circle" size={18} color="#B91C1C" active />
+                </View>
+                <Text
+                  style={[
+                    localStyles.qrStateTitle,
+                    isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                  ]}
+                >
+                  QR rendering unavailable
+                </Text>
+                <Text
+                  style={[
+                    localStyles.qrStateBody,
+                    isDarkMode ? { color: MAXIM_UI_MUTED_DARK } : null,
+                  ]}
+                >
+                  {qrRenderError}
+                </Text>
+              </View>
+            ) : !passengerReportQrUrl ? (
+              <View
+                style={[
+                  localStyles.qrStateCard,
+                  isDarkMode
+                    ? {
+                        backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
+                        borderColor: MAXIM_UI_BORDER_DARK,
+                      }
+                    : null,
+                ]}
+              >
+                <View
+                  style={[
+                    localStyles.qrStateIconWrap,
+                    isDarkMode ? { backgroundColor: MAXIM_UI_GREEN_SOFT_DARK } : null,
+                  ]}
+                >
+                  <AppIcon name="globe" size={18} color="#147D64" />
+                </View>
+                <Text
+                  style={[
+                    localStyles.qrStateTitle,
+                    isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                  ]}
+                >
+                  No QR assigned yet
+                </Text>
+                <Text
+                  style={[
+                    localStyles.qrStateBody,
+                    isDarkMode ? { color: MAXIM_UI_MUTED_DARK } : null,
+                  ]}
+                >
+                  Your passenger reporting QR has not been assigned in the admin dashboard yet.
+                </Text>
+              </View>
+            ) : qrSvgXml ? (
+              <View style={localStyles.qrPanel}>
+                <View
+                  style={[
+                    localStyles.qrFrame,
+                    isDarkMode
+                      ? {
+                          backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
+                          borderColor: MAXIM_UI_BORDER_DARK,
+                        }
+                      : null,
+                  ]}
+                >
+                  <SvgXml xml={qrSvgXml} width={220} height={220} />
+                </View>
+                <Text
+                  style={[
+                    localStyles.qrHint,
+                    isDarkMode ? { color: MAXIM_UI_MUTED_DARK } : null,
+                  ]}
+                >
+                  Show this screen to passengers for scanning.
+                </Text>
+              </View>
+            ) : (
+              <View
+                style={[
+                  localStyles.qrStateCard,
+                  isDarkMode
+                    ? {
+                        backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
+                        borderColor: MAXIM_UI_BORDER_DARK,
+                      }
+                    : null,
+                ]}
+              >
+                <ActivityIndicator size="small" color="#147D64" />
+                <Text
+                  style={[
+                    localStyles.qrStateTitle,
+                    isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                  ]}
+                >
+                  Preparing your QR code...
+                </Text>
+              </View>
+            )}
+
+            <View
+              style={[
+                localStyles.qrMetaRow,
+                isDarkMode ? { borderTopColor: MAXIM_UI_BORDER_SOFT_DARK } : null,
+              ]}
+            >
+              <Text
+                style={[
+                  localStyles.qrMetaLabel,
+                  isDarkMode ? { color: MAXIM_UI_MUTED_DARK } : null,
+                ]}
+              >
+                Status
+              </Text>
+              <Text
+                style={[
+                  localStyles.qrMetaValue,
+                  isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                ]}
+              >
+                {profileQrStatus ? profileQrStatus.replace('_', ' ') : 'Not assigned'}
+              </Text>
+            </View>
+
+            {qrIssuedLabel ? (
+              <View
+                style={[
+                  localStyles.qrMetaRow,
+                  isDarkMode ? { borderTopColor: MAXIM_UI_BORDER_SOFT_DARK } : null,
+                ]}
+              >
+                <Text
+                  style={[
+                    localStyles.qrMetaLabel,
+                    isDarkMode ? { color: MAXIM_UI_MUTED_DARK } : null,
+                  ]}
+                >
+                  Issued
+                </Text>
+                <Text
+                  style={[
+                    localStyles.qrMetaValue,
+                    isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                  ]}
+                >
+                  {qrIssuedLabel}
+                </Text>
+              </View>
+            ) : null}
           </View>
 
           <Pressable style={localStyles.logoutButton} onPress={onLogout}>
@@ -194,6 +707,7 @@ export function ProfileScreen({
         activeTab="profile"
         onNavigate={onNavigate}
         showCenterRoute={false}
+        isLowBatteryMapMode={isDarkMode}
         styles={styles}
       />
 
@@ -210,18 +724,21 @@ export function ProfileScreen({
         setDraftContact={setDraftContact}
         draftImageUri={draftImageUri}
         profileImageUri={profileImageUri}
+        isLowBatteryMapMode={isDarkMode}
       />
 
       <TermsOfUseModal
         visible={termsModalVisible}
         onRequestClose={() => setTermsModalVisible(false)}
         onClose={() => setTermsModalVisible(false)}
+        isLowBatteryMapMode={isDarkMode}
       />
 
       <SupportModal
         visible={supportModalVisible}
         onRequestClose={() => setSupportModalVisible(false)}
         onClose={() => setSupportModalVisible(false)}
+        isLowBatteryMapMode={isDarkMode}
       />
     </View>
   );
@@ -352,6 +869,137 @@ const localStyles = StyleSheet.create({
     lineHeight: 17,
     color: '#111827',
     fontFamily: 'CircularStdMedium500',
+  },
+  qrHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  qrHeaderCopy: {
+    flex: 1,
+  },
+  qrEyebrow: {
+    fontSize: 12,
+    lineHeight: 14,
+    color: '#147D64',
+    fontFamily: 'CircularStdMedium500',
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
+  },
+  qrTitle: {
+    marginTop: 4,
+    fontSize: 22,
+    lineHeight: 26,
+    color: '#111827',
+    fontFamily: 'CircularStdMedium500',
+  },
+  qrBadge: {
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    backgroundColor: '#E8FBF6',
+  },
+  qrBadgeText: {
+    fontSize: 12,
+    lineHeight: 14,
+    color: '#147D64',
+    fontFamily: 'CircularStdMedium500',
+  },
+  qrDescription: {
+    marginTop: 10,
+    fontSize: 14,
+    lineHeight: 21,
+    color: '#475569',
+    fontFamily: 'CircularStdMedium500',
+  },
+  qrPanel: {
+    marginTop: 18,
+    alignItems: 'center',
+  },
+  qrFrame: {
+    width: '100%',
+    borderRadius: 22,
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    paddingVertical: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  qrHint: {
+    marginTop: 12,
+    fontSize: 13,
+    lineHeight: 17,
+    color: '#64748B',
+    fontFamily: 'CircularStdMedium500',
+    textAlign: 'center',
+  },
+  qrStateCard: {
+    marginTop: 18,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    backgroundColor: '#F8FAFC',
+    paddingHorizontal: 16,
+    paddingVertical: 18,
+    alignItems: 'center',
+  },
+  qrStateIconWrap: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#E8FBF6',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 10,
+  },
+  qrStateIconWrapError: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#FEE2E2',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 10,
+  },
+  qrStateTitle: {
+    marginTop: 10,
+    fontSize: 15,
+    lineHeight: 19,
+    color: '#0F172A',
+    fontFamily: 'CircularStdMedium500',
+    textAlign: 'center',
+  },
+  qrStateBody: {
+    marginTop: 6,
+    fontSize: 13,
+    lineHeight: 18,
+    color: '#64748B',
+    fontFamily: 'CircularStdMedium500',
+    textAlign: 'center',
+  },
+  qrMetaRow: {
+    marginTop: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderTopWidth: 1,
+    borderTopColor: '#EEF2F6',
+    paddingTop: 12,
+  },
+  qrMetaLabel: {
+    fontSize: 13,
+    lineHeight: 16,
+    color: '#64748B',
+    fontFamily: 'CircularStdMedium500',
+  },
+  qrMetaValue: {
+    fontSize: 13,
+    lineHeight: 16,
+    color: '#0F172A',
+    fontFamily: 'CircularStdMedium500',
+    textTransform: 'capitalize',
   },
   logoutButton: {
     height: 52,

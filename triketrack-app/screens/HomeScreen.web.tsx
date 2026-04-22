@@ -3,6 +3,7 @@ import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
 import { BottomTab, HomeNavigationCard } from '../components/navigation/HomeNavigationCard';
 import { OutsideGeofenceModal } from '../components/modals';
 import { AppIcon, Avatar } from '../components/ui';
+import type { TripCompletionPayload } from '../lib/tripTransactions';
 
 type HomeScreenProps = {
   onLogout?: () => void;
@@ -13,30 +14,24 @@ type HomeScreenProps = {
   onGoOffline: () => void;
   onBackToHome: () => void;
   locationEnabled: boolean;
-  onTripComplete: (payload: {
-    fare: number;
-    distanceKm: number;
-    durationSeconds: number;
-    routePath: Array<{ latitude: number; longitude: number }>;
-    endLocation: { latitude: number; longitude: number } | null;
-  }) => void;
-  onTripStart?: (payload: { startLocation: { latitude: number; longitude: number } | null }) => void;
+  onTripComplete: (payload: TripCompletionPayload) => void;
+  onTripStart?: (payload: {
+    startLocation: { latitude: number; longitude: number } | null;
+  }) => boolean | Promise<boolean>;
   onGeofenceExit?: (payload: { location: { latitude: number; longitude: number } | null }) => void;
   totalEarnings: number;
   totalTrips: number;
   totalDistanceKm: number;
   totalMinutes: number;
+  homeStatsFilter?: 'TODAY' | 'YESTERDAY' | 'LAST_WEEK' | 'LAST_30_DAYS';
+  onChangeHomeStatsFilter?: (value: 'TODAY' | 'YESTERDAY' | 'LAST_WEEK' | 'LAST_30_DAYS') => void;
   profileName: string;
   profileDriverCode: string;
   profilePlateNumber: string;
   profileImageUri: string | null;
-  mapTypeOption: MapTypeOption;
-  onChangeMapTypeOption: (value: MapTypeOption) => void;
+  isLowBatteryMapMode: boolean;
   styles: Record<string, any>;
 };
-
-export const MAP_TYPE_OPTIONS = ['default', 'satellite', 'dark'] as const;
-export type MapTypeOption = (typeof MAP_TYPE_OPTIONS)[number];
 
 const formatPeso = (amount: number) =>
   `₱${amount.toLocaleString('en-PH', {
@@ -56,34 +51,34 @@ export function HomeScreen({
   totalEarnings,
   totalTrips,
   totalDistanceKm,
+  homeStatsFilter = 'TODAY',
+  onChangeHomeStatsFilter,
   profileName,
   profileDriverCode,
   profilePlateNumber,
   profileImageUri,
-  mapTypeOption,
-  onChangeMapTypeOption,
+  isLowBatteryMapMode,
   styles,
 }: HomeScreenProps) {
+  const filterLabel =
+    homeStatsFilter === 'TODAY'
+      ? 'Today'
+      : homeStatsFilter === 'YESTERDAY'
+        ? 'Yesterday'
+        : homeStatsFilter === 'LAST_WEEK'
+          ? 'Last Week'
+          : 'Last 30 Days';
   const [showOutsideGeofenceModal, setShowOutsideGeofenceModal] = useState(false);
   const [isTripStarted, setIsTripStarted] = useState(false);
   const [selectedFare, setSelectedFare] = useState(10);
 
-  const nextMapTypeOption = (value: MapTypeOption) => {
-    const idx = MAP_TYPE_OPTIONS.indexOf(value);
-    const nextIdx = idx >= 0 ? (idx + 1) % MAP_TYPE_OPTIONS.length : 0;
-    return MAP_TYPE_OPTIONS[nextIdx] ?? 'default';
-  };
-
-  const mapTypeLabel = (value: MapTypeOption) => {
-    if (value === 'satellite') return 'Satellite';
-    if (value === 'dark') return 'Dark';
-    return 'Default';
-  };
-
-  const handleTripButtonPress = () => {
+  const handleTripButtonPress = async () => {
     if (!isTripStarted) {
+      const canStartTrip = (await onTripStart?.({ startLocation: null })) ?? true;
+      if (!canStartTrip) {
+        return;
+      }
       setIsTripStarted(true);
-      onTripStart?.({ startLocation: null });
       return;
     }
 
@@ -107,18 +102,9 @@ export function HomeScreen({
           <AppIcon name="map" size={34} color="#57c7a8" />
           <Text style={localStyles.mapFallbackTitle}>Native map is available on mobile</Text>
           <Text style={localStyles.mapFallbackSub}>
-            This web fallback keeps the app runnable without `react-native-maps`.
+            This web fallback keeps the app runnable without the native mobile map SDK.
           </Text>
         </View>
-
-        <Pressable style={localStyles.mapTypeToggle} onPress={() => onChangeMapTypeOption(nextMapTypeOption(mapTypeOption))}>
-          <AppIcon
-            name={mapTypeOption === 'dark' ? 'moon' : mapTypeOption === 'satellite' ? 'globe' : 'map'}
-            size={16}
-            color="#0F172A"
-          />
-          <Text style={localStyles.mapTypeToggleText}>{mapTypeLabel(mapTypeOption)}</Text>
-        </Pressable>
 
         {!isTripScreen ? (
           <>
@@ -174,7 +160,23 @@ export function HomeScreen({
                     {profileDriverCode} • {profilePlateNumber}
                   </Text>
                 </View>
-                <Text style={localStyles.todayText}>Today</Text>
+                <Pressable
+                  style={localStyles.statsFilterButton}
+                  onPress={() => {
+                    const order = ['TODAY', 'YESTERDAY', 'LAST_WEEK', 'LAST_30_DAYS'] as const;
+                    const currentIndex = order.indexOf(homeStatsFilter);
+                    const nextIndex = currentIndex >= 0 ? (currentIndex + 1) % order.length : 0;
+                    onChangeHomeStatsFilter?.(order[nextIndex] ?? 'TODAY');
+                  }}
+                >
+                  <Text style={localStyles.todayText}>{filterLabel}</Text>
+                  <AppIcon
+                    name="chevron-right"
+                    size={14}
+                    color="#334155"
+                    style={{ transform: [{ rotate: '90deg' }] }}
+                  />
+                </Pressable>
               </View>
 
               <View style={localStyles.metricRow}>
@@ -222,6 +224,7 @@ export function HomeScreen({
         activeTab="home"
         onNavigate={onNavigate}
         showCenterRoute={!isTripScreen}
+        isLowBatteryMapMode={isLowBatteryMapMode}
         styles={styles}
       />
 
@@ -270,26 +273,6 @@ const localStyles = StyleSheet.create({
     color: '#475569',
     fontFamily: 'CircularStdMedium500',
     textAlign: 'center',
-  },
-  mapTypeToggle: {
-    position: 'absolute',
-    top: 58,
-    right: 14,
-    height: 36,
-    borderRadius: 18,
-    paddingHorizontal: 12,
-    backgroundColor: 'rgba(255,255,255,0.92)',
-    borderWidth: 1,
-    borderColor: '#E2E8F0',
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  mapTypeToggleText: {
-    fontSize: 12,
-    lineHeight: 14,
-    color: '#0F172A',
-    fontFamily: 'CircularStdMedium500',
   },
   statusBarCard: {
     position: 'absolute',
@@ -427,6 +410,17 @@ const localStyles = StyleSheet.create({
     lineHeight: 18,
     color: '#334155',
     fontFamily: 'CircularStdMedium500',
+  },
+  statsFilterButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingVertical: 4,
+    paddingHorizontal: 8,
+    borderRadius: 999,
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
   },
   metricRow: {
     flexDirection: 'row',

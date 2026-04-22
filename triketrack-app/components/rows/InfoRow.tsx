@@ -1,5 +1,6 @@
 import { Pressable, Text, View } from 'react-native';
 import { AppIcon, type AppIconName } from '../ui';
+import { MAXIM_UI_MUTED_DARK, MAXIM_UI_TEXT_DARK } from '../../screens/homeScreenShared';
 
 type InfoRowProps = {
   icon: AppIconName;
@@ -9,9 +10,19 @@ type InfoRowProps = {
   onPress?: () => void;
   showChevron?: boolean;
   styles: Record<string, any>;
+  isLowBatteryMapMode?: boolean;
 };
 
-export function InfoRow({ icon, label, value, isLast = false, onPress, showChevron = false, styles }: InfoRowProps) {
+export function InfoRow({
+  icon,
+  label,
+  value,
+  isLast = false,
+  onPress,
+  showChevron = false,
+  styles,
+  isLowBatteryMapMode = false,
+}: InfoRowProps) {
   const Container: any = onPress ? Pressable : View;
   return (
     <Container
@@ -20,15 +31,23 @@ export function InfoRow({ icon, label, value, isLast = false, onPress, showChevr
       disabled={!onPress}
     >
       <View style={styles.infoIconWrap}>
-        <AppIcon name={icon} size={16} color="#111827" />
+        <AppIcon name={icon} size={16} color={isLowBatteryMapMode ? MAXIM_UI_TEXT_DARK : '#111827'} />
       </View>
       <View style={styles.infoTextWrap}>
-        <Text style={styles.infoLabel}>{label}</Text>
-        <Text style={styles.infoValue}>{value}</Text>
+        <Text style={[styles.infoLabel, isLowBatteryMapMode ? { color: MAXIM_UI_MUTED_DARK } : null]}>
+          {label}
+        </Text>
+        <Text style={[styles.infoValue, isLowBatteryMapMode ? { color: MAXIM_UI_TEXT_DARK } : null]}>
+          {value}
+        </Text>
       </View>
       {showChevron ? (
         <View style={{ width: 22, alignItems: 'flex-end', justifyContent: 'center', paddingTop: 3 }}>
-          <AppIcon name="chevron-right" size={16} color="#94A3B8" />
+          <AppIcon
+            name="chevron-right"
+            size={16}
+            color={isLowBatteryMapMode ? MAXIM_UI_MUTED_DARK : '#94A3B8'}
+          />
         </View>
       ) : null}
     </Container>

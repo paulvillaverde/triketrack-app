@@ -1,5 +1,13 @@
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Svg, { Circle, Ellipse, G, Path, Rect } from 'react-native-svg';
+import {
+  MAXIM_UI_BG_DARK,
+  MAXIM_UI_BORDER_DARK,
+  MAXIM_UI_MUTED_DARK,
+  MAXIM_UI_SUBTLE_DARK,
+  MAXIM_UI_TEXT_DARK,
+} from './homeScreenShared';
 
 type PermissionOnboardingStep = 'phone' | 'location';
 
@@ -11,6 +19,7 @@ type PermissionOnboardingScreenProps = {
   onContinue: () => void | Promise<void>;
   onSkip: () => void | Promise<void>;
   isSubmitting?: boolean;
+  isDarkMode?: boolean;
 };
 
 export function PermissionOnboardingScreen({
@@ -21,18 +30,32 @@ export function PermissionOnboardingScreen({
   onContinue,
   onSkip,
   isSubmitting = false,
+  isDarkMode = false,
 }: PermissionOnboardingScreenProps) {
+  const insets = useSafeAreaInsets();
+
   return (
-    <View style={styles.screen}>
-      <View style={styles.topSpacer} />
+    <View
+      style={[
+        styles.screen,
+        {
+          paddingTop: 26 + insets.top,
+          paddingBottom: 28 + insets.bottom,
+        },
+        isDarkMode ? { backgroundColor: MAXIM_UI_BG_DARK } : null,
+      ]}
+    >
+      <View style={[styles.topSpacer, { minHeight: 44 + insets.top * 0.2 }]} />
 
       <View style={styles.heroWrap}>
         {kind === 'phone' ? <PhoneSecurityIllustration /> : <LocationServicesIllustration />}
       </View>
 
       <View style={styles.copyWrap}>
-        <Text style={styles.title}>{title}</Text>
-        <Text style={styles.description}>{description}</Text>
+        <Text style={[styles.title, isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null]}>{title}</Text>
+        <Text style={[styles.description, isDarkMode ? { color: MAXIM_UI_MUTED_DARK } : null]}>
+          {description}
+        </Text>
       </View>
 
       <View style={styles.stepRow}>
@@ -42,6 +65,7 @@ export function PermissionOnboardingScreen({
             style={[
               styles.stepIndicator,
               step === index ? styles.stepIndicatorActive : styles.stepIndicatorInactive,
+              isDarkMode && step !== index ? { backgroundColor: MAXIM_UI_BORDER_DARK } : null,
             ]}
           />
         ))}
@@ -55,11 +79,14 @@ export function PermissionOnboardingScreen({
           }
         }}
       >
-        <Text style={styles.skipText}>Skip</Text>
+        <Text style={[styles.skipText, isDarkMode ? { color: MAXIM_UI_SUBTLE_DARK } : null]}>Skip</Text>
       </Pressable>
 
       <Pressable
-        style={[styles.continueButton, isSubmitting && styles.continueButtonDisabled]}
+        style={[
+          styles.continueButton,
+          isSubmitting && styles.continueButtonDisabled,
+        ]}
         onPress={() => {
           if (!isSubmitting) {
             void onContinue();
@@ -67,7 +94,7 @@ export function PermissionOnboardingScreen({
         }}
       >
         {isSubmitting ? (
-          <ActivityIndicator size="small" color="#111827" />
+          <ActivityIndicator size="small" color="#FFFFFF" />
         ) : (
           <Text style={styles.continueText}>Continue</Text>
         )}
@@ -130,7 +157,7 @@ function LocationServicesIllustration() {
         <Circle cx="80" cy="92" r="11" fill="#E7F7F1" />
         <Circle cx="174" cy="88" r="8" fill="#E7F7F1" />
         <Path d="M54 148L95 116L135 154L92 187Z" fill="#E6F5EF" />
-        <Path d="M95 116L143 90L186 123L135 154Z" fill="#D9F3EA" />r
+        <Path d="M95 116L143 90L186 123L135 154Z" fill="#D9F3EA" />
         <Path d="M70 100L110 77L143 90L95 116Z" fill="#EEF9F5" />
         <Path d="M135 154L186 123L198 156L145 188Z" fill="#EEF9F5" />
         <Path d="M107 95L114 100L92 112L85 107Z" fill="#FFFFFF" opacity="0.85" />
@@ -239,6 +266,7 @@ const styles = StyleSheet.create({
     fontFamily: 'CircularStdMedium500',
   },
   continueButton: {
+    width: '100%',
     minHeight: 60,
     borderRadius: 14,
     backgroundColor: '#57C7A8',

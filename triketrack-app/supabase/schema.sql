@@ -195,6 +195,7 @@ begin
     drop table if exists public.violations cascade;
     drop table if exists public.trip_route_points cascade;
     drop table if exists public.trip_routes cascade;
+    drop table if exists public.violation_proofs cascade;
     drop table if exists public.mobile_violations cascade;
     drop table if exists public.violation_appeals cascade;
     drop table if exists public.trips cascade;
@@ -488,13 +489,18 @@ create table if not exists public.routes (
 
 create table if not exists public.qr_codes (
   qr_id bigint generated always as identity primary key,
-  tricycle_id bigint not null references public.tricycles(tricycle_id) on delete cascade,
+  driver_id bigint,
+  tricycle_id bigint references public.tricycles(tricycle_id) on delete set null,
   qr_token text not null unique,
   status public.qr_status not null default public.qr_status_from_text('active'),
   issued_at timestamptz not null default now(),
   expires_at timestamptz,
   created_at timestamptz not null default now()
 );
+
+alter table public.qr_codes add column if not exists driver_id bigint;
+alter table public.qr_codes add column if not exists tricycle_id bigint;
+alter table public.qr_codes alter column tricycle_id drop not null;
 
 do $$
 begin
@@ -509,6 +515,7 @@ begin
     drop table if exists public.driver_locations cascade;
     drop table if exists public.trip_points cascade;
     drop table if exists public.trip_routes cascade;
+    drop table if exists public.violation_proofs cascade;
     drop table if exists public.mobile_violations cascade;
     drop table if exists public.violation_appeals cascade;
     drop table if exists public.trips cascade;
@@ -541,6 +548,22 @@ alter table public.drivers add column if not exists password_hash text;
 alter table public.drivers add column if not exists updated_at timestamptz not null default now();
 alter table public.drivers add column if not exists tricycle_id bigint;
 alter table public.drivers add column if not exists qr_id bigint;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'qr_codes_driver_id_fkey'
+      and conrelid = 'public.qr_codes'::regclass
+  ) then
+    alter table public.qr_codes
+      add constraint qr_codes_driver_id_fkey
+      foreign key (driver_id) references public.drivers(driver_id) on delete set null;
+  end if;
+exception
+  when undefined_table then null;
+end $$;
 
 update public.drivers
 set updated_at = coalesce(updated_at, created_at, now())
@@ -616,6 +639,27 @@ create table if not exists public.trips (
   constraint trip_fare_check check (fare_amount is null or fare_amount >= 0)
 );
 
+-- Mobile trip transactions keep the rendered route, dashed off-road connector,
+-- and GPS quality summary so the detail screen can replay the exact saved trip
+-- without depending on a live map-matching service.
+alter table public.trips add column if not exists start_location_raw jsonb;
+alter table public.trips add column if not exists start_location_matched jsonb;
+alter table public.trips add column if not exists end_location_raw jsonb;
+alter table public.trips add column if not exists end_location_matched jsonb;
+alter table public.trips add column if not exists start_display_name text;
+alter table public.trips add column if not exists end_display_name text;
+alter table public.trips add column if not exists start_coordinate jsonb;
+alter table public.trips add column if not exists end_coordinate jsonb;
+alter table public.trips add column if not exists dashed_start_connector jsonb;
+alter table public.trips add column if not exists dashed_end_connector jsonb;
+alter table public.trips add column if not exists route_trace_geojson jsonb;
+alter table public.trips add column if not exists trip_metrics jsonb;
+alter table public.trips add column if not exists gps_quality_summary jsonb;
+alter table public.trips add column if not exists raw_gps_point_count integer not null default 0;
+alter table public.trips add column if not exists matched_point_count integer not null default 0;
+alter table public.trips add column if not exists offline_segments_count integer not null default 0;
+alter table public.trips add column if not exists sync_status text not null default 'SYNC_PENDING';
+
 create table if not exists public.trip_points (
   point_id bigint generated always as identity primary key,
   trip_id bigint references public.trips(trip_id) on delete cascade,
@@ -626,6 +670,8 @@ create table if not exists public.trip_points (
   speed double precision,
   heading double precision,
   accuracy double precision,
+  altitude double precision,
+  provider text,
   dedup_key text not null unique,
   created_at timestamptz not null default now()
 );
@@ -732,6 +778,29 @@ create table if not exists public.violation_appeals (
   updated_at timestamptz not null default now()
 );
 
+create table if not exists public.violation_proofs (
+  id uuid primary key default gen_random_uuid(),
+  violation_id uuid not null references public.mobile_violations(id) on delete cascade,
+  driver_id bigint not null references public.drivers(driver_id) on delete cascade,
+  file_url text not null,
+  file_path text not null,
+  file_type text,
+  status text not null default 'UPLOADED',
+  uploaded_at timestamptz not null default now(),
+  reviewed_at timestamptz,
+  review_notes text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.admin_notification_reads (
+  admin_id bigint not null references public.admin_accounts(admin_id) on delete cascade,
+  notification_key text not null,
+  read_at timestamptz not null default now(),
+  created_at timestamptz not null default now(),
+  primary key (admin_id, notification_key)
+);
+
 drop trigger if exists trg_mobile_violations_updated_at on public.mobile_violations;
 create trigger trg_mobile_violations_updated_at
 before update on public.mobile_violations
@@ -740,6 +809,11 @@ for each row execute function public.set_updated_at();
 drop trigger if exists trg_violation_appeals_updated_at on public.violation_appeals;
 create trigger trg_violation_appeals_updated_at
 before update on public.violation_appeals
+for each row execute function public.set_updated_at();
+
+drop trigger if exists trg_violation_proofs_updated_at on public.violation_proofs;
+create trigger trg_violation_proofs_updated_at
+before update on public.violation_proofs
 for each row execute function public.set_updated_at();
 
 -- ---------- RPCs for driver app ----------
@@ -772,6 +846,50 @@ begin
     and upper(coalesce(d.driver_code, d.driver_id::text)) = upper(p_driver_code)
     and d.password_hash is not null
     and d.password_hash = extensions.crypt(p_password, d.password_hash)
+  limit 1;
+end;
+$$;
+
+drop function if exists public.get_driver_profile(bigint);
+create or replace function public.get_driver_profile(p_driver_id bigint)
+returns table (
+  id bigint,
+  full_name text,
+  driver_id text,
+  contact_number text,
+  plate_number text,
+  avatar_url text,
+  qr_id bigint,
+  qr_token text,
+  qr_status public.qr_status,
+  qr_issued_at timestamptz,
+  report_path text
+)
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  return query
+  select
+    d.driver_id as id,
+    trim(concat_ws(' ', d.first_name, d.last_name)) as full_name,
+    coalesce(d.driver_code, d.driver_id::text) as driver_id,
+    coalesce(d.contact_no, '') as contact_number,
+    coalesce(t.plate_no, '') as plate_number,
+    d.avatar_url,
+    d.qr_id,
+    qr.qr_token,
+    qr.status as qr_status,
+    qr.issued_at as qr_issued_at,
+    case
+      when qr.qr_token is not null then '/report/' || qr.qr_token
+      else null
+    end as report_path
+  from public.drivers d
+  left join public.tricycles t on t.tricycle_id = d.tricycle_id
+  left join public.qr_codes qr on qr.qr_id = d.qr_id
+  where d.driver_id = p_driver_id
   limit 1;
 end;
 $$;
@@ -1110,6 +1228,7 @@ create index if not exists idx_driver_locations_updated_at on public.driver_loca
 create index if not exists idx_tricycles_toda_id on public.tricycles (toda_id);
 create index if not exists idx_tricycles_permit_expiration_date on public.tricycles (permit_expiration_date);
 create index if not exists idx_routes_toda_id on public.routes (toda_id);
+create index if not exists idx_qr_codes_driver_id on public.qr_codes (driver_id);
 create index if not exists idx_qr_codes_tricycle_id on public.qr_codes (tricycle_id);
 create index if not exists idx_trips_driver_id on public.trips (driver_id);
 create index if not exists idx_trips_tricycle_id on public.trips (tricycle_id);
@@ -1145,9 +1264,44 @@ create index if not exists idx_mobile_violations_status on public.mobile_violati
 create index if not exists idx_mobile_violations_type on public.mobile_violations (type);
 create index if not exists idx_violation_appeals_driver_submitted_at_desc on public.violation_appeals (driver_id, submitted_at desc);
 create index if not exists idx_violation_appeals_violation on public.violation_appeals (violation_id);
+create index if not exists idx_violation_proofs_driver_uploaded_at_desc on public.violation_proofs (driver_id, uploaded_at desc);
+create index if not exists idx_violation_proofs_violation on public.violation_proofs (violation_id);
+create index if not exists idx_admin_notification_reads_admin_read_at_desc
+  on public.admin_notification_reads (admin_id, read_at desc);
 
-create unique index if not exists uq_qr_codes_active_per_tricycle
-on public.qr_codes (tricycle_id)
+do $$
+begin
+  drop index if exists public.uq_qr_codes_active_per_tricycle;
+
+  with duplicate_active_qr_rows as (
+    select
+      qr_id
+    from (
+      select
+        qr_id,
+        row_number() over (
+          partition by driver_id
+          order by
+            coalesce(issued_at, created_at) desc,
+            qr_id desc
+        ) as duplicate_rank
+      from public.qr_codes
+      where status = public.qr_status_from_text('active')
+        and driver_id is not null
+    ) ranked
+    where duplicate_rank > 1
+  )
+  update public.qr_codes
+  set
+    status = public.qr_status_from_text('revoked'),
+    expires_at = coalesce(expires_at, now())
+  where qr_id in (select qr_id from duplicate_active_qr_rows);
+exception
+  when undefined_table then null;
+end $$;
+
+create unique index if not exists uq_qr_codes_active_per_driver
+on public.qr_codes (driver_id)
 where status = public.qr_status_from_text('active');
 
 create unique index if not exists ux_active_appeal_per_violation
@@ -1195,6 +1349,8 @@ alter table public.trip_route_points enable row level security;
 alter table public.trip_routes enable row level security;
 alter table public.mobile_violations enable row level security;
 alter table public.violation_appeals enable row level security;
+alter table public.violation_proofs enable row level security;
+alter table public.admin_notification_reads enable row level security;
 
 do $$
 begin
@@ -1207,6 +1363,279 @@ begin
   ) then
     create policy authenticated_admins_can_read_driver_locations
     on public.driver_locations
+    for select
+    to authenticated
+    using (true);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'violation_proofs'
+      and policyname = 'authenticated_can_read_violation_proofs'
+  ) then
+    create policy authenticated_can_read_violation_proofs
+    on public.violation_proofs
+    for select
+    to anon, authenticated
+    using (true);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'violation_proofs'
+      and policyname = 'authenticated_can_insert_violation_proofs'
+  ) then
+    create policy authenticated_can_insert_violation_proofs
+    on public.violation_proofs
+    for insert
+    to anon, authenticated
+    with check (true);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'trip_points'
+      and policyname = 'authenticated_can_read_trip_points'
+  ) then
+    create policy authenticated_can_read_trip_points
+    on public.trip_points
+    for select
+    to anon, authenticated
+    using (true);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'trip_points'
+      and policyname = 'authenticated_can_insert_trip_points'
+  ) then
+    create policy authenticated_can_insert_trip_points
+    on public.trip_points
+    for insert
+    to anon, authenticated
+    with check (true);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'trips'
+      and policyname = 'authenticated_can_read_trips'
+  ) then
+    create policy authenticated_can_read_trips
+    on public.trips
+    for select
+    to anon, authenticated
+    using (true);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'trips'
+      and policyname = 'authenticated_can_delete_trips'
+  ) then
+    create policy authenticated_can_delete_trips
+    on public.trips
+    for delete
+    to anon, authenticated
+    using (true);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'trip_route_points'
+      and policyname = 'authenticated_can_read_trip_route_points'
+  ) then
+    create policy authenticated_can_read_trip_route_points
+    on public.trip_route_points
+    for select
+    to anon, authenticated
+    using (true);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'trip_routes'
+      and policyname = 'authenticated_can_read_trip_routes'
+  ) then
+    create policy authenticated_can_read_trip_routes
+    on public.trip_routes
+    for select
+    to anon, authenticated
+    using (true);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'trip_routes'
+      and policyname = 'authenticated_can_insert_trip_routes'
+  ) then
+    create policy authenticated_can_insert_trip_routes
+    on public.trip_routes
+    for insert
+    to anon, authenticated
+    with check (true);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'trip_routes'
+      and policyname = 'authenticated_can_update_trip_routes'
+  ) then
+    create policy authenticated_can_update_trip_routes
+    on public.trip_routes
+    for update
+    to anon, authenticated
+    using (true)
+    with check (true);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'trip_routes'
+      and policyname = 'authenticated_can_delete_trip_routes'
+  ) then
+    create policy authenticated_can_delete_trip_routes
+    on public.trip_routes
+    for delete
+    to anon, authenticated
+    using (true);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'mobile_violations'
+      and policyname = 'authenticated_can_read_mobile_violations'
+  ) then
+    create policy authenticated_can_read_mobile_violations
+    on public.mobile_violations
+    for select
+    to anon, authenticated
+    using (true);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'mobile_violations'
+      and policyname = 'authenticated_can_insert_mobile_violations'
+  ) then
+    create policy authenticated_can_insert_mobile_violations
+    on public.mobile_violations
+    for insert
+    to anon, authenticated
+    with check (true);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'violation_appeals'
+      and policyname = 'authenticated_can_read_violation_appeals'
+  ) then
+    create policy authenticated_can_read_violation_appeals
+    on public.violation_appeals
+    for select
+    to anon, authenticated
+    using (true);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'violation_appeals'
+      and policyname = 'authenticated_can_insert_violation_appeals'
+  ) then
+    create policy authenticated_can_insert_violation_appeals
+    on public.violation_appeals
+    for insert
+    to anon, authenticated
+    with check (true);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'violations'
+      and policyname = 'authenticated_can_read_violations'
+  ) then
+    create policy authenticated_can_read_violations
+    on public.violations
     for select
     to authenticated
     using (true);
@@ -1315,6 +1744,55 @@ do $$
 begin
   begin
     alter publication supabase_realtime add table public.driver_locations;
+  exception
+    when duplicate_object then null;
+    when undefined_object then null;
+  end;
+
+  begin
+    alter publication supabase_realtime add table public.trips;
+  exception
+    when duplicate_object then null;
+    when undefined_object then null;
+  end;
+
+  begin
+    alter publication supabase_realtime add table public.trip_route_points;
+  exception
+    when duplicate_object then null;
+    when undefined_object then null;
+  end;
+
+  begin
+    alter publication supabase_realtime add table public.trip_routes;
+  exception
+    when duplicate_object then null;
+    when undefined_object then null;
+  end;
+
+  begin
+    alter publication supabase_realtime add table public.mobile_violations;
+  exception
+    when duplicate_object then null;
+    when undefined_object then null;
+  end;
+
+  begin
+    alter publication supabase_realtime add table public.violation_appeals;
+  exception
+    when duplicate_object then null;
+    when undefined_object then null;
+  end;
+
+  begin
+    alter publication supabase_realtime add table public.violation_proofs;
+  exception
+    when duplicate_object then null;
+    when undefined_object then null;
+  end;
+
+  begin
+    alter publication supabase_realtime add table public.violations;
   exception
     when duplicate_object then null;
     when undefined_object then null;

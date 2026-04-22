@@ -4,7 +4,12 @@ type LatLng = { latitude: number; longitude: number };
 
 type TripRouteMapProps = {
   routePath: LatLng[];
+  rawStartPoint?: LatLng | null;
+  dashedStartConnector?: LatLng[];
+  endPoint?: LatLng | null;
   geofence: LatLng[];
+  lockSavedRoute?: boolean;
+  isLowBatteryMapMode?: boolean;
   style: any;
   getRouteRegion: (routePath: LatLng[]) => {
     latitude: number;

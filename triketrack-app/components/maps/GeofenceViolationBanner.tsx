@@ -23,7 +23,7 @@ export function GeofenceViolationBanner({
 const styles = StyleSheet.create({
   banner: {
     position: 'absolute',
-    top: 106,
+    top: 118,
     left: 14,
     right: 14,
     borderRadius: 18,

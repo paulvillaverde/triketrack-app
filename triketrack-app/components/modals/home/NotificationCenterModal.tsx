@@ -1,5 +1,17 @@
 import { FlatList, Modal, Pressable, StyleSheet, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { AppIcon, type AppIconName } from '../../ui';
+import {
+  MAXIM_UI_BORDER_DARK,
+  MAXIM_UI_BORDER_SOFT_DARK,
+  MAXIM_UI_GREEN_SOFT_DARK,
+  MAXIM_UI_MUTED_DARK,
+  MAXIM_UI_SUBTLE_DARK,
+  MAXIM_UI_SURFACE_ALT_DARK,
+  MAXIM_UI_SURFACE_DARK,
+  MAXIM_UI_SURFACE_ELEVATED_DARK,
+  MAXIM_UI_TEXT_DARK,
+} from '../../../screens/homeScreenShared';
 
 export type NotificationCenterItem = {
   id: string;
@@ -18,6 +30,7 @@ type NotificationCenterModalProps = {
   unreadCount: number;
   onPressNotification: (notificationId: string) => void;
   onMarkAllRead: () => void;
+  isLowBatteryMapMode?: boolean;
 };
 
 const formatNotificationTime = (createdAt: string) => {
@@ -57,15 +70,47 @@ export function NotificationCenterModal({
   unreadCount,
   onPressNotification,
   onMarkAllRead,
+  isLowBatteryMapMode = false,
 }: NotificationCenterModalProps) {
+  const insets = useSafeAreaInsets();
+
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onRequestClose}>
-      <View style={styles.backdrop}>
-        <View style={styles.sheet}>
+      <View
+        style={[
+          styles.backdrop,
+          isLowBatteryMapMode ? { backgroundColor: 'rgba(10, 14, 20, 0.58)' } : null,
+        ]}
+      >
+        <View
+          style={[
+            styles.sheet,
+            { paddingBottom: 24 + insets.bottom },
+            isLowBatteryMapMode
+              ? {
+                  backgroundColor: MAXIM_UI_SURFACE_DARK,
+                  borderTopWidth: 1,
+                  borderTopColor: MAXIM_UI_BORDER_DARK,
+                }
+              : null,
+          ]}
+        >
           <View style={styles.header}>
             <View>
-              <Text style={styles.title}>Notifications</Text>
-              <Text style={styles.subtitle}>
+              <Text
+                style={[
+                  styles.title,
+                  isLowBatteryMapMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                ]}
+              >
+                Notifications
+              </Text>
+              <Text
+                style={[
+                  styles.subtitle,
+                  isLowBatteryMapMode ? { color: MAXIM_UI_MUTED_DARK } : null,
+                ]}
+              >
                 {unreadCount > 0
                   ? `${unreadCount} unread update${unreadCount > 1 ? 's' : ''}`
                   : 'Everything is up to date'}
@@ -73,12 +118,33 @@ export function NotificationCenterModal({
             </View>
             <View style={styles.headerActions}>
               {unreadCount > 0 ? (
-                <Pressable style={styles.markAllButton} onPress={onMarkAllRead}>
+                <Pressable
+                  style={[
+                    styles.markAllButton,
+                    isLowBatteryMapMode ? { backgroundColor: MAXIM_UI_GREEN_SOFT_DARK } : null,
+                  ]}
+                  onPress={onMarkAllRead}
+                >
                   <Text style={styles.markAllButtonText}>Mark all read</Text>
                 </Pressable>
               ) : null}
-              <Pressable style={styles.closeButton} onPress={onRequestClose}>
-                <AppIcon name="x" size={18} color="#0F172A" />
+              <Pressable
+                style={[
+                  styles.closeButton,
+                  isLowBatteryMapMode
+                    ? {
+                        backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
+                        borderColor: MAXIM_UI_BORDER_DARK,
+                      }
+                    : null,
+                ]}
+                onPress={onRequestClose}
+              >
+                <AppIcon
+                  name="x"
+                  size={18}
+                  color={isLowBatteryMapMode ? MAXIM_UI_TEXT_DARK : '#0F172A'}
+                />
               </Pressable>
             </View>
           </View>
@@ -87,23 +153,68 @@ export function NotificationCenterModal({
             data={notifications}
             keyExtractor={(item) => item.id}
             contentContainerStyle={notifications.length === 0 ? styles.emptyListContent : styles.listContent}
-            ItemSeparatorComponent={() => <View style={styles.separator} />}
+            ItemSeparatorComponent={() => (
+              <View
+                style={[
+                  styles.separator,
+                  isLowBatteryMapMode ? { backgroundColor: MAXIM_UI_BORDER_SOFT_DARK } : null,
+                ]}
+              />
+            )}
             renderItem={({ item }) => (
               <Pressable
-                style={[styles.row, !item.read && styles.rowUnread]}
+                style={[
+                  styles.row,
+                  !item.read && styles.rowUnread,
+                  isLowBatteryMapMode && !item.read
+                    ? { backgroundColor: MAXIM_UI_SURFACE_ELEVATED_DARK }
+                    : null,
+                ]}
                 onPress={() => onPressNotification(item.id)}
               >
-                <View style={[styles.iconWrap, !item.read && styles.iconWrapUnread]}>
+                <View
+                  style={[
+                    styles.iconWrap,
+                    isLowBatteryMapMode
+                      ? {
+                          backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
+                          borderColor: MAXIM_UI_BORDER_DARK,
+                        }
+                      : null,
+                    !item.read && styles.iconWrapUnread,
+                  ]}
+                >
                   <AppIcon name={item.icon} size={18} color={!item.read ? '#147D64' : '#475569'} />
                 </View>
                 <View style={styles.textWrap}>
                   <View style={styles.rowTop}>
-                    <Text style={[styles.rowTitle, !item.read && styles.rowTitleUnread]} numberOfLines={1}>
+                    <Text
+                      style={[
+                        styles.rowTitle,
+                        isLowBatteryMapMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                        !item.read && styles.rowTitleUnread,
+                        !item.read && isLowBatteryMapMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                      ]}
+                      numberOfLines={1}
+                    >
                       {item.title}
                     </Text>
-                    <Text style={styles.rowTime}>{formatNotificationTime(item.createdAt)}</Text>
+                    <Text
+                      style={[
+                        styles.rowTime,
+                        isLowBatteryMapMode ? { color: MAXIM_UI_SUBTLE_DARK } : null,
+                      ]}
+                    >
+                      {formatNotificationTime(item.createdAt)}
+                    </Text>
                   </View>
-                  <Text style={styles.rowMessage} numberOfLines={2}>
+                  <Text
+                    style={[
+                      styles.rowMessage,
+                      isLowBatteryMapMode ? { color: MAXIM_UI_TEXT_DARK, opacity: 0.86 } : null,
+                    ]}
+                    numberOfLines={2}
+                  >
                     {item.message}
                   </Text>
                 </View>
@@ -112,11 +223,28 @@ export function NotificationCenterModal({
             )}
             ListEmptyComponent={
               <View style={styles.emptyState}>
-                <View style={styles.emptyIconWrap}>
+                <View
+                  style={[
+                    styles.emptyIconWrap,
+                    isLowBatteryMapMode ? { backgroundColor: MAXIM_UI_GREEN_SOFT_DARK } : null,
+                  ]}
+                >
                   <AppIcon name="bell" size={24} color="#57C7A8" />
                 </View>
-                <Text style={styles.emptyTitle}>No notifications yet</Text>
-                <Text style={styles.emptySubtitle}>
+                <Text
+                  style={[
+                    styles.emptyTitle,
+                    isLowBatteryMapMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                  ]}
+                >
+                  No notifications yet
+                </Text>
+                <Text
+                  style={[
+                    styles.emptySubtitle,
+                    isLowBatteryMapMode ? { color: MAXIM_UI_MUTED_DARK } : null,
+                  ]}
+                >
                   Profile updates, trip activity, and violation changes will appear here.
                 </Text>
               </View>

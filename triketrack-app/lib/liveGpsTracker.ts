@@ -6,6 +6,8 @@ export type LiveGpsSample = {
   accuracy?: number | null;
   heading?: number | null;
   speed?: number | null;
+  altitude?: number | null;
+  provider?: string | null;
   timestampMs: number;
 };
 
@@ -16,8 +18,27 @@ type StartLiveGpsTrackerParams = {
   initialTimeoutMs?: number;
   watchIntervalMs?: number;
   distanceIntervalMeters?: number;
+  minimumPointDistanceMeters?: number;
   staleSampleThresholdMs?: number;
   accuracy?: Location.Accuracy;
+};
+
+const toRad = (value: number) => (value * Math.PI) / 180;
+
+const distanceBetweenMeters = (
+  from: Pick<LiveGpsSample, 'latitude' | 'longitude'>,
+  to: Pick<LiveGpsSample, 'latitude' | 'longitude'>,
+) => {
+  const earthRadiusMeters = 6371000;
+  const dLat = toRad(to.latitude - from.latitude);
+  const dLon = toRad(to.longitude - from.longitude);
+  const lat1 = toRad(from.latitude);
+  const lat2 = toRad(to.latitude);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return earthRadiusMeters * c;
 };
 
 const toLiveGpsSample = (location: Location.LocationObject): LiveGpsSample => ({
@@ -32,6 +53,11 @@ const toLiveGpsSample = (location: Location.LocationObject): LiveGpsSample => ({
     typeof location.coords.speed === 'number' && Number.isFinite(location.coords.speed)
       ? location.coords.speed
       : null,
+  altitude:
+    typeof location.coords.altitude === 'number' && Number.isFinite(location.coords.altitude)
+      ? location.coords.altitude
+      : null,
+  provider: 'expo-location',
   timestampMs: location.timestamp,
 });
 
@@ -43,6 +69,7 @@ export async function startLiveGpsTracker(params: StartLiveGpsTrackerParams) {
     initialTimeoutMs = 4000,
     watchIntervalMs = 1000,
     distanceIntervalMeters = 1,
+    minimumPointDistanceMeters = 0,
     staleSampleThresholdMs = 4000,
     accuracy = Location.Accuracy.BestForNavigation,
   } = params;
@@ -51,6 +78,7 @@ export async function startLiveGpsTracker(params: StartLiveGpsTrackerParams) {
   let subscription: Location.LocationSubscription | null = null;
   let firstFreshSampleEmitted = false;
   let latestSampleTimestampMs = 0;
+  let lastDeliveredSample: LiveGpsSample | null = null;
 
   const isFreshEnough = (sample: LiveGpsSample) =>
     sample.timestampMs > 0 && Date.now() - sample.timestampMs <= staleSampleThresholdMs;
@@ -66,12 +94,23 @@ export async function startLiveGpsTracker(params: StartLiveGpsTrackerParams) {
 
     latestSampleTimestampMs = sample.timestampMs;
 
+    if (
+      mode === 'update' &&
+      lastDeliveredSample &&
+      minimumPointDistanceMeters > 0 &&
+      distanceBetweenMeters(lastDeliveredSample, sample) < minimumPointDistanceMeters
+    ) {
+      return;
+    }
+
     if (!firstFreshSampleEmitted || mode === 'seed') {
       firstFreshSampleEmitted = true;
+      lastDeliveredSample = sample;
       onSeed(sample);
       return;
     }
 
+    lastDeliveredSample = sample;
     onUpdate(sample);
   };
 

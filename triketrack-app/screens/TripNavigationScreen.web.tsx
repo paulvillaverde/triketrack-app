@@ -2,7 +2,14 @@
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import type { HomeScreen } from './HomeScreen';
 
-type TripNavigationScreenProps = Omit<ComponentProps<typeof HomeScreen>, 'isTripScreen'>;
+type TripNavigationScreenProps = Omit<ComponentProps<typeof HomeScreen>, 'isTripScreen'> & {
+  forceNewTripSession?: boolean;
+  initialTripLocation?: {
+    latitude: number;
+    longitude: number;
+    timestampMs?: number | null;
+  } | null;
+};
 
 export function TripNavigationScreen({ onExitTripNavigation }: TripNavigationScreenProps) {
   return (

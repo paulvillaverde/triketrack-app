@@ -1,5 +1,14 @@
 import { LayoutChangeEvent, Pressable, Text, View } from 'react-native';
 import { AppIcon } from '../ui';
+import {
+  MAXIM_UI_BORDER_DARK,
+  MAXIM_UI_GREEN_BORDER_DARK,
+  MAXIM_UI_GREEN_SOFT_DARK,
+  MAXIM_UI_MUTED_DARK,
+  MAXIM_UI_SURFACE_ALT_DARK,
+  MAXIM_UI_SURFACE_ELEVATED_DARK,
+  MAXIM_UI_TEXT_DARK,
+} from '../../screens/homeScreenShared';
 
 type StartTripPanelProps = {
   styles: Record<string, any>;
@@ -14,11 +23,10 @@ type StartTripPanelProps = {
   setFarePickerOpen: (value: boolean | ((prev: boolean) => boolean)) => void;
   setSelectedFare: (value: number) => void;
   speedKmh: number;
-  enableTripSimulation: boolean;
   isTripStarted: boolean;
-  onOpenSimulation?: () => void;
   onTripButtonPress: () => void | Promise<void>;
   onLayout?: (event: LayoutChangeEvent) => void;
+  isLowBatteryMapMode?: boolean;
 };
 
 export function StartTripPanel({
@@ -34,18 +42,36 @@ export function StartTripPanel({
   setFarePickerOpen,
   setSelectedFare,
   speedKmh,
-  enableTripSimulation,
   isTripStarted,
-  onOpenSimulation,
   onTripButtonPress,
   onLayout,
+  isLowBatteryMapMode = false,
 }: StartTripPanelProps) {
-  const showSimulationAction = enableTripSimulation && !isTripStarted && !!onOpenSimulation;
-
   return (
-    <View style={[styles.routeTripPanel, { bottom: 104 + (insetsBottom || 0) }]} onLayout={onLayout}>
+    <View
+      style={[
+        styles.routeTripPanel,
+        isLowBatteryMapMode
+          ? {
+              backgroundColor: MAXIM_UI_SURFACE_ELEVATED_DARK,
+              borderColor: MAXIM_UI_BORDER_DARK,
+              shadowOpacity: 0,
+              elevation: 0,
+            }
+          : null,
+        { bottom: 104 + (insetsBottom || 0) },
+      ]}
+      onLayout={onLayout}
+    >
       <View style={styles.routeGeofenceStatusRow}>
-        <Text style={styles.routeGeofenceStatusLabel}>Obrero Geofence</Text>
+        <Text
+          style={[
+            styles.routeGeofenceStatusLabel,
+            isLowBatteryMapMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+          ]}
+        >
+          Obrero Geofence
+        </Text>
         <View
           style={[
             styles.routeGeofencePill,
@@ -66,36 +92,121 @@ export function StartTripPanel({
       </View>
 
       <View style={[styles.routeTripStatsRow, localStyles.tripStatsRow]}>
-        <View style={[styles.routeTripStatPill, localStyles.tripStatPill]}>
-          <Text style={styles.routeTripStatValue}>{minutesText}</Text>
-          <Text style={styles.routeTripStatLabel}>mins</Text>
+        <View
+          style={[
+            styles.routeTripStatPill,
+            localStyles.tripStatPill,
+            isLowBatteryMapMode
+              ? {
+                  backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
+                  borderColor: MAXIM_UI_BORDER_DARK,
+                }
+              : null,
+          ]}
+        >
+          <Text
+            style={[
+              styles.routeTripStatValue,
+              isLowBatteryMapMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+            ]}
+          >
+            {minutesText}
+          </Text>
+          <Text
+            style={[
+              styles.routeTripStatLabel,
+              isLowBatteryMapMode ? { color: MAXIM_UI_MUTED_DARK } : null,
+            ]}
+          >
+            mins
+          </Text>
         </View>
-        <View style={[styles.routeTripStatPill, localStyles.tripStatPill]}>
-          <Text style={styles.routeTripStatValue}>{kmText}</Text>
-          <Text style={styles.routeTripStatLabel}>km</Text>
+        <View
+          style={[
+            styles.routeTripStatPill,
+            localStyles.tripStatPill,
+            isLowBatteryMapMode
+              ? {
+                  backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
+                  borderColor: MAXIM_UI_BORDER_DARK,
+                }
+              : null,
+          ]}
+        >
+          <Text
+            style={[
+              styles.routeTripStatValue,
+              isLowBatteryMapMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+            ]}
+          >
+            {kmText}
+          </Text>
+          <Text
+            style={[
+              styles.routeTripStatLabel,
+              isLowBatteryMapMode ? { color: MAXIM_UI_MUTED_DARK } : null,
+            ]}
+          >
+            km
+          </Text>
         </View>
         <Pressable
-          style={[styles.routeTripStatPill, localStyles.tripStatPill]}
+          style={[
+            styles.routeTripStatPill,
+            localStyles.tripStatPill,
+            isLowBatteryMapMode
+              ? {
+                  backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
+                  borderColor: MAXIM_UI_BORDER_DARK,
+                }
+              : null,
+          ]}
           onPress={() => setFarePickerOpen((prev) => !prev)}
         >
-          <Text style={styles.routeTripStatValue}>{'\u20B1'}{selectedFare}</Text>
-          <Text style={styles.routeTripStatLabel}>fare</Text>
+          <Text
+            style={[
+              styles.routeTripStatValue,
+              isLowBatteryMapMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+            ]}
+          >
+            {'\u20B1'}{selectedFare}
+          </Text>
+          <Text
+            style={[
+              styles.routeTripStatLabel,
+              isLowBatteryMapMode ? { color: MAXIM_UI_MUTED_DARK } : null,
+            ]}
+          >
+            fare
+          </Text>
         </Pressable>
       </View>
 
       <View style={localStyles.navigationMetaRow}>
-        <Text style={localStyles.navigationMetaText}>Speed {speedKmh.toFixed(1)} km/h</Text>
+        <Text
+          style={[
+            localStyles.navigationMetaText,
+            isLowBatteryMapMode ? { color: MAXIM_UI_MUTED_DARK } : null,
+          ]}
+        >
+          Speed {speedKmh.toFixed(1)} km/h
+        </Text>
         <View style={localStyles.metaActionsRow}>
-          <View style={localStyles.metaStatusChip}>
+          <View
+            style={[
+              localStyles.metaStatusChip,
+              isLowBatteryMapMode
+                ? {
+                    backgroundColor: MAXIM_UI_GREEN_SOFT_DARK,
+                    borderWidth: 1,
+                    borderColor: MAXIM_UI_GREEN_BORDER_DARK,
+                  }
+                : null,
+            ]}
+          >
             <AppIcon name="navigation" size={12} color="#147D64" />
             <Text style={localStyles.metaStatusChipText}>Auto-reroute on</Text>
           </View>
-          {showSimulationAction ? (
-            <Pressable style={localStyles.simulationChip} onPress={onOpenSimulation}>
-              <AppIcon name="activity" size={12} color="#2D7DF6" />
-              <Text style={localStyles.simulationChipText}>Simulation</Text>
-            </Pressable>
-          ) : null}
         </View>
       </View>
 
@@ -106,7 +217,19 @@ export function StartTripPanel({
               key={value}
               style={[
                 styles.routeFareOption,
+                isLowBatteryMapMode
+                  ? {
+                      backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
+                      borderColor: MAXIM_UI_BORDER_DARK,
+                    }
+                  : null,
                 value === selectedFare && styles.routeFareOptionActive,
+                value === selectedFare && isLowBatteryMapMode
+                  ? {
+                      backgroundColor: MAXIM_UI_GREEN_SOFT_DARK,
+                      borderColor: '#57c7a8',
+                    }
+                  : null,
               ]}
               onPress={() => {
                 setSelectedFare(value);
@@ -116,6 +239,7 @@ export function StartTripPanel({
               <Text
                 style={[
                   styles.routeFareOptionText,
+                  isLowBatteryMapMode ? { color: MAXIM_UI_MUTED_DARK } : null,
                   value === selectedFare && styles.routeFareOptionTextActive,
                 ]}
               >

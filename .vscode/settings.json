@@ -1,0 +1,6 @@
+{
+  "mssql.intelliSense.enableErrorChecking": false,
+  "mssql.autoDisableNonTSqlLanguageService": true,
+  "java.compile.nullAnalysis.mode": "automatic",
+  "java.configuration.updateBuildConfiguration": "interactive"
+}

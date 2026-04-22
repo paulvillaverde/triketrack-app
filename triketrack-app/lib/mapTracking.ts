@@ -1,13 +1,14 @@
 export type LatLngPoint = { latitude: number; longitude: number };
 
 export const OBRERO_GEOFENCE: LatLngPoint[] = [
-  { latitude: 7.0849408, longitude: 125.6121403 },
-  { latitude: 7.0861485, longitude: 125.6130254 },
-  { latitude: 7.09253, longitude: 125.61713 },
-  { latitude: 7.0832297, longitude: 125.6242034 },
-  { latitude: 7.0771506, longitude: 125.6170807 },
-  { latitude: 7.0776251, longitude: 125.6141467 },
-  { latitude: 7.0835656, longitude: 125.6126754 },
+  { latitude: 7.0832297, longitude: 125.624803 },
+  { latitude: 7.076611, longitude: 125.617071 },
+  { latitude: 7.078821, longitude: 125.6140047 },
+  { latitude: 7.0817, longitude: 125.612905 },
+  { latitude: 7.0835656, longitude: 125.612594 },
+  { latitude: 7.0849408, longitude: 125.611754 },
+  { latitude: 7.0868171, longitude: 125.613004 },
+  { latitude: 7.09187, longitude: 125.6177977 },
 ];
 
 export const dedupeSequentialPoints = (points: LatLngPoint[]) =>

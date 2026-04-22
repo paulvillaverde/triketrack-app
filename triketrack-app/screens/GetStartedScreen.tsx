@@ -1,16 +1,23 @@
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { TrikeTrackLogo } from '../components/branding';
+import { MAXIM_UI_BG_DARK, MAXIM_UI_MUTED_DARK } from './homeScreenShared';
 
 type GetStartedScreenProps = {
   onGetStarted: () => void;
   styles: Record<string, any>;
+  isDarkMode?: boolean;
 };
 
-export function GetStartedScreen({ onGetStarted }: GetStartedScreenProps) {
+export function GetStartedScreen({ onGetStarted, isDarkMode = false }: GetStartedScreenProps) {
   return (
-    <Pressable style={localStyles.container} onPress={onGetStarted}>
+    <Pressable
+      style={[localStyles.container, isDarkMode ? { backgroundColor: MAXIM_UI_BG_DARK } : null]}
+      onPress={onGetStarted}
+    >
       <TrikeTrackLogo />
-      <Text style={localStyles.hint}>Tap anywhere to get started</Text>
+      <Text style={[localStyles.hint, isDarkMode ? { color: MAXIM_UI_MUTED_DARK } : null]}>
+        Tap anywhere to get started
+      </Text>
     </Pressable>
   );
 }

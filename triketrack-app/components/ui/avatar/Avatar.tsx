@@ -1,8 +1,11 @@
+import { useEffect, useMemo, useState } from 'react';
 import { Image, ImageStyle, StyleProp, StyleSheet, Text, TextStyle, View, ViewStyle } from 'react-native';
 
 type AvatarProps = {
   name: string;
   imageUri?: string | null;
+  fallbackText?: string;
+  backgroundColor?: string;
   size?: number;
   style?: StyleProp<ViewStyle>;
   textStyle?: StyleProp<TextStyle>;
@@ -32,10 +35,44 @@ function pickColor(name: string) {
   return COLOR_PALETTE[idx] ?? '#57c7a8';
 }
 
-export function Avatar({ name, imageUri, size, style, textStyle }: AvatarProps) {
+const buildFallbackText = (name: string, explicitFallbackText?: string) => {
+  const normalizedExplicit = explicitFallbackText?.trim();
+  if (normalizedExplicit) {
+    return normalizedExplicit.slice(0, 2).toUpperCase();
+  }
+
+  const parts = name
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  if (parts.length === 0) {
+    return '?';
+  }
+
+  if (parts.length === 1) {
+    return (parts[0].slice(0, 2) || '?').toUpperCase();
+  }
+
+  return `${parts[0][0] ?? ''}${parts[1][0] ?? ''}`.toUpperCase() || '?';
+};
+
+export function Avatar({
+  name,
+  imageUri,
+  fallbackText,
+  backgroundColor: backgroundColorOverride,
+  size,
+  style,
+  textStyle,
+}: AvatarProps) {
   const trimmed = name.trim();
-  const initial = (trimmed[0] ?? '?').toUpperCase();
-  const backgroundColor = pickColor(trimmed);
+  const [hasImageError, setHasImageError] = useState(false);
+  const initial = useMemo(
+    () => buildFallbackText(trimmed, fallbackText),
+    [fallbackText, trimmed],
+  );
+  const backgroundColor = backgroundColorOverride ?? pickColor(trimmed || fallbackText || '?');
 
   const baseStyle: ViewStyle = size
     ? { width: size, height: size, borderRadius: size / 2 }
@@ -54,11 +91,21 @@ export function Avatar({ name, imageUri, size, style, textStyle }: AvatarProps) 
     height: '100%',
     borderRadius: resolvedBorderRadius,
   };
+  const shouldShowImage = Boolean(imageUri) && !hasImageError;
+
+  useEffect(() => {
+    setHasImageError(false);
+  }, [imageUri]);
 
   return (
     <View style={[styles.container, baseStyle, { backgroundColor }, style]}>
-      {imageUri ? (
-        <Image source={{ uri: imageUri }} style={imageStyle} resizeMode="cover" />
+      {shouldShowImage ? (
+        <Image
+          source={{ uri: imageUri! }}
+          style={imageStyle}
+          resizeMode="cover"
+          onError={() => setHasImageError(true)}
+        />
       ) : (
         <Text style={[styles.initial, { fontSize }, textStyle]}>{initial}</Text>
       )}

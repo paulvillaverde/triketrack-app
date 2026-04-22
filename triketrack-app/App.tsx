@@ -1,7 +1,9 @@
 import { StatusBar } from 'expo-status-bar';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Animated,
   Alert,
+  Easing,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -10,8 +12,9 @@ import {
   Text,
   View,
   StatusBar as RNStatusBar,
+  Vibration,
 } from 'react-native';
-import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { SafeAreaInsetsContext, SafeAreaProvider } from 'react-native-safe-area-context';
 import { useFonts } from '@expo-google-fonts/poppins';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
@@ -20,13 +23,21 @@ import * as Location from 'expo-location';
 import {
   authenticateDriver,
   attachTripRoutesToServerTrip,
+  checkTripExists,
   completeTrip,
   createViolation,
+  deleteTrip as deleteTripFromBackend,
+  fetchDriverProfile,
   hasSupabaseConfig,
+  insertTripPointBatch,
+  listViolations,
   listTripsWithRoutePoints,
+  replaceTripRouteFallback,
   setDriverLocationOffline,
   setDriverPassword,
   startTrip,
+  supabase,
+  type DriverQrStatus,
   uploadDriverAvatar,
   upsertDriverLocation,
   insertTripRouteBatch,
@@ -34,31 +45,78 @@ import {
 import {
   attachServerTripIdToOfflineTrip,
   completeOfflineTripSession,
+  deleteOfflineTrip,
+  getLatestOngoingOfflineTripSession,
+  getOfflineMatchedTripPointsByLocalTripId,
+  getOfflineTripSession,
+  getOfflineTripSessionByServerTripId,
   getOfflineTripPointsByLocalTripId,
+  getOfflineTripStatusEventsByLocalTripId,
   getPendingOfflineTripSessions,
+  getUnsyncedOfflineMatchedTripPoints,
   getUnsyncedOfflineTripPoints,
   initOfflineTripStorage,
+  insertOfflineMatchedTripPoints,
   insertOfflineTripSession,
   insertOfflineTripPoint,
+  insertOfflineTripStatusEvent,
+  markOfflineMatchedTripPointsSynced,
   markOfflineTripSessionCompletedSynced,
   markOfflineTripSessionStartedSynced,
   markOfflineTripPointsSynced,
+  type OfflineMatchedPointSource,
 } from './lib/offlineTripStorage';
 import { reconstructCompletedTripPath, type RawTripTelemetryPoint } from './lib/tripPathReconstruction';
-import { smoothDisplayedRoutePath } from './lib/roadPath';
+import {
+  buildRoadAlignedTripPath,
+  buildRoadAlignedTripPathDetailed,
+  polylineDistanceKm,
+  smoothDisplayedRoutePath,
+} from './lib/roadPath';
+import { buildMatchedTracePointsFromSegment } from './lib/tripTrace';
+import {
+  buildTripHistoryItem,
+  countOfflineSegments,
+  mergeTripHistoryItem,
+  normalizeGeoJsonRoutePath,
+  normalizeTripHistoryItem,
+  pickPreferredRouteMatchSummary,
+  type TripCompletionPayload,
+  type TripGpsQualitySummary,
+  type TripHistoryItem,
+  type TripRouteMatchSummary,
+} from './lib/tripTransactions';
+import {
+  selectTripStartEndpointFromBuildings,
+  selectTripEndpointFromBuildings,
+  type TripEndpointSelectionSummary,
+} from './lib/tripEndpointSelection';
+import { resolveTripDisplayLocationLabels } from './lib/tripLocationLabels';
 import { LoginScreen } from './screens/LoginScreen';
 import { GetStartedScreen } from './screens/GetStartedScreen';
-import { HomeScreen, type MapTypeOption } from './screens/HomeScreen';
+import { HomeScreen } from './screens/HomeScreen';
 import { StartTripScreen } from './screens/StartTripScreen';
 import { TripNavigationScreen } from './screens/TripNavigationScreen';
-import { SimulationScreen } from './screens/SimulationScreen';
 import { TripScreen } from './screens/TripScreen';
-import { ViolationScreen } from './screens/ViolationScreen';
+import { ViolationScreen, type ViolationItem } from './screens/ViolationScreen';
 import { ProfileScreen } from './screens/ProfileScreen';
 import { CreatePasswordScreen } from './screens/CreatePasswordScreen';
 import { PermissionOnboardingScreen } from './screens/PermissionOnboardingScreen';
-import { TripActionModal, type NotificationCenterItem } from './components/modals';
+import {
+  TripActionModal,
+  type NotificationCenterItem,
+} from './components/modals';
 import { AppIcon, type AppIconName } from './components/ui';
+import { useLowBatteryMapMode } from './lib/useLowBatteryMapMode';
+import {
+  MAXIM_UI_BG_DARK,
+  MAXIM_UI_BORDER_DARK,
+  MAXIM_UI_BORDER_SOFT_DARK,
+  MAXIM_UI_SUBTLE_DARK,
+  MAXIM_UI_SURFACE_ALT_DARK,
+  MAXIM_UI_SURFACE_DARK,
+  MAXIM_UI_TEXT_DARK,
+} from './screens/homeScreenShared';
 
 type Screen =
   | 'getStarted'
@@ -69,7 +127,6 @@ type Screen =
   | 'home'
   | 'startTrip'
   | 'tripNavigation'
-  | 'simulation'
   | 'trip'
   | 'violation'
   | 'profile';
@@ -82,17 +139,7 @@ type PermissionOnboardingState = {
   completedAt: string;
 };
 
-type TripHistoryItem = {
-  id: string;
-  tripDate: string; // YYYY-MM-DD
-  duration: string;
-  distance: string;
-  fare: string;
-  violations: string;
-  status: 'ONGOING' | 'COMPLETED' | 'FLAGGED';
-  compliance: number;
-  routePath: Array<{ latitude: number; longitude: number }>;
-};
+type HomeStatsFilter = 'TODAY' | 'YESTERDAY' | 'LAST_WEEK' | 'LAST_30_DAYS';
 
 type NotificationDraft = {
   category: 'account' | 'profile' | 'trip' | 'violation';
@@ -101,64 +148,112 @@ type NotificationDraft = {
   icon: AppIconName;
 };
 
+type OfflineQueueStatus = {
+  pendingTripCount: number;
+  pendingGpsPointCount: number;
+  pendingMatchedPointCount: number;
+  isSyncing: boolean;
+  lastAttemptAt: string | null;
+  lastError: string | null;
+  nextRetryAt: string | null;
+};
+
+type ProfileQrDetails = {
+  qrId: number | null;
+  qrToken: string | null;
+  qrStatus: DriverQrStatus | null;
+  qrIssuedAt: string | null;
+  reportPath: string | null;
+};
+
+const createEmptyProfileQrDetails = (): ProfileQrDetails => ({
+  qrId: null,
+  qrToken: null,
+  qrStatus: null,
+  qrIssuedAt: null,
+  reportPath: null,
+});
+
+const createEmptyOfflineQueueStatus = (): OfflineQueueStatus => ({
+  pendingTripCount: 0,
+  pendingGpsPointCount: 0,
+  pendingMatchedPointCount: 0,
+  isSyncing: false,
+  lastAttemptAt: null,
+  lastError: null,
+  nextRetryAt: null,
+});
+
 const createDemoTrip = (): TripHistoryItem => {
   const today = new Date();
   const yyyy = today.getFullYear();
   const mm = String(today.getMonth() + 1).padStart(2, '0');
   const dd = String(today.getDate()).padStart(2, '0');
+  const demoRoutePath = [
+    // Road-following demo path used by trip history previews.
+    { latitude: 7.078241, longitude: 125.614578 },
+    { latitude: 7.078549, longitude: 125.614448 },
+    { latitude: 7.078634, longitude: 125.614412 },
+    { latitude: 7.078693, longitude: 125.614387 },
+    { latitude: 7.078712, longitude: 125.614521 },
+    { latitude: 7.078778, longitude: 125.614469 },
+    { latitude: 7.078919, longitude: 125.614354 },
+    { latitude: 7.079054, longitude: 125.614251 },
+    { latitude: 7.079189, longitude: 125.614146 },
+    { latitude: 7.079224, longitude: 125.614122 },
+    { latitude: 7.079256, longitude: 125.614104 },
+    { latitude: 7.079295, longitude: 125.61409 },
+    { latitude: 7.079347, longitude: 125.614086 },
+    { latitude: 7.079398, longitude: 125.614088 },
+    { latitude: 7.079643, longitude: 125.614092 },
+    { latitude: 7.079962, longitude: 125.614097 },
+    { latitude: 7.080177, longitude: 125.614101 },
+    { latitude: 7.08044, longitude: 125.614105 },
+    { latitude: 7.080741, longitude: 125.614115 },
+    { latitude: 7.081036, longitude: 125.614125 },
+    { latitude: 7.08108, longitude: 125.614127 },
+    { latitude: 7.081101, longitude: 125.614127 },
+    { latitude: 7.081339, longitude: 125.614139 },
+    { latitude: 7.081538, longitude: 125.614149 },
+    { latitude: 7.08174, longitude: 125.614158 },
+    { latitude: 7.082294, longitude: 125.614829 },
+    { latitude: 7.082641, longitude: 125.614546 },
+    { latitude: 7.083658, longitude: 125.615749 },
+    { latitude: 7.084517, longitude: 125.61681 },
+    { latitude: 7.084579, longitude: 125.616887 },
+  ];
 
-  return {
+  return buildTripHistoryItem({
     id: 'TRIP-9001',
     tripDate: `${yyyy}-${mm}-${dd}`,
-    duration: '3 min',
-    distance: '0.90 km',
-    fare: '\u20B120.00',
-    violations: '0',
-    status: 'COMPLETED',
-    compliance: 100,
-    routePath: [
-      // Road-snapped path (OSRM) so the polyline follows streets.
-      { latitude: 7.078241, longitude: 125.614578 },
-      { latitude: 7.078549, longitude: 125.614448 },
-      { latitude: 7.078634, longitude: 125.614412 },
-      { latitude: 7.078693, longitude: 125.614387 },
-      { latitude: 7.078712, longitude: 125.614521 },
-      { latitude: 7.078778, longitude: 125.614469 },
-      { latitude: 7.078919, longitude: 125.614354 },
-      { latitude: 7.079054, longitude: 125.614251 },
-      { latitude: 7.079189, longitude: 125.614146 },
-      { latitude: 7.079224, longitude: 125.614122 },
-      { latitude: 7.079256, longitude: 125.614104 },
-      { latitude: 7.079295, longitude: 125.61409 },
-      { latitude: 7.079347, longitude: 125.614086 },
-      { latitude: 7.079398, longitude: 125.614088 },
-      { latitude: 7.079643, longitude: 125.614092 },
-      { latitude: 7.079962, longitude: 125.614097 },
-      { latitude: 7.080177, longitude: 125.614101 },
-      { latitude: 7.08044, longitude: 125.614105 },
-      { latitude: 7.080741, longitude: 125.614115 },
-      { latitude: 7.081036, longitude: 125.614125 },
-      { latitude: 7.08108, longitude: 125.614127 },
-      { latitude: 7.081101, longitude: 125.614127 },
-      { latitude: 7.081339, longitude: 125.614139 },
-      { latitude: 7.081538, longitude: 125.614149 },
-      { latitude: 7.08174, longitude: 125.614158 },
-      { latitude: 7.082294, longitude: 125.614829 },
-      { latitude: 7.082641, longitude: 125.614546 },
-      { latitude: 7.083658, longitude: 125.615749 },
-      { latitude: 7.084517, longitude: 125.61681 },
-      { latitude: 7.084579, longitude: 125.616887 },
-    ],
-  };
+    fare: 20,
+    durationSeconds: 180,
+    matchedRoutePath: demoRoutePath,
+    rawStartPoint: demoRoutePath[0] ?? null,
+    rawEndPoint: demoRoutePath[demoRoutePath.length - 1] ?? null,
+    matchedStartPoint: demoRoutePath[0] ?? null,
+    matchedEndPoint: demoRoutePath[demoRoutePath.length - 1] ?? null,
+    syncStatus: 'SYNCED',
+    tripState: 'SYNCED',
+    routeName: 'Demo Route',
+  });
 };
 
 const computeTripTotals = (items: TripHistoryItem[]) =>
   items.reduce(
     (acc, item) => {
-      const fareNum = Number(item.fare.replace(/[^\d.]/g, '') || 0);
-      const distanceNum = Number(item.distance.replace(/[^\d.]/g, '') || 0);
-      const durationNum = Number(item.duration.replace(/[^\d]/g, '') || 0);
-      const durationMinutes = item.duration.includes('sec') ? durationNum / 60 : durationNum;
+      const fareNum =
+        typeof item.fareAmount === 'number' && Number.isFinite(item.fareAmount)
+          ? item.fareAmount
+          : Number(item.fare.replace(/[^\d.-]/g, '') || 0);
+      const distanceNum =
+        typeof item.totalDistanceMatchedMeters === 'number' && Number.isFinite(item.totalDistanceMatchedMeters)
+          ? item.totalDistanceMatchedMeters / 1000
+          : Number(item.distance.replace(/[^\d.]/g, '') || 0);
+      const durationMinutes =
+        typeof item.durationSeconds === 'number' && Number.isFinite(item.durationSeconds)
+          ? item.durationSeconds / 60
+          : Number(item.duration.replace(/[^\d]/g, '') || 0);
       return {
         earnings: acc.earnings + fareNum,
         trips: acc.trips + 1,
@@ -169,6 +264,401 @@ const computeTripTotals = (items: TripHistoryItem[]) =>
     { earnings: 0, trips: 0, distance: 0, minutes: 0 },
   );
 
+const getDaysAgoFromTripDate = (tripDate: string) => {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const date = new Date(`${tripDate}T00:00:00`);
+  date.setHours(0, 0, 0, 0);
+  const diffMs = today.getTime() - date.getTime();
+  return Math.floor(diffMs / (1000 * 60 * 60 * 24));
+};
+
+const filterTripHistoryByRange = (items: TripHistoryItem[], range: HomeStatsFilter) =>
+  items.filter((item) => {
+    const daysAgo = getDaysAgoFromTripDate(item.tripDate);
+    if (range === 'TODAY') return daysAgo === 0;
+    if (range === 'YESTERDAY') return daysAgo === 1;
+    if (range === 'LAST_WEEK') return daysAgo >= 1 && daysAgo <= 7;
+    return daysAgo >= 0 && daysAgo <= 29;
+  });
+
+const dedupeSequentialRoutePoints = (
+  points: Array<{ latitude: number; longitude: number }>,
+) => {
+  return points.filter((point, index, source) => {
+    if (index === 0) {
+      return true;
+    }
+    const previous = source[index - 1];
+    return (
+      previous.latitude !== point.latitude ||
+      previous.longitude !== point.longitude
+    );
+  });
+};
+
+const normalizeSavedRoutePath = (
+  nextPath: Array<{ latitude: number; longitude: number }>,
+  fallbackPath: Array<{ latitude: number; longitude: number }> = [],
+  {
+    preserveDetailedGeometry = false,
+  }: {
+    preserveDetailedGeometry?: boolean;
+  } = {},
+) => {
+  const normalizePath = (points: Array<{ latitude: number; longitude: number }>) => {
+    const dedupedPoints = dedupeSequentialRoutePoints(points);
+    return preserveDetailedGeometry ? dedupedPoints : smoothDisplayedRoutePath(dedupedPoints);
+  };
+
+  const normalizedNext = normalizePath(nextPath);
+  if (normalizedNext.length > 1) {
+    return normalizedNext;
+  }
+
+  return normalizePath(fallbackPath);
+};
+
+const shouldPreserveDetailedRouteGeometry = (
+  routeMatchSummary?: TripRouteMatchSummary | null,
+) =>
+  typeof routeMatchSummary?.provider === 'string' &&
+  routeMatchSummary.provider !== 'local-directional';
+
+const buildPreferredOfflineMatchedPath = (
+  points: Array<{
+    latitude: number;
+    longitude: number;
+    match_source: OfflineMatchedPointSource;
+  }>,
+) => {
+  const authoritativeMatchedPoints = points.filter(
+    (point) => point.match_source === 'service' || point.match_source === 'reconstructed',
+  );
+  const roadAnchoredPoints = points.filter((point) => point.match_source !== 'local-heuristic');
+  const preferredPoints =
+    authoritativeMatchedPoints.length > 1
+      ? authoritativeMatchedPoints
+      : roadAnchoredPoints.length > 1
+        ? roadAnchoredPoints
+        : points;
+  const preserveDetailedGeometry = preferredPoints.some(
+    (point) => point.match_source === 'service' || point.match_source === 'reconstructed',
+  );
+  return normalizeSavedRoutePath(
+    preferredPoints.map((point) => ({
+      latitude: point.latitude,
+      longitude: point.longitude,
+    })),
+    [],
+    {
+      preserveDetailedGeometry,
+    },
+  );
+};
+
+const upsertTripHistoryItems = (
+  current: TripHistoryItem[],
+  nextItems: TripHistoryItem[],
+) => {
+  const byId = new Map<string, TripHistoryItem>();
+  for (const item of current) {
+    byId.set(item.id, item);
+  }
+  for (const item of nextItems) {
+    byId.set(item.id, mergeTripHistoryItem(byId.get(item.id), item));
+  }
+  return [...byId.values()].sort((left, right) => {
+    const leftTime = new Date(left.startedAt ?? `${left.tripDate}T00:00:00`).getTime();
+    const rightTime = new Date(right.startedAt ?? `${right.tripDate}T00:00:00`).getTime();
+    return rightTime - leftTime;
+  });
+};
+
+const removeTripHistoryItem = (items: TripHistoryItem[], tripId: string) =>
+  items.filter((item) => item.id !== tripId);
+
+const getLocalTripIdFromHistoryId = (tripId: string) =>
+  tripId.startsWith('TRIP-trip-') ? tripId.replace(/^TRIP-/, '') : null;
+
+const getTripHistorySyncSignature = (item: TripHistoryItem) => {
+  const fareValue = Number(item.fare.replace(/[^\d.-]/g, ''));
+  const normalizedFare = Number.isFinite(fareValue) ? fareValue.toFixed(2) : item.fare;
+  return [
+    item.tripDate,
+    item.durationSeconds,
+    normalizedFare,
+  ].join('|');
+};
+
+const reconcileSyncedTripHistoryItems = (
+  current: TripHistoryItem[],
+  mappedServerItems: TripHistoryItem[],
+) => {
+  const syncedServerSignatures = new Set(
+    mappedServerItems
+      .filter((item) => item.syncStatus === 'SYNCED')
+      .map(getTripHistorySyncSignature),
+  );
+  const syncedServerIds = new Set(
+    mappedServerItems
+      .filter((item) => item.syncStatus === 'SYNCED')
+      .map((item) => item.id),
+  );
+  const withoutStalePendingItems = current.filter((item) => {
+    if (item.syncStatus !== 'SYNC_PENDING') {
+      return true;
+    }
+
+    return (
+      !syncedServerIds.has(item.id) &&
+      !syncedServerSignatures.has(getTripHistorySyncSignature(item))
+    );
+  });
+
+  return upsertTripHistoryItems(withoutStalePendingItems, mappedServerItems);
+};
+
+const LEGACY_DUMMY_TRIP_ROUTE_NAMES = new Set([
+  'Road-Following Demo Route',
+  'Pearl-Amethyst Road Demo',
+]);
+
+const isLegacyDummyTrip45 = (item: TripHistoryItem) =>
+  item.id === 'TRIP-45' &&
+  item.driverCode === 'D-007' &&
+  item.vehiclePlateNumber === '54321' &&
+  LEGACY_DUMMY_TRIP_ROUTE_NAMES.has(item.routeName ?? '');
+
+const buildTripHistoryId = ({
+  serverTripId,
+  localTripId,
+  fallbackOrdinal,
+}: {
+  serverTripId?: string | number | null;
+  localTripId?: string | null;
+  fallbackOrdinal: number;
+}) => {
+  if (serverTripId !== null && typeof serverTripId !== 'undefined' && String(serverTripId).length > 0) {
+    return `TRIP-${serverTripId}`;
+  }
+  if (localTripId) {
+    return `TRIP-${localTripId}`;
+  }
+  return `TRIP-${String(1000 + fallbackOrdinal).padStart(4, '0')}`;
+};
+
+const buildOptimisticTripRoutePath = ({
+  routePath,
+  rawTelemetry,
+  routeMatchSummary = null,
+}: {
+  routePath: Array<{ latitude: number; longitude: number }>;
+  rawTelemetry?: RawTripTelemetryPoint[];
+  routeMatchSummary?: TripRouteMatchSummary | null;
+}) => {
+  const preserveDetailedGeometry = shouldPreserveDetailedRouteGeometry(routeMatchSummary);
+  const tracedRoute = normalizeSavedRoutePath(routePath, [], {
+    preserveDetailedGeometry,
+  });
+  if (tracedRoute.length > 0) {
+    return tracedRoute;
+  }
+
+  const rawTelemetryPath = dedupeSequentialRoutePoints(
+    (rawTelemetry ?? []).map((point) => ({
+      latitude: point.latitude,
+      longitude: point.longitude,
+    })),
+  );
+  return normalizeSavedRoutePath(rawTelemetryPath, [], {
+    preserveDetailedGeometry,
+  });
+};
+
+const buildRoadAlignedRoutePath = async ({
+  candidatePath,
+  fallbackPath = [],
+  preserveDetailedGeometry = false,
+  trustCandidateGeometry = false,
+}: {
+  candidatePath: Array<{ latitude: number; longitude: number }>;
+  fallbackPath?: Array<{ latitude: number; longitude: number }>;
+  preserveDetailedGeometry?: boolean;
+  trustCandidateGeometry?: boolean;
+}) => {
+  return buildRoadAlignedTripPath({
+    candidatePath,
+    fallbackPath,
+    preserveDetailedGeometry,
+    trustCandidateGeometry,
+  });
+};
+
+const buildRoadAlignedRoutePathDetailed = async ({
+  candidatePath,
+  fallbackPath = [],
+  preserveDetailedGeometry = false,
+  trustCandidateGeometry = false,
+}: {
+  candidatePath: Array<{ latitude: number; longitude: number }>;
+  fallbackPath?: Array<{ latitude: number; longitude: number }>;
+  preserveDetailedGeometry?: boolean;
+  trustCandidateGeometry?: boolean;
+}) =>
+  buildRoadAlignedTripPathDetailed({
+    candidatePath,
+    fallbackPath,
+    preserveDetailedGeometry,
+    trustCandidateGeometry,
+  });
+
+type FinalizedTripEndpointState = {
+  roadEndpoint: { latitude: number; longitude: number } | null;
+  matchedEndPoint: { latitude: number; longitude: number } | null;
+  dashedEndConnector: Array<{ latitude: number; longitude: number }>;
+  endpointSelectionSummary: TripEndpointSelectionSummary | null;
+};
+
+type FinalizedTripStartEndpointState = {
+  roadStartPoint: { latitude: number; longitude: number } | null;
+  matchedStartPoint: { latitude: number; longitude: number } | null;
+  dashedStartConnector: Array<{ latitude: number; longitude: number }>;
+  startEndpointSelectionSummary: TripEndpointSelectionSummary | null;
+};
+
+const resolveFinalizedTripStartEndpointState = async ({
+  routePath,
+  rawStartPoint = null,
+}: {
+  routePath: Array<{ latitude: number; longitude: number }>;
+  rawStartPoint?: { latitude: number; longitude: number } | null;
+}): Promise<FinalizedTripStartEndpointState> => {
+  const normalizedRoutePath = dedupeSequentialRoutePoints(routePath);
+  const roadStartPoint = normalizedRoutePath[0] ?? null;
+  if (!roadStartPoint) {
+    return {
+      roadStartPoint: null,
+      matchedStartPoint: null,
+      dashedStartConnector: [],
+      startEndpointSelectionSummary: null,
+    };
+  }
+
+  const endpointSelection = await selectTripStartEndpointFromBuildings({
+    roadPath: normalizedRoutePath,
+    rawStartPoint,
+  });
+
+  return {
+    roadStartPoint,
+    matchedStartPoint: endpointSelection.finalEndpoint ?? roadStartPoint,
+    dashedStartConnector: endpointSelection.dashedConnector,
+    startEndpointSelectionSummary: endpointSelection.summary ?? null,
+  };
+};
+
+const resolveFinalizedTripEndpointState = async ({
+  routePath,
+  rawEndPoint = null,
+}: {
+  routePath: Array<{ latitude: number; longitude: number }>;
+  rawEndPoint?: { latitude: number; longitude: number } | null;
+}): Promise<FinalizedTripEndpointState> => {
+  const normalizedRoutePath = dedupeSequentialRoutePoints(routePath);
+  const roadEndpoint = normalizedRoutePath.at(-1) ?? null;
+  if (!roadEndpoint) {
+    return {
+      roadEndpoint: null,
+      matchedEndPoint: null,
+      dashedEndConnector: [],
+      endpointSelectionSummary: null,
+    };
+  }
+
+  const endpointSelection = await selectTripEndpointFromBuildings({
+    roadPath: normalizedRoutePath,
+    rawEndPoint,
+  });
+
+  return {
+    roadEndpoint,
+    matchedEndPoint: endpointSelection.finalEndpoint ?? roadEndpoint,
+    dashedEndConnector: endpointSelection.dashedConnector,
+    endpointSelectionSummary: endpointSelection.summary ?? null,
+  };
+};
+
+const MAX_TRIP_ROUTE_REPAIRS_PER_PASS = Number.MAX_SAFE_INTEGER;
+const TRIP_ROUTE_ENDPOINT_MATCH_MAX_DISTANCE_KM = 0.08;
+const SHORT_TRIP_ROUTE_REPAIR_MAX_DISTANCE_KM = 0.15;
+const SHORT_TRIP_ROUTE_REPAIR_MAX_POINTS = 6;
+const OVER_SMOOTHED_REMOTE_ROUTE_MIN_EXPECTED_POINTS = 8;
+
+const parseServerTripIdFromHistoryId = (tripId: string) => {
+  const match = /^TRIP-(\d+)$/.exec(tripId.trim());
+  if (!match) {
+    return null;
+  }
+
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const mapViolationRecordToItem = (violation: {
+  id: string;
+  driver_id: number;
+  trip_id: number | null;
+  type: 'GEOFENCE_BOUNDARY' | 'ROUTE_DEVIATION' | 'UNAUTHORIZED_STOP';
+  occurred_at: string;
+  latitude: number | null;
+  longitude: number | null;
+  location_label: string | null;
+  details: string | null;
+  status: 'OPEN' | 'UNDER_REVIEW' | 'RESOLVED';
+  priority: 'HIGH' | 'MEDIUM' | 'LOW';
+  title?: string | null;
+  appeals?: ViolationItem['appeals'];
+  proofs?: ViolationItem['proofs'];
+}): ViolationItem => {
+  const date = new Date(violation.occurred_at);
+  const formattedDate = Number.isNaN(date.getTime())
+    ? violation.occurred_at
+    : date.toLocaleString('en-PH', {
+        month: 'short',
+        day: '2-digit',
+        year: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+      });
+  const derivedTitle =
+    violation.type === 'GEOFENCE_BOUNDARY'
+      ? 'Geofence Boundary Violation'
+      : violation.type === 'ROUTE_DEVIATION'
+        ? 'Route Deviation Alert'
+        : violation.type === 'UNAUTHORIZED_STOP'
+          ? 'Unauthorized Stop'
+          : 'Route Violation';
+
+  return {
+    id: violation.id,
+    driverId: violation.driver_id,
+    tripId: violation.trip_id,
+    type: violation.type,
+    title: violation.title ?? derivedTitle,
+    date: formattedDate,
+    occurredAt: violation.occurred_at,
+    latitude: violation.latitude,
+    longitude: violation.longitude,
+    location: violation.location_label ?? '--',
+    details: violation.details ?? '--',
+    status: violation.status,
+    priority: violation.priority,
+    appeals: violation.appeals ?? [],
+    proofs: violation.proofs ?? [],
+  };
+};
+
 const isTemporarilyIgnorableRouteError = (error: string | null | undefined) => {
   const normalizedError = error?.toLowerCase() ?? '';
   return (
@@ -177,13 +667,13 @@ const isTemporarilyIgnorableRouteError = (error: string | null | undefined) => {
   );
 };
 
-const MAX_FAST_START_ACCURACY_METERS = 80;
-const MAX_LIVE_SYNC_ACCURACY_METERS = 35;
+const MAX_FAST_START_ACCURACY_METERS = 150;
+const MAX_LIVE_SYNC_ACCURACY_METERS = 80;
 const MAX_LIVE_SYNC_JUMP_KM = 0.08;
 const LIVE_SYNC_INTERVAL_MS = 1000;
 const INITIAL_LIVE_FIX_TIMEOUT_MS = 4000;
 const OFFLINE_POINT_SYNC_BATCH_SIZE = 250;
-const OFFLINE_POINT_MIN_DISTANCE_KM = 0.003;
+const OFFLINE_POINT_MIN_DISTANCE_KM = 0.005;
 const OFFLINE_SYNC_RETRY_BASE_MS = 5000;
 const OFFLINE_SYNC_RETRY_MAX_MS = 60000;
 
@@ -212,10 +702,6 @@ const SCREEN_CONTENT: Record<Screen, { title: string; subtitle: string }> = {
     subtitle: '',
   },
   tripNavigation: {
-    title: '',
-    subtitle: '',
-  },
-  simulation: {
     title: '',
     subtitle: '',
   },
@@ -253,7 +739,7 @@ const SCREEN_CONTENT: Record<Screen, { title: string; subtitle: string }> = {
 
 export default function App() {
   const PROFILE_STORAGE_KEY = 'triketrack_profile_v2_';
-  const TRIP_HISTORY_STORAGE_KEY = 'triketrack_trip_history_v1';
+  const TRIP_HISTORY_STORAGE_KEY = 'triketrack_trip_history_v2_';
   const NOTIFICATION_STORAGE_KEY = 'triketrack_notifications_v1_';
   const PERMISSION_ONBOARDING_STORAGE_KEY = 'triketrack_permission_onboarding_v1';
   const ALWAYS_SHOW_PERMISSION_ONBOARDING = true;
@@ -268,12 +754,15 @@ export default function App() {
   const [permissionOnboardingState, setPermissionOnboardingState] = useState<PermissionOnboardingState | null>(null);
   const [pendingPhoneAccessStatus, setPendingPhoneAccessStatus] = useState<PermissionOnboardingStatus>('granted');
   const [isPermissionOnboardingSubmitting, setIsPermissionOnboardingSubmitting] = useState(false);
-  const [mapTypeOption, setMapTypeOption] = useState<MapTypeOption>('default');
+  const isLowBatteryMapMode = useLowBatteryMapMode();
   const [totalEarnings, setTotalEarnings] = useState(0);
   const [totalTrips, setTotalTrips] = useState(0);
   const [totalDistanceKm, setTotalDistanceKm] = useState(0);
   const [totalMinutes, setTotalMinutes] = useState(0);
   const [tripHistory, setTripHistory] = useState<TripHistoryItem[]>([]);
+  const [isTripHistoryRefreshing, setIsTripHistoryRefreshing] = useState(false);
+  const [homeStatsFilter, setHomeStatsFilter] = useState<HomeStatsFilter>('TODAY');
+  const [violationItems, setViolationItems] = useState<ViolationItem[]>([]);
   const [profileName, setProfileName] = useState('Juan Dela Cruz');
   const [profileDriverCode, setProfileDriverCode] = useState('D-001');
   const [profileContact, setProfileContact] = useState('09276096932');
@@ -283,23 +772,66 @@ export default function App() {
   const [driverDbId, setDriverDbId] = useState<number | null>(null);
   const [activeTripDbId, setActiveTripDbId] = useState<string | null>(null);
   const [activeLocalTripId, setActiveLocalTripId] = useState<string | null>(null);
+  const [restoredTripTrace, setRestoredTripTrace] = useState<{
+    rawStartPoint: { latitude: number; longitude: number } | null;
+    matchedPath: Array<{ latitude: number; longitude: number }>;
+    hasConfirmedMovement: boolean;
+    startedAt: string;
+  } | null>(null);
+  const [offlineQueueStatus, setOfflineQueueStatus] = useState<OfflineQueueStatus>(
+    createEmptyOfflineQueueStatus,
+  );
+  const [forceNewTripNavigationSession, setForceNewTripNavigationSession] = useState(false);
   const [isHomeLocationVisible, setIsHomeLocationVisible] = useState(false);
   const [isWaitingForTripLocation, setIsWaitingForTripLocation] = useState(false);
   const activeTripStartPromiseRef = useRef<Promise<string | null> | null>(null);
   const pendingOpenTripScreenRef = useRef(false);
   const [profileImageUri, setProfileImageUri] = useState<string | null>(null);
+  const [profileQrDetails, setProfileQrDetails] = useState<ProfileQrDetails>(createEmptyProfileQrDetails);
+  const [isProfileQrLoading, setIsProfileQrLoading] = useState(false);
+  const [profileQrError, setProfileQrError] = useState<string | null>(null);
   const [profileHydrated, setProfileHydrated] = useState(false);
   const [tripHistoryHydrated, setTripHistoryHydrated] = useState(false);
+  const [tripHistoryHydratedDriverId, setTripHistoryHydratedDriverId] = useState<number | null>(null);
   const tripHistoryRef = useRef<TripHistoryItem[]>([]);
+  const tripHistoryHydratedRef = useRef(false);
+  const tripHistoryHydratedDriverIdRef = useRef<number | null>(null);
+  const tripRouteRepairAttemptedIdsRef = useRef<Set<string>>(new Set());
+  const hasRetriedLegacyOrsRouteConversionRef = useRef(false);
+  const tripRouteRepairInFlightRef = useRef(false);
   const [notifications, setNotifications] = useState<NotificationCenterItem[]>([]);
   const [notificationsHydrated, setNotificationsHydrated] = useState(false);
+  const screenTransitionOpacity = useRef(new Animated.Value(1)).current;
+  const screenTransitionTranslateY = useRef(new Animated.Value(0)).current;
   const content = useMemo(() => SCREEN_CONTENT[screen], [screen]);
+  const filteredHomeTrips = useMemo(
+    () => filterTripHistoryByRange(tripHistory, homeStatsFilter),
+    [homeStatsFilter, tripHistory],
+  );
+  const filteredHomeTotals = useMemo(
+    () => computeTripTotals(filteredHomeTrips),
+    [filteredHomeTrips],
+  );
+  const localSnapRoadPath = useMemo(() => {
+    const candidatePath =
+      restoredTripTrace?.matchedPath && restoredTripTrace.matchedPath.length > 1
+        ? restoredTripTrace.matchedPath
+        : [];
+
+    return candidatePath.length > 1
+      ? smoothDisplayedRoutePath(dedupeSequentialRoutePoints(candidatePath))
+      : [];
+  }, [restoredTripTrace, tripHistory]);
   const liveTrackingSubscriptionRef = useRef<Location.LocationSubscription | null>(null);
   const lastLiveSyncPointRef = useRef<{ latitude: number; longitude: number } | null>(null);
   const lastLiveSyncTimestampRef = useRef<number | null>(null);
+  const driverDbIdRef = useRef<number | null>(null);
+  const isDriverOnlineRef = useRef(false);
+  const previousDriverOnlineRef = useRef(false);
   const hasShownTrackingPermissionErrorRef = useRef(false);
   const isSyncingOfflineTripPointsRef = useRef(false);
   const isNetworkAvailableRef = useRef(false);
+  const lastGeofenceViolationFeedbackAtRef = useRef<number | null>(null);
   const lastOfflineStoredPointRef = useRef<{
     localTripId: string;
     latitude: number;
@@ -307,6 +839,60 @@ export default function App() {
   } | null>(null);
   const offlineSyncRetryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const offlineSyncRetryDelayMsRef = useRef(OFFLINE_SYNC_RETRY_BASE_MS);
+  const recoveredTripNotificationIdsRef = useRef<Set<string>>(new Set());
+  const getTripHistoryStorageKey = (targetDriverId: number) => `${TRIP_HISTORY_STORAGE_KEY}${targetDriverId}`;
+
+  const applyProfileQrDetails = (payload: {
+    qr_id?: number | null;
+    qr_token?: string | null;
+    qr_status?: DriverQrStatus | null;
+    qr_issued_at?: string | null;
+    report_path?: string | null;
+  }) => {
+    setProfileQrDetails({
+      qrId: typeof payload.qr_id === 'number' ? payload.qr_id : null,
+      qrToken: typeof payload.qr_token === 'string' && payload.qr_token.length > 0 ? payload.qr_token : null,
+      qrStatus: payload.qr_status ?? null,
+      qrIssuedAt: payload.qr_issued_at ?? null,
+      reportPath:
+        typeof payload.report_path === 'string' && payload.report_path.length > 0
+          ? payload.report_path
+          : null,
+    });
+  };
+
+  const refreshDriverProfileFromBackend = async (
+    targetDriverId: number,
+    options?: { preserveError?: boolean },
+  ) => {
+    setIsProfileQrLoading(true);
+    if (!options?.preserveError) {
+      setProfileQrError(null);
+    }
+
+    const { profile, error } = await fetchDriverProfile(targetDriverId);
+
+    if (driverDbIdRef.current !== targetDriverId) {
+      return;
+    }
+
+    if (error) {
+      setProfileQrError(error);
+      setIsProfileQrLoading(false);
+      return;
+    }
+
+    if (!profile) {
+      setProfileQrDetails(createEmptyProfileQrDetails());
+      setProfileQrError('Driver profile could not be found.');
+      setIsProfileQrLoading(false);
+      return;
+    }
+
+    applyProfileQrDetails(profile);
+    setProfileQrError(null);
+    setIsProfileQrLoading(false);
+  };
 
   const distanceBetweenKm = (
     from: { latitude: number; longitude: number },
@@ -325,66 +911,503 @@ export default function App() {
     return earthRadiusKm * c;
   };
 
-  const dedupeSequentialRoutePoints = (
-    points: Array<{ latitude: number; longitude: number }>,
-  ) => {
-    return points.filter((point, index, source) => {
-      if (index === 0) {
-        return true;
-      }
-      const previous = source[index - 1];
-      return (
-        previous.latitude !== point.latitude ||
-        previous.longitude !== point.longitude
-      );
-    });
-  };
-
-  const normalizeSavedRoutePath = (
-    nextPath: Array<{ latitude: number; longitude: number }>,
-    fallbackPath: Array<{ latitude: number; longitude: number }> = [],
-  ) => {
-    const normalizedNext = smoothDisplayedRoutePath(dedupeSequentialRoutePoints(nextPath));
-    if (normalizedNext.length > 1) {
-      return normalizedNext;
+  const shouldAttemptTripRouteRepair = (item: TripHistoryItem) => {
+    if (item.status === 'ONGOING') {
+      return false;
     }
 
-    const normalizedFallback = smoothDisplayedRoutePath(dedupeSequentialRoutePoints(fallbackPath));
-    return normalizedFallback;
+    const routePointCount = item.routePath.length;
+    const hasLocalFallbackRoute = item.routeMatchSummary?.provider === 'local-directional';
+    const hasLegacyOrsRoute = item.routeMatchSummary?.provider === 'ors-directions';
+    const hasOsrmRouteFallback = item.routeMatchSummary?.provider === 'osrm-route';
+    const hasRemoteMatchedRoute = item.routeMatchSummary?.provider === 'osrm-match';
+    const expectedMatchedPointCount = Math.max(
+      routePointCount,
+      item.matchedPointCount,
+      item.routeMatchSummary?.matchedPointCount ?? 0,
+    );
+    const sparseMatchedPath = routePointCount <= 3 || item.matchedPointCount <= 3;
+    const rawHasMoreDetail = item.rawTelemetry.length >= Math.max(4, routePointCount + 2);
+    const matchedDistanceKm = Math.max(0, item.totalDistanceMatchedMeters / 1000);
+    const rawDistanceKm = Math.max(0, item.totalDistanceRawMeters / 1000);
+    const matchedLooksTooShort =
+      rawDistanceKm > 0.02 &&
+      matchedDistanceKm > 0 &&
+      matchedDistanceKm < rawDistanceKm * 0.72;
+    const hasEndConnectorHint = item.dashedEndConnector.length === 2 && routePointCount <= 4;
+    const shortTripWithLowDetail =
+      matchedDistanceKm <= SHORT_TRIP_ROUTE_REPAIR_MAX_DISTANCE_KM &&
+      routePointCount <= SHORT_TRIP_ROUTE_REPAIR_MAX_POINTS;
+    const overSmoothedRemoteMatch =
+      hasRemoteMatchedRoute &&
+      expectedMatchedPointCount >= OVER_SMOOTHED_REMOTE_ROUTE_MIN_EXPECTED_POINTS &&
+      (routePointCount + 3 <= expectedMatchedPointCount ||
+        (matchedDistanceKm >= 0.12 && routePointCount <= SHORT_TRIP_ROUTE_REPAIR_MAX_POINTS));
+
+    if (hasRemoteMatchedRoute && !overSmoothedRemoteMatch && !rawHasMoreDetail) {
+      return false;
+    }
+
+    return (
+      (hasLocalFallbackRoute && item.rawTelemetry.length > 1) ||
+      (hasLegacyOrsRoute && item.rawTelemetry.length > 1) ||
+      (hasOsrmRouteFallback && item.rawTelemetry.length > 1) ||
+      overSmoothedRemoteMatch ||
+      sparseMatchedPath ||
+      hasEndConnectorHint ||
+      rawHasMoreDetail ||
+      matchedLooksTooShort ||
+      shortTripWithLowDetail
+    );
+  };
+
+  const buildTripEndpointSeedPath = (item: TripHistoryItem) =>
+    dedupeSequentialRoutePoints(
+      [
+        item.startLocationMatched ?? item.startLocationRaw ?? item.rawStartPoint ?? null,
+        item.endLocationMatched ?? item.endLocationRaw ?? null,
+      ].filter(
+        (
+          point,
+        ): point is {
+          latitude: number;
+          longitude: number;
+        } => Boolean(point),
+      ),
+    );
+
+  const shouldPreferFallbackRoutePath = (
+    fallbackTrip: TripHistoryItem | undefined,
+    serverRoutePath: Array<{ latitude: number; longitude: number }>,
+  ) => {
+    if (!fallbackTrip || fallbackTrip.routePath.length < 2) {
+      return false;
+    }
+
+    if (serverRoutePath.length < 2) {
+      return true;
+    }
+
+    const fallbackStart = fallbackTrip.routePath[0];
+    const fallbackEnd = fallbackTrip.routePath.at(-1);
+    const serverStart = serverRoutePath[0];
+    const serverEnd = serverRoutePath.at(-1);
+    if (!fallbackStart || !fallbackEnd || !serverStart || !serverEnd) {
+      return false;
+    }
+
+    const endpointsAlign =
+      distanceBetweenKm(fallbackStart, serverStart) <= TRIP_ROUTE_ENDPOINT_MATCH_MAX_DISTANCE_KM &&
+      distanceBetweenKm(fallbackEnd, serverEnd) <= TRIP_ROUTE_ENDPOINT_MATCH_MAX_DISTANCE_KM;
+
+    if (!endpointsAlign) {
+      return false;
+    }
+
+    return (
+      fallbackTrip.routePath.length > serverRoutePath.length ||
+      fallbackTrip.matchedPointCount > serverRoutePath.length
+    );
+  };
+
+  const hasMaterialRouteRepair = (
+    currentPath: Array<{ latitude: number; longitude: number }>,
+    repairedPath: Array<{ latitude: number; longitude: number }>,
+  ) => {
+    if (repairedPath.length < 2) {
+      return false;
+    }
+
+    if (currentPath.length < 2) {
+      return true;
+    }
+
+    const pointCountGain = repairedPath.length - currentPath.length;
+    const currentDistanceKm = polylineDistanceKm(currentPath);
+    const repairedDistanceKm = polylineDistanceKm(repairedPath);
+    const startShiftKm = distanceBetweenKm(currentPath[0], repairedPath[0]);
+    const endShiftKm = distanceBetweenKm(currentPath.at(-1)!, repairedPath.at(-1)!);
+
+    return (
+      pointCountGain >= 2 ||
+      Math.abs(repairedDistanceKm - currentDistanceKm) > Math.max(0.015, currentDistanceKm * 0.25) ||
+      startShiftKm > 0.01 ||
+      endShiftKm > 0.01
+    );
+  };
+
+  const repairTripHistoryItemRoute = async (
+    item: TripHistoryItem,
+    targetDriverId: number | null,
+  ) => {
+    const telemetryPath = dedupeSequentialRoutePoints(
+      item.rawTelemetry.map((point) => ({
+        latitude: point.latitude,
+        longitude: point.longitude,
+      })),
+    );
+
+    let candidatePath =
+      item.routePath.length > 1
+        ? item.routePath
+        : telemetryPath;
+    const endpointSeedPath = buildTripEndpointSeedPath(item);
+
+    let reconstructionRouteMatchSummary: TripRouteMatchSummary | null = null;
+
+    if (telemetryPath.length > 1) {
+      const reconstruction = await reconstructCompletedTripPath(item.rawTelemetry);
+      reconstructionRouteMatchSummary = reconstruction.routeMatchMetadata ?? null;
+      const reconstructedPath = normalizeSavedRoutePath(
+        reconstruction.reconstructedPath,
+        telemetryPath,
+        {
+          preserveDetailedGeometry: shouldPreserveDetailedRouteGeometry(
+            reconstruction.routeMatchMetadata,
+          ),
+        },
+      );
+      if (reconstructedPath.length > 1) {
+        candidatePath = reconstructedPath;
+      } else if (telemetryPath.length > 1) {
+        candidatePath = telemetryPath;
+      }
+    }
+
+    const isShortLowDetailRoute =
+      Math.max(0, item.totalDistanceMatchedMeters / 1000) <= SHORT_TRIP_ROUTE_REPAIR_MAX_DISTANCE_KM &&
+      item.routePath.length <= SHORT_TRIP_ROUTE_REPAIR_MAX_POINTS;
+    if (
+      endpointSeedPath.length > 1 &&
+      (!item.rawTelemetry.length || isShortLowDetailRoute || candidatePath.length <= 3)
+    ) {
+      candidatePath = endpointSeedPath;
+    }
+
+    const preferredRepairRouteMatchSummary = pickPreferredRouteMatchSummary(
+      reconstructionRouteMatchSummary,
+      item.routeMatchSummary,
+    );
+    const trustCandidateRepairGeometry =
+      candidatePath.length > 1 &&
+      (shouldPreserveDetailedRouteGeometry(preferredRepairRouteMatchSummary) ||
+        telemetryPath.length > 1);
+    const fallbackPath =
+      telemetryPath.length > 1
+        ? telemetryPath
+        : endpointSeedPath.length > 1
+          ? endpointSeedPath
+          : item.routePath;
+    const roadAlignmentResult = await buildRoadAlignedRoutePathDetailed({
+      candidatePath,
+      fallbackPath,
+      preserveDetailedGeometry: shouldPreserveDetailedRouteGeometry(
+        preferredRepairRouteMatchSummary,
+      ),
+      trustCandidateGeometry: trustCandidateRepairGeometry,
+    });
+    const repairedRoutePath = roadAlignmentResult.path ?? fallbackPath;
+    const repairedEndpointState = await resolveFinalizedTripEndpointState({
+      routePath: repairedRoutePath,
+      rawEndPoint: item.endLocationRaw ?? item.rawTelemetry.at(-1) ?? null,
+    });
+    const repairedStartEndpointState = await resolveFinalizedTripStartEndpointState({
+      routePath: repairedRoutePath,
+      rawStartPoint: item.startLocationRaw ?? item.rawStartPoint,
+    });
+
+    const repairedMatchedStartPoint =
+      repairedStartEndpointState.matchedStartPoint ?? repairedRoutePath[0] ?? item.startLocationMatched;
+    const repairedMatchedEndPoint =
+      repairedEndpointState.matchedEndPoint ?? repairedRoutePath.at(-1) ?? item.endLocationMatched;
+    const repairedLocationLabels = await resolveTripDisplayLocationLabels({
+      matchedStartPoint: repairedMatchedStartPoint,
+      matchedEndPoint: repairedMatchedEndPoint,
+      routePath: repairedRoutePath,
+      filteredStartPoint: item.startLocationRaw ?? item.rawStartPoint,
+      filteredEndPoint: item.endLocationRaw ?? item.rawTelemetry.at(-1) ?? null,
+    });
+
+    const repairedRouteMatchSummary: TripRouteMatchSummary | null =
+      pickPreferredRouteMatchSummary(
+        roadAlignmentResult.metadata ?? null,
+        preferredRepairRouteMatchSummary,
+      )
+        ? {
+            ...pickPreferredRouteMatchSummary(
+              roadAlignmentResult.metadata ?? null,
+              preferredRepairRouteMatchSummary,
+            )!,
+            matchedPointCount: repairedRoutePath.length,
+            distanceMeters: polylineDistanceKm(repairedRoutePath) * 1000,
+          }
+        : null;
+    const replacedLegacyRouteProvider =
+      (item.routeMatchSummary?.provider === 'ors-directions' ||
+        item.routeMatchSummary?.provider === 'osrm-route') &&
+      repairedRouteMatchSummary?.provider !== item.routeMatchSummary.provider &&
+      repairedRouteMatchSummary !== null;
+
+    if (!hasMaterialRouteRepair(item.routePath, repairedRoutePath) && !replacedLegacyRouteProvider) {
+      return null;
+    }
+
+    const repairedItem = normalizeTripHistoryItem({
+      ...item,
+      routePath: repairedRoutePath,
+      startLocationMatched: repairedMatchedStartPoint,
+      endLocationMatched: repairedMatchedEndPoint,
+      startDisplayName: repairedLocationLabels.startDisplayName,
+      endDisplayName: repairedLocationLabels.endDisplayName,
+      startCoordinate: repairedLocationLabels.startCoordinate,
+      endCoordinate: repairedLocationLabels.endCoordinate,
+      matchedPointCount: repairedRoutePath.length,
+      totalDistanceMatchedMeters: polylineDistanceKm(repairedRoutePath) * 1000,
+      distance: undefined,
+      routeTraceGeoJson: undefined,
+      dashedStartConnector:
+        repairedStartEndpointState.dashedStartConnector.length > 0
+          ? repairedStartEndpointState.dashedStartConnector
+          : undefined,
+      dashedEndConnector:
+        repairedEndpointState.dashedEndConnector.length > 0
+          ? repairedEndpointState.dashedEndConnector
+          : undefined,
+      routeMatchSummary: repairedRouteMatchSummary,
+    });
+
+    if (targetDriverId !== null && item.syncStatus === 'SYNCED') {
+      const serverTripId = parseServerTripIdFromHistoryId(item.id);
+      if (serverTripId !== null) {
+        const repairResult = await replaceTripRouteFallback({
+          tripId: serverTripId,
+          driverId: targetDriverId,
+          routePoints: repairedRoutePath,
+          startedAt: item.startedAt,
+          localTripId: `repair-trip-${serverTripId}`,
+          routeMatchSummary: repairedRouteMatchSummary,
+          rawEndPoint: item.endLocationRaw ?? null,
+          matchedEndPoint: repairedMatchedEndPoint,
+          startDisplayName: repairedLocationLabels.startDisplayName,
+          startCoordinate: repairedLocationLabels.startCoordinate,
+          endDisplayName: repairedLocationLabels.endDisplayName,
+          endCoordinate: repairedLocationLabels.endCoordinate,
+          dashedEndConnector: repairedEndpointState.dashedEndConnector,
+          endpointSelectionSummary: repairedEndpointState.endpointSelectionSummary,
+        });
+
+        if (repairResult.error) {
+          console.warn('[TripRouteRepair] Failed to persist repaired fallback route.', {
+            tripId: item.id,
+            error: repairResult.error,
+          });
+        }
+      }
+    }
+
+    return repairedItem;
   };
 
   const mapTripRecordToHistoryItem = (
     trip: {
       id: string | number;
       trip_date: string;
+      started_at?: string | null;
+      ended_at?: string | null;
       duration_seconds?: number | null;
       distance_km?: number | null;
       fare?: number | null;
       status: string;
       route_points?: Array<{ latitude: number; longitude: number }>;
+      raw_start_point?: { latitude: number; longitude: number } | null;
+      route_trace_geojson?: { type: 'LineString'; coordinates: number[][] } | null;
+      trip_metrics?: Record<string, unknown> | null;
+      gps_quality_summary?: Record<string, unknown> | null;
+      raw_gps_point_count?: number | null;
+      matched_point_count?: number | null;
+      start_location_raw?: { latitude: number; longitude: number } | null;
+      start_location_matched?: { latitude: number; longitude: number } | null;
+      end_location_raw?: { latitude: number; longitude: number } | null;
+      end_location_matched?: { latitude: number; longitude: number } | null;
+      start_display_name?: string | null;
+      end_display_name?: string | null;
+      start_coordinate?: { latitude: number; longitude: number } | null;
+      end_coordinate?: { latitude: number; longitude: number } | null;
+      dashed_start_connector?: Array<{ latitude: number; longitude: number }> | null;
+      dashed_end_connector?: Array<{ latitude: number; longitude: number }> | null;
+      sync_status?: string | null;
+      raw_telemetry?: RawTripTelemetryPoint[];
     },
-    fallbackRoutePath: Array<{ latitude: number; longitude: number }> = [],
+    fallbackTrip?: TripHistoryItem,
   ): TripHistoryItem => {
-    const mins = Math.floor((trip.duration_seconds ?? 0) / 60);
-    const secs = (trip.duration_seconds ?? 0) % 60;
-    const durationLabel = mins > 0 ? `${mins} min` : `${secs} sec`;
     const idSuffix = String(trip.id).split('-')[0]?.toUpperCase() ?? String(trip.id);
-    return {
+    const fallbackRoutePath = fallbackTrip?.routePath ?? [];
+    const serverRouteMatchSummary =
+      ((trip.trip_metrics as { routeMatchSummary?: TripRouteMatchSummary | null } | null)
+        ?.routeMatchSummary) ?? null;
+    const preserveDetailedServerRoute = shouldPreserveDetailedRouteGeometry(
+      serverRouteMatchSummary,
+    );
+    const preserveDetailedFallbackRoute = shouldPreserveDetailedRouteGeometry(
+      fallbackTrip?.routeMatchSummary,
+    );
+    const serverRoutePath = normalizeSavedRoutePath(trip.route_points ?? [], [], {
+      preserveDetailedGeometry: preserveDetailedServerRoute,
+    });
+    const serverGeoJsonRoutePath = normalizeSavedRoutePath(
+      normalizeGeoJsonRoutePath(trip.route_trace_geojson ?? null),
+      serverRoutePath,
+      {
+        preserveDetailedGeometry: preserveDetailedServerRoute,
+      },
+    );
+    const shouldTrustAuthoritativeServerRoute =
+      trip.sync_status !== 'SYNC_PENDING' &&
+      serverGeoJsonRoutePath.length > 1 &&
+      preserveDetailedServerRoute;
+    const preferredFallbackRoutePath = normalizeSavedRoutePath(
+      fallbackRoutePath,
+      serverRoutePath,
+      {
+        preserveDetailedGeometry: preserveDetailedFallbackRoute,
+      },
+    );
+    const preferredServerRoutePath = normalizeSavedRoutePath(
+      serverRoutePath,
+      fallbackRoutePath,
+      {
+        preserveDetailedGeometry: preserveDetailedServerRoute,
+      },
+    );
+    const routePath =
+      shouldTrustAuthoritativeServerRoute
+        ? serverGeoJsonRoutePath
+        : shouldPreferFallbackRoutePath(fallbackTrip, serverRoutePath)
+          ? preferredFallbackRoutePath
+          : preferredServerRoutePath;
+    return buildTripHistoryItem({
       id: `TRIP-${idSuffix}`,
       tripDate: trip.trip_date,
-      duration: durationLabel,
-      distance: `${Number(trip.distance_km ?? 0).toFixed(2)} km`,
-      fare: `\u20B1${Number(trip.fare ?? 0).toFixed(2)}`,
-      violations: '0',
+      fare: Number(trip.fare ?? fallbackTrip?.fareAmount ?? 0),
+      durationSeconds: Number(trip.duration_seconds ?? 0),
+      startedAt: trip.started_at ?? fallbackTrip?.startedAt ?? null,
+      endedAt: trip.ended_at ?? fallbackTrip?.endedAt ?? null,
+      distanceKm:
+        typeof trip.distance_km === 'number' && Number.isFinite(trip.distance_km)
+          ? trip.distance_km
+          : typeof fallbackTrip?.totalDistanceMatchedMeters === 'number'
+            ? fallbackTrip.totalDistanceMatchedMeters / 1000
+            : null,
+      matchedRoutePath: routePath,
+      rawTelemetry: trip.raw_telemetry && trip.raw_telemetry.length > 0
+        ? trip.raw_telemetry
+        : fallbackTrip?.rawTelemetry ?? [],
+      rawStartPoint:
+        trip.start_location_raw ?? trip.raw_start_point ?? fallbackTrip?.rawStartPoint ?? null,
+      rawEndPoint: trip.end_location_raw ?? fallbackTrip?.endLocationRaw ?? routePath.at(-1) ?? null,
+      matchedStartPoint:
+        trip.start_location_matched ?? fallbackTrip?.startLocationMatched ?? routePath[0] ?? null,
+      matchedEndPoint:
+        trip.end_location_matched ?? fallbackTrip?.endLocationMatched ?? routePath.at(-1) ?? null,
+      startDisplayName:
+        trip.start_display_name ?? fallbackTrip?.startDisplayName ?? null,
+      endDisplayName:
+        trip.end_display_name ?? fallbackTrip?.endDisplayName ?? null,
+      startCoordinate:
+        trip.start_coordinate ?? fallbackTrip?.startCoordinate ?? null,
+      endCoordinate:
+        trip.end_coordinate ?? fallbackTrip?.endCoordinate ?? null,
+      dashedStartConnector:
+        trip.dashed_start_connector ?? fallbackTrip?.dashedStartConnector ?? [],
+      dashedEndConnector:
+        trip.dashed_end_connector ??
+        (shouldTrustAuthoritativeServerRoute ? [] : fallbackTrip?.dashedEndConnector ?? []),
       status: trip.status === 'ONGOING' ? 'ONGOING' : 'COMPLETED',
-      compliance: 100,
-      routePath: normalizeSavedRoutePath(trip.route_points ?? [], fallbackRoutePath),
-    };
+      syncStatus: trip.sync_status === 'SYNC_PENDING' ? 'SYNC_PENDING' : 'SYNCED',
+      tripState: trip.status === 'ONGOING' ? 'ON_ROAD' : 'SYNCED',
+      driverName: profileName,
+      driverCode: profileDriverCode,
+      vehiclePlateNumber: profilePlateNumber,
+      routeName: fallbackTrip?.routeName ?? null,
+      gpsQualitySummary:
+        (trip.gps_quality_summary as TripGpsQualitySummary | null | undefined) ??
+        fallbackTrip?.gpsQualitySummary ??
+        null,
+      routeTraceGeoJson: trip.route_trace_geojson ?? fallbackTrip?.routeTraceGeoJson ?? null,
+      rawGpsPointCount:
+        typeof trip.raw_gps_point_count === 'number'
+          ? trip.raw_gps_point_count
+          : fallbackTrip?.rawGpsPointCount,
+      matchedPointCount:
+        typeof trip.matched_point_count === 'number'
+          ? trip.matched_point_count
+          : fallbackTrip?.matchedPointCount,
+      routeMatchSummary: pickPreferredRouteMatchSummary(
+        serverRouteMatchSummary,
+        fallbackTrip?.routeMatchSummary ?? null,
+      ),
+    });
   };
+
+  const buildTripPointDedupKey = ({
+    tripId,
+    recordedAt,
+    latitude,
+    longitude,
+  }: {
+    tripId: number;
+    recordedAt: string;
+    latitude: number;
+    longitude: number;
+  }) => `trip-point:${tripId}:${recordedAt}:${latitude.toFixed(6)}:${longitude.toFixed(6)}`;
 
   useEffect(() => {
     tripHistoryRef.current = tripHistory;
   }, [tripHistory]);
+
+  useEffect(() => {
+    tripHistoryHydratedRef.current = tripHistoryHydrated;
+  }, [tripHistoryHydrated]);
+
+  useEffect(() => {
+    if (!tripHistoryHydrated) {
+      return;
+    }
+
+    const nextTripHistory = tripHistoryRef.current.filter((item) => !isLegacyDummyTrip45(item));
+    if (nextTripHistory.length === tripHistoryRef.current.length) {
+      return;
+    }
+
+    setTripHistory(nextTripHistory);
+    const totals = computeTripTotals(nextTripHistory);
+    setTotalEarnings(totals.earnings);
+    setTotalTrips(totals.trips);
+    setTotalDistanceKm(totals.distance);
+    setTotalMinutes(totals.minutes);
+  }, [tripHistoryHydrated, tripHistory]);
+
+  useEffect(() => {
+    driverDbIdRef.current = driverDbId;
+  }, [driverDbId]);
+
+  useEffect(() => {
+    tripRouteRepairAttemptedIdsRef.current = new Set();
+    tripRouteRepairInFlightRef.current = false;
+  }, [driverDbId]);
+
+  useEffect(() => {
+    isDriverOnlineRef.current = isDriverOnline;
+  }, [isDriverOnline]);
+
+  useEffect(() => {
+    const wasDriverOnline = previousDriverOnlineRef.current;
+    previousDriverOnlineRef.current = isDriverOnline;
+
+    if (wasDriverOnline && !isDriverOnline && driverDbId !== null) {
+      void setDriverPresenceOffline(driverDbId);
+    }
+  }, [driverDbId, isDriverOnline]);
 
   const pushNotification = ({ category, title, message, icon }: NotificationDraft) => {
     setNotifications((prev) => [
@@ -399,6 +1422,282 @@ export default function App() {
       },
       ...prev,
     ].slice(0, 60));
+  };
+
+  const refreshTripHistoryFromBackend = async (targetDriverId: number) => {
+    const { trips, error } = await listTripsWithRoutePoints(targetDriverId, 250);
+    if (error) {
+      return null;
+    }
+
+    const previousRoutesById = new Map(
+      tripHistoryRef.current.map((item) => [item.id, item]),
+    );
+    const mapped: TripHistoryItem[] = trips.map((trip) =>
+      mapTripRecordToHistoryItem(
+        trip,
+        previousRoutesById.get(
+          `TRIP-${String(trip.id).split('-')[0]?.toUpperCase() ?? String(trip.id)}`,
+        ),
+      ),
+    );
+
+    const mergedHistory = reconcileSyncedTripHistoryItems(tripHistoryRef.current, mapped);
+    tripHistoryRef.current = mergedHistory;
+    setTripHistory(mergedHistory);
+    const totals = computeTripTotals(mergedHistory);
+    setTotalEarnings(totals.earnings);
+    setTotalTrips(totals.trips);
+    setTotalDistanceKm(totals.distance);
+    setTotalMinutes(totals.minutes);
+    return mergedHistory;
+  };
+
+  const repairTripHistoryRoutes = async ({
+    items = tripHistoryRef.current,
+    targetDriverId = driverDbId,
+    maxCount = MAX_TRIP_ROUTE_REPAIRS_PER_PASS,
+  }: {
+    items?: TripHistoryItem[];
+    targetDriverId?: number | null;
+    maxCount?: number;
+  } = {}) => {
+    if (
+      !tripHistoryHydratedRef.current ||
+      items.length === 0 ||
+      tripRouteRepairInFlightRef.current ||
+      !isNetworkAvailableRef.current
+    ) {
+      return 0;
+    }
+
+    const candidates = items
+      .filter(
+        (item) =>
+          shouldAttemptTripRouteRepair(item) &&
+          !tripRouteRepairAttemptedIdsRef.current.has(item.id),
+      )
+      .slice(0, maxCount);
+
+    if (candidates.length === 0) {
+      return 0;
+    }
+
+    for (const item of candidates) {
+      tripRouteRepairAttemptedIdsRef.current.add(item.id);
+    }
+
+    tripRouteRepairInFlightRef.current = true;
+    try {
+      const repairedItems: TripHistoryItem[] = [];
+
+      for (const item of candidates) {
+        const repairedItem = await repairTripHistoryItemRoute(item, targetDriverId ?? null);
+        if (repairedItem) {
+          repairedItems.push(repairedItem);
+        }
+      }
+
+      if (repairedItems.length === 0) {
+        return 0;
+      }
+
+      setTripHistory((prev) => {
+        const merged = upsertTripHistoryItems(prev, repairedItems);
+        const totals = computeTripTotals(merged);
+        setTotalEarnings(totals.earnings);
+        setTotalTrips(totals.trips);
+        setTotalDistanceKm(totals.distance);
+        setTotalMinutes(totals.minutes);
+        return merged;
+      });
+
+      return repairedItems.length;
+    } finally {
+      tripRouteRepairInFlightRef.current = false;
+    }
+  };
+
+  const promoteOfflineHistoryItemToServerTrip = ({
+    sourceHistoryId,
+    localTripId,
+    serverTripId,
+    routePath,
+    routeMatchSummary,
+    startDisplayName,
+    endDisplayName,
+    startCoordinate,
+    endCoordinate,
+  }: {
+    sourceHistoryId?: string | null;
+    localTripId: string;
+    serverTripId: number;
+    routePath?: Array<{ latitude: number; longitude: number }>;
+    routeMatchSummary?: TripRouteMatchSummary | null;
+    startDisplayName?: string | null;
+    endDisplayName?: string | null;
+    startCoordinate?: { latitude: number; longitude: number } | null;
+    endCoordinate?: { latitude: number; longitude: number } | null;
+  }) => {
+    const localHistoryId = `TRIP-${localTripId}`;
+    const serverHistoryId = `TRIP-${serverTripId}`;
+
+    setTripHistory((prev) => {
+      const sourceItem =
+        (sourceHistoryId ? prev.find((item) => item.id === sourceHistoryId) : null) ??
+        prev.find((item) => item.id === localHistoryId) ??
+        prev.find((item) => item.id === serverHistoryId && item.syncStatus === 'SYNC_PENDING') ??
+        null;
+      if (!sourceItem) {
+        return prev;
+      }
+
+      const resolvedRoutePath = routePath ?? sourceItem.routePath;
+      const promotedItem = normalizeTripHistoryItem({
+        ...sourceItem,
+        id: serverHistoryId,
+        routePath: resolvedRoutePath,
+        matchedPointCount: Math.max(resolvedRoutePath.length, sourceItem.matchedPointCount),
+        totalDistanceMatchedMeters:
+          resolvedRoutePath.length > 0
+            ? polylineDistanceKm(resolvedRoutePath) * 1000
+            : sourceItem.totalDistanceMatchedMeters,
+        routeMatchSummary: pickPreferredRouteMatchSummary(
+          routeMatchSummary ?? null,
+          sourceItem.routeMatchSummary,
+        ),
+        startDisplayName: startDisplayName ?? sourceItem.startDisplayName,
+        endDisplayName: endDisplayName ?? sourceItem.endDisplayName,
+        startCoordinate: startCoordinate ?? sourceItem.startCoordinate,
+        endCoordinate: endCoordinate ?? sourceItem.endCoordinate,
+        syncStatus: 'SYNCED',
+        tripState: 'SYNCED',
+      });
+
+      const nextItems = prev.filter((item) => {
+        if (item.syncStatus !== 'SYNC_PENDING') {
+          return true;
+        }
+
+        return (
+          item.id !== localHistoryId &&
+          item.id !== serverHistoryId &&
+          item.id !== sourceHistoryId
+        );
+      });
+      const merged = upsertTripHistoryItems(nextItems, [promotedItem]);
+      tripHistoryRef.current = merged;
+      const totals = computeTripTotals(merged);
+      setTotalEarnings(totals.earnings);
+      setTotalTrips(totals.trips);
+      setTotalDistanceKm(totals.distance);
+      setTotalMinutes(totals.minutes);
+      return merged;
+    });
+  };
+
+  useEffect(() => {
+    if (!tripHistoryHydrated || tripHistory.length === 0) {
+      return;
+    }
+
+    const legacyFallbackRouteTripIds = tripHistory
+      .filter(
+        (item) =>
+          item.routeMatchSummary?.provider === 'ors-directions' ||
+          item.routeMatchSummary?.provider === 'osrm-route',
+      )
+      .map((item) => item.id);
+    if (legacyFallbackRouteTripIds.length > 0 && !hasRetriedLegacyOrsRouteConversionRef.current) {
+      hasRetriedLegacyOrsRouteConversionRef.current = true;
+      for (const tripId of legacyFallbackRouteTripIds) {
+        tripRouteRepairAttemptedIdsRef.current.delete(tripId);
+      }
+    } else if (legacyFallbackRouteTripIds.length === 0) {
+      hasRetriedLegacyOrsRouteConversionRef.current = false;
+    }
+
+    void (async () => {
+      await repairTripHistoryRoutes({
+        items: tripHistory,
+        targetDriverId: driverDbId,
+      });
+    })();
+  }, [driverDbId, tripHistory, tripHistoryHydrated]);
+
+  const refreshViolationItems = async (targetDriverId: number) => {
+    const { violations, error } = await listViolations(targetDriverId);
+    if (error) {
+      return;
+    }
+    setViolationItems(violations.map(mapViolationRecordToItem));
+  };
+
+  const syncDriverPresenceLocation = async (
+    location: Location.LocationObject | (Location.LocationObjectCoords & { timestamp?: number }),
+    options?: { maxAccuracyMeters?: number },
+  ) => {
+    if (driverDbIdRef.current === null || !profileDriverCode) {
+      return null;
+    }
+
+    const coords = 'coords' in location ? location.coords : location;
+    const timestamp =
+      'timestamp' in location && typeof location.timestamp === 'number'
+        ? location.timestamp
+        : Date.now();
+    const accuracy =
+      typeof coords.accuracy === 'number' && Number.isFinite(coords.accuracy)
+        ? coords.accuracy
+        : null;
+    const maxAccuracyMeters = options?.maxAccuracyMeters ?? MAX_LIVE_SYNC_ACCURACY_METERS;
+
+    if (accuracy !== null && accuracy > maxAccuracyMeters) {
+      return null;
+    }
+
+    const nextPoint = {
+      latitude: coords.latitude,
+      longitude: coords.longitude,
+    };
+    const previousPoint = lastLiveSyncPointRef.current;
+    const previousTimestamp = lastLiveSyncTimestampRef.current;
+    if (previousPoint && previousTimestamp !== null) {
+      const jumpKm = distanceBetweenKm(previousPoint, nextPoint);
+      const elapsedSec = Math.max((timestamp - previousTimestamp) / 1000, 0);
+      if (jumpKm > MAX_LIVE_SYNC_JUMP_KM && elapsedSec <= 3) {
+        return null;
+      }
+    }
+
+    const { error } = await upsertDriverLocation({
+      driverId: driverDbIdRef.current,
+      driverCode: profileDriverCode,
+      latitude: nextPoint.latitude,
+      longitude: nextPoint.longitude,
+      speed: coords.speed ?? null,
+      heading: coords.heading ?? null,
+      accuracy,
+      recordedAt: timestamp ? new Date(timestamp).toISOString() : undefined,
+    });
+
+    if (!error) {
+      lastLiveSyncPointRef.current = nextPoint;
+      lastLiveSyncTimestampRef.current = timestamp;
+    }
+
+    return error;
+  };
+
+  const setDriverPresenceOffline = async (driverId: number | null) => {
+    if (driverId === null) {
+      return;
+    }
+
+    const { error } = await setDriverLocationOffline(driverId);
+    if (error) {
+      console.warn('Driver offline sync failed:', error);
+    }
   };
 
   const markNotificationRead = (notificationId: string) => {
@@ -536,22 +1835,149 @@ export default function App() {
     setScreen('home');
   };
 
-  const syncOfflineTripPoints = async () => {
+  const refreshOfflineQueueStatus = async (
+    overrides: Partial<OfflineQueueStatus> = {},
+  ) => {
+    try {
+      await initOfflineTripStorage();
+      const [pendingSessions, pendingGpsPoints, pendingMatchedPoints] = await Promise.all([
+        getPendingOfflineTripSessions(1000),
+        getUnsyncedOfflineTripPoints(10000),
+        getUnsyncedOfflineMatchedTripPoints(10000),
+      ]);
+
+      setOfflineQueueStatus((current) => ({
+        ...current,
+        pendingTripCount: pendingSessions.length,
+        pendingGpsPointCount: pendingGpsPoints.length,
+        pendingMatchedPointCount: pendingMatchedPoints.length,
+        ...overrides,
+      }));
+    } catch (error) {
+      setOfflineQueueStatus((current) => ({
+        ...current,
+        ...overrides,
+        lastError:
+          overrides.lastError ??
+          (error instanceof Error ? error.message : 'Offline queue status unavailable.'),
+      }));
+    }
+  };
+
+  const syncOfflineTripPoints = async (targetLocalTripId?: string | null) => {
     if (isSyncingOfflineTripPointsRef.current || !hasSupabaseConfig) {
-      return;
+      const error = isSyncingOfflineTripPointsRef.current
+        ? 'sync-in-progress'
+        : 'supabase-not-configured';
+      setOfflineQueueStatus((current) => ({
+        ...current,
+        lastError: error,
+      }));
+      return {
+        ok: false,
+        error,
+        syncedLocalTripIds: [] as string[],
+      };
     }
 
     isSyncingOfflineTripPointsRef.current = true;
+    const syncStartedAt = new Date().toISOString();
+    let finalQueueStatusOverrides: Partial<OfflineQueueStatus> = {
+      isSyncing: false,
+      lastAttemptAt: syncStartedAt,
+    };
+    setOfflineQueueStatus((current) => ({
+      ...current,
+      isSyncing: true,
+      lastAttemptAt: syncStartedAt,
+      lastError: null,
+    }));
     try {
+      await initOfflineTripStorage();
+      let shouldRefreshTripHistoryAfterSync = false;
+      const syncedLocalTripIds: string[] = [];
+      const failTripSync = (message: string): never => {
+        throw new Error(message);
+      };
+      const scheduleOfflineSyncRetry = () => {
+        if (offlineSyncRetryTimeoutRef.current) {
+          clearTimeout(offlineSyncRetryTimeoutRef.current);
+        }
+        const retryDelay = offlineSyncRetryDelayMsRef.current;
+        const nextRetryAt = new Date(Date.now() + retryDelay).toISOString();
+        setOfflineQueueStatus((current) => ({
+          ...current,
+          nextRetryAt,
+        }));
+        offlineSyncRetryTimeoutRef.current = setTimeout(() => {
+          offlineSyncRetryTimeoutRef.current = null;
+          void syncOfflineTripPoints();
+        }, retryDelay);
+        offlineSyncRetryDelayMsRef.current = Math.min(
+          retryDelay * 2,
+          OFFLINE_SYNC_RETRY_MAX_MS,
+        );
+      };
+      const ensureServerTripForLocalRows = async ({
+        localTripId,
+        currentServerTripId,
+        driverId,
+        fallbackStartPoint,
+      }: {
+        localTripId: string;
+        currentServerTripId: number | null;
+        driverId: number;
+        fallbackStartPoint?: { latitude: number; longitude: number } | null;
+      }) => {
+        if (currentServerTripId) {
+          const { exists, error } = await checkTripExists(currentServerTripId);
+          if (error) {
+            failTripSync(error);
+          }
+          if (exists) {
+            return currentServerTripId;
+          }
+        }
+
+        const session = await getOfflineTripSession(localTripId);
+        const startLatitude = session?.start_latitude ?? fallbackStartPoint?.latitude ?? undefined;
+        const startLongitude = session?.start_longitude ?? fallbackStartPoint?.longitude ?? undefined;
+        const { tripId, error } = await startTrip(driverId, startLatitude, startLongitude);
+        if (error || !tripId) {
+          failTripSync(error ?? `The server did not recreate trip ${localTripId}.`);
+        }
+
+        const parsedTripId = Number(tripId);
+        if (!Number.isFinite(parsedTripId)) {
+          failTripSync(`The server returned an invalid trip id (${tripId}).`);
+        }
+
+        await markOfflineTripSessionStartedSynced(localTripId, parsedTripId);
+        await attachServerTripIdToOfflineTrip(localTripId, parsedTripId);
+        shouldRefreshTripHistoryAfterSync = true;
+        return parsedTripId;
+      };
+
       while (true) {
-        const sessions = await getPendingOfflineTripSessions(100);
+        const sessions = (await getPendingOfflineTripSessions(100)).filter((session) =>
+          targetLocalTripId ? session.local_trip_id === targetLocalTripId : true,
+        );
         if (sessions.length === 0) {
           break;
         }
 
-        let sessionSyncFailed = false;
         for (const session of sessions) {
           let serverTripId = session.server_trip_id;
+
+          if (serverTripId && session.start_synced === 1) {
+            const { exists, error } = await checkTripExists(serverTripId);
+            if (error) {
+              failTripSync(error);
+            }
+            if (!exists) {
+              serverTripId = null;
+            }
+          }
 
           if (!serverTripId || session.start_synced === 0) {
             const { tripId, error } = await startTrip(
@@ -561,19 +1987,21 @@ export default function App() {
             );
 
             if (error || !tripId) {
-              sessionSyncFailed = true;
-              break;
+              failTripSync(
+                error ??
+                  `The server did not create a trip for local trip ${session.local_trip_id}.`,
+              );
             }
 
             const parsedTripId = Number(tripId);
             if (!Number.isFinite(parsedTripId)) {
-              sessionSyncFailed = true;
-              break;
+              failTripSync(`The server returned an invalid trip id (${tripId}).`);
             }
 
             serverTripId = parsedTripId;
             await markOfflineTripSessionStartedSynced(session.local_trip_id, parsedTripId);
             await attachServerTripIdToOfflineTrip(session.local_trip_id, parsedTripId);
+            shouldRefreshTripHistoryAfterSync = true;
             if (session.local_trip_id === activeLocalTripId) {
               setActiveTripDbId(String(parsedTripId));
             }
@@ -582,8 +2010,7 @@ export default function App() {
               parsedTripId,
             );
             if (routeAttachResult.error) {
-              sessionSyncFailed = true;
-              break;
+              failTripSync(routeAttachResult.error);
             }
           }
 
@@ -591,7 +2018,11 @@ export default function App() {
             continue;
           }
 
-          const tripPoints = await getOfflineTripPointsByLocalTripId(session.local_trip_id);
+          const [tripPoints, matchedTripPoints, tripStatusEvents] = await Promise.all([
+            getOfflineTripPointsByLocalTripId(session.local_trip_id),
+            getOfflineMatchedTripPointsByLocalTripId(session.local_trip_id),
+            getOfflineTripStatusEventsByLocalTripId(session.local_trip_id),
+          ]);
           const reconstruction = await reconstructCompletedTripPath(
             tripPoints.map((point) => ({
               latitude: point.latitude,
@@ -607,47 +2038,222 @@ export default function App() {
             status: reconstruction.status,
             provider: reconstruction.matchedProvider,
             rawAcceptedPoints: reconstruction.rawAcceptedPath.length,
+            smoothedPoints: reconstruction.smoothedAcceptedPath.length,
+            preprocessedPoints: reconstruction.preprocessedPath.length,
             reconstructedPoints: reconstruction.reconstructedPath.length,
+            rejectedOutliers: reconstruction.rejectedOutlierCount,
           });
-          const routePoints = reconstruction.reconstructedPath;
-          const endPoint =
+          const preserveDetailedOfflineGeometry = shouldPreserveDetailedRouteGeometry(
+            reconstruction.routeMatchMetadata,
+          );
+          let routePoints = await buildRoadAlignedRoutePath({
+            candidatePath:
+              reconstruction.reconstructedPath.length > 1
+                ? reconstruction.reconstructedPath
+                : reconstruction.preprocessedPath.length > 1
+                  ? reconstruction.preprocessedPath
+                  : reconstruction.rawAcceptedPath,
+            fallbackPath:
+              reconstruction.preprocessedPath.length > 1
+                ? reconstruction.preprocessedPath
+                : reconstruction.rawAcceptedPath,
+            preserveDetailedGeometry: preserveDetailedOfflineGeometry,
+            trustCandidateGeometry:
+              reconstruction.reconstructedPath.length > 1 &&
+              (preserveDetailedOfflineGeometry || reconstruction.preprocessedPath.length > 1),
+          });
+          const rawTripPointPath = tripPoints.map((point) => ({
+            latitude: point.latitude,
+            longitude: point.longitude,
+          }));
+          const matchedTripPointPath = matchedTripPoints.map((point) => ({
+            latitude: point.latitude,
+            longitude: point.longitude,
+          }));
+          const statusEventPointPath = tripStatusEvents
+            .filter((event) => event.latitude !== null && event.longitude !== null)
+            .map((event) => ({
+              latitude: event.latitude!,
+              longitude: event.longitude!,
+            }));
+          const fallbackTripPath =
+            rawTripPointPath.length > 0
+              ? rawTripPointPath
+              : matchedTripPointPath.length > 0
+                ? matchedTripPointPath
+                : statusEventPointPath;
+          if (routePoints.length === 0 && fallbackTripPath.length > 0) {
+            routePoints = fallbackTripPath;
+          }
+          const firstFallbackTripPoint = fallbackTripPath[0] ?? routePoints[0] ?? null;
+          const lastFallbackTripPoint = fallbackTripPath.at(-1) ?? routePoints.at(-1) ?? null;
+          const rawEndPoint =
             session.end_latitude !== null && session.end_longitude !== null
               ? { latitude: session.end_latitude, longitude: session.end_longitude }
-              : routePoints.at(-1) ??
+              : lastFallbackTripPoint ??
                 (session.start_latitude !== null && session.start_longitude !== null
                   ? { latitude: session.start_latitude, longitude: session.start_longitude }
                   : null);
+          const finalizedEndpointState = await resolveFinalizedTripEndpointState({
+            routePath: routePoints,
+            rawEndPoint,
+          });
+          const endPoint = finalizedEndpointState.matchedEndPoint ?? rawEndPoint;
+          const rawStartPoint =
+            session.start_latitude !== null && session.start_longitude !== null
+              ? { latitude: session.start_latitude, longitude: session.start_longitude }
+              : firstFallbackTripPoint;
+          const finalizedStartEndpointState = await resolveFinalizedTripStartEndpointState({
+            routePath: routePoints,
+            rawStartPoint,
+          });
+          const offlineMatchedStartPoint =
+            finalizedStartEndpointState.matchedStartPoint ?? routePoints[0] ?? rawStartPoint;
+          const offlineMatchedEndPoint =
+            finalizedEndpointState.matchedEndPoint ?? routePoints.at(-1) ?? rawEndPoint;
+          const offlineTripDisplayLabels = await resolveTripDisplayLocationLabels({
+            matchedStartPoint: offlineMatchedStartPoint,
+            matchedEndPoint: offlineMatchedEndPoint,
+            routePath: routePoints,
+            filteredStartPoint: rawStartPoint,
+            filteredEndPoint: rawEndPoint,
+          });
 
-          if (!endPoint || !serverTripId) {
-            sessionSyncFailed = true;
-            break;
+          if (!serverTripId) {
+            failTripSync(`Local trip ${session.local_trip_id} could not create or restore a server trip id.`);
+          }
+
+          if (!endPoint) {
+            console.warn('[TripSync] Skipping completed offline trip with no stored location points.', {
+              localTripId: session.local_trip_id,
+              rawPointCount: tripPoints.length,
+              matchedPointCount: matchedTripPoints.length,
+              statusEventPointCount: statusEventPointPath.length,
+            });
+            failTripSync(
+              `Local trip ${session.local_trip_id} is incomplete and cannot sync until it has a valid endpoint.`,
+            );
           }
 
           const completeResult = await completeTrip({
             tripId: String(serverTripId),
-            endLat: endPoint.latitude,
-            endLng: endPoint.longitude,
+            endLat: endPoint!.latitude,
+            endLng: endPoint!.longitude,
             distanceKm: Number(session.distance_km ?? 0),
             fare: Number(session.fare ?? 0),
             durationSeconds: Number(session.duration_seconds ?? 0),
             routePoints,
+            routeMatchSummary: reconstruction.routeMatchMetadata ?? null,
+            matchedPointCount: routePoints.length,
+            rawGpsPointCount: tripPoints.length,
+            matchedStartPoint: offlineMatchedStartPoint,
+            rawEndPoint,
+            matchedEndPoint: offlineMatchedEndPoint,
+            startDisplayName: offlineTripDisplayLabels.startDisplayName,
+            endDisplayName: offlineTripDisplayLabels.endDisplayName,
+            startCoordinate: offlineTripDisplayLabels.startCoordinate,
+            endCoordinate: offlineTripDisplayLabels.endCoordinate,
+            dashedStartConnector: finalizedStartEndpointState.dashedStartConnector,
+            dashedEndConnector: finalizedEndpointState.dashedEndConnector,
+            endpointSelectionSummary: finalizedEndpointState.endpointSelectionSummary,
           });
 
           if (completeResult.error) {
-            sessionSyncFailed = true;
+            failTripSync(completeResult.error);
+          }
+
+          promoteOfflineHistoryItemToServerTrip({
+            localTripId: session.local_trip_id,
+            serverTripId,
+            routePath: routePoints,
+            routeMatchSummary: pickPreferredRouteMatchSummary(
+              reconstruction.routeMatchMetadata ?? null,
+              null,
+            ),
+            startDisplayName: offlineTripDisplayLabels.startDisplayName,
+            endDisplayName: offlineTripDisplayLabels.endDisplayName,
+            startCoordinate: offlineTripDisplayLabels.startCoordinate,
+            endCoordinate: offlineTripDisplayLabels.endCoordinate,
+          });
+          await markOfflineTripSessionCompletedSynced(session.local_trip_id);
+          syncedLocalTripIds.push(session.local_trip_id);
+          shouldRefreshTripHistoryAfterSync = true;
+        }
+
+      }
+
+      while (true) {
+        const rows = (await getUnsyncedOfflineTripPoints(OFFLINE_POINT_SYNC_BATCH_SIZE)).filter((row) =>
+          targetLocalTripId ? row.local_trip_id === targetLocalTripId : true,
+        );
+        if (rows.length === 0) {
+          break;
+        }
+
+        const rowsByTrip = new Map<string, typeof rows>();
+        for (const row of rows) {
+          const list = rowsByTrip.get(row.local_trip_id) ?? [];
+          list.push(row);
+          rowsByTrip.set(row.local_trip_id, list);
+        }
+
+        let syncFailed = false;
+        let syncFailureReason: string | null = null;
+        for (const tripRows of rowsByTrip.values()) {
+          const firstTripRow = tripRows[0];
+          if (!firstTripRow) {
+            syncFailed = true;
+            syncFailureReason = 'Trip GPS point batch was empty.';
+            break;
+          }
+          let serverTripId = firstTripRow.server_trip_id ?? null;
+          serverTripId = await ensureServerTripForLocalRows({
+            localTripId: firstTripRow.local_trip_id,
+            currentServerTripId: serverTripId,
+            driverId: firstTripRow.driver_id,
+            fallbackStartPoint: { latitude: firstTripRow.latitude, longitude: firstTripRow.longitude },
+          });
+
+          const { error } = await insertTripPointBatch(
+            tripRows.map((row) => ({
+              driver_id: row.driver_id,
+              trip_id: serverTripId,
+              lat: row.latitude,
+              lng: row.longitude,
+              speed: row.speed,
+              heading: row.heading,
+              accuracy: row.accuracy,
+              altitude: row.altitude,
+              provider: row.provider,
+              recorded_at: row.recorded_at,
+              dedup_key: row.idempotency_key || buildTripPointDedupKey({
+                tripId: serverTripId,
+                recordedAt: row.recorded_at,
+                latitude: row.latitude,
+                longitude: row.longitude,
+              }),
+            })),
+          );
+
+          if (error) {
+            syncFailed = true;
+            syncFailureReason = error;
             break;
           }
 
-          await markOfflineTripSessionCompletedSynced(session.local_trip_id);
+          await markOfflineTripPointsSynced(tripRows.map((row) => row.id));
         }
 
-        if (sessionSyncFailed) {
-          throw new Error('offline-trip-session-sync-failed');
+        if (syncFailed) {
+          scheduleOfflineSyncRetry();
+          failTripSync(syncFailureReason ?? 'Trip GPS point sync failed.');
         }
       }
 
       while (true) {
-        const rows = await getUnsyncedOfflineTripPoints(OFFLINE_POINT_SYNC_BATCH_SIZE);
+        const rows = (await getUnsyncedOfflineMatchedTripPoints(OFFLINE_POINT_SYNC_BATCH_SIZE)).filter((row) =>
+          targetLocalTripId ? row.local_trip_id === targetLocalTripId : true,
+        );
         if (rows.length === 0) {
           offlineSyncRetryDelayMsRef.current = OFFLINE_SYNC_RETRY_BASE_MS;
           break;
@@ -661,11 +2267,24 @@ export default function App() {
         }
 
         let syncFailed = false;
+        let syncFailureReason: string | null = null;
         for (const tripRows of rowsByTrip.values()) {
+          const firstTripRow = tripRows[0];
+          if (!firstTripRow) {
+            syncFailed = true;
+            syncFailureReason = 'Trip route point batch was empty.';
+            break;
+          }
+          const serverTripId = await ensureServerTripForLocalRows({
+            localTripId: firstTripRow.local_trip_id,
+            currentServerTripId: firstTripRow.server_trip_id ?? null,
+            driverId: firstTripRow.driver_id,
+            fallbackStartPoint: { latitude: firstTripRow.latitude, longitude: firstTripRow.longitude },
+          });
           const { error } = await insertTripRouteBatch(
             tripRows.map((row) => ({
               local_trip_id: row.local_trip_id,
-              trip_id: row.server_trip_id,
+              trip_id: serverTripId,
               driver_id: row.driver_id,
               latitude: row.latitude,
               longitude: row.longitude,
@@ -675,34 +2294,55 @@ export default function App() {
 
           if (error) {
             syncFailed = true;
+            syncFailureReason = error;
             break;
           }
 
-          await markOfflineTripPointsSynced(tripRows.map((row) => row.id));
+          await markOfflineMatchedTripPointsSynced(tripRows.map((row) => row.id));
         }
 
         if (syncFailed) {
-          if (offlineSyncRetryTimeoutRef.current) {
-            clearTimeout(offlineSyncRetryTimeoutRef.current);
-          }
-          const retryDelay = offlineSyncRetryDelayMsRef.current;
-          offlineSyncRetryTimeoutRef.current = setTimeout(() => {
-            offlineSyncRetryTimeoutRef.current = null;
-            void syncOfflineTripPoints();
-          }, retryDelay);
-          offlineSyncRetryDelayMsRef.current = Math.min(
-            retryDelay * 2,
-            OFFLINE_SYNC_RETRY_MAX_MS,
-          );
-          break;
+          scheduleOfflineSyncRetry();
+          failTripSync(syncFailureReason ?? 'Trip route sync failed.');
+        }
+      }
+      if (
+        shouldRefreshTripHistoryAfterSync &&
+        driverDbIdRef.current !== null &&
+        tripHistoryHydratedDriverIdRef.current === driverDbIdRef.current
+      ) {
+        tripRouteRepairAttemptedIdsRef.current = new Set();
+        await refreshTripHistoryFromBackend(driverDbIdRef.current);
+        const repairedCount = await repairTripHistoryRoutes({
+          targetDriverId: driverDbIdRef.current,
+          maxCount: MAX_TRIP_ROUTE_REPAIRS_PER_PASS,
+        });
+        if (repairedCount > 0) {
+          await refreshTripHistoryFromBackend(driverDbIdRef.current);
         }
       }
       offlineSyncRetryDelayMsRef.current = OFFLINE_SYNC_RETRY_BASE_MS;
-    } catch {
+      if (offlineSyncRetryTimeoutRef.current) {
+        clearTimeout(offlineSyncRetryTimeoutRef.current);
+        offlineSyncRetryTimeoutRef.current = null;
+      }
+      finalQueueStatusOverrides = {
+        ...finalQueueStatusOverrides,
+        lastError: null,
+        nextRetryAt: null,
+      };
+      return {
+        ok: true,
+        error: null,
+        syncedLocalTripIds,
+      };
+    } catch (error) {
       if (offlineSyncRetryTimeoutRef.current) {
         clearTimeout(offlineSyncRetryTimeoutRef.current);
       }
+      const errorMessage = error instanceof Error ? error.message : 'offline-trip-session-sync-failed';
       const retryDelay = offlineSyncRetryDelayMsRef.current;
+      const nextRetryAt = new Date(Date.now() + retryDelay).toISOString();
       offlineSyncRetryTimeoutRef.current = setTimeout(() => {
         offlineSyncRetryTimeoutRef.current = null;
         void syncOfflineTripPoints();
@@ -711,27 +2351,173 @@ export default function App() {
         retryDelay * 2,
         OFFLINE_SYNC_RETRY_MAX_MS,
       );
+      finalQueueStatusOverrides = {
+        ...finalQueueStatusOverrides,
+        lastError: errorMessage,
+        nextRetryAt,
+      };
+      return {
+        ok: false,
+        error: errorMessage,
+        syncedLocalTripIds: [] as string[],
+      };
     } finally {
       isSyncingOfflineTripPointsRef.current = false;
+      await refreshOfflineQueueStatus(finalQueueStatusOverrides);
+    }
+  };
+
+  const refreshTripHistoryAfterNetworkRestore = async () => {
+    const targetDriverId = driverDbIdRef.current;
+    if (
+      targetDriverId === null ||
+      tripHistoryHydratedDriverIdRef.current !== targetDriverId ||
+      !hasSupabaseConfig
+    ) {
+      return;
+    }
+
+    await syncOfflineTripPoints();
+
+    if (
+      driverDbIdRef.current !== targetDriverId ||
+      tripHistoryHydratedDriverIdRef.current !== targetDriverId
+    ) {
+      return;
+    }
+
+    tripRouteRepairAttemptedIdsRef.current = new Set();
+    await refreshTripHistoryFromBackend(targetDriverId);
+
+    const repairedCount = await repairTripHistoryRoutes({
+      targetDriverId,
+      maxCount: MAX_TRIP_ROUTE_REPAIRS_PER_PASS,
+    });
+    if (repairedCount > 0) {
+      await refreshTripHistoryFromBackend(targetDriverId);
     }
   };
 
   useEffect(() => {
-    void initOfflineTripStorage();
+    void (async () => {
+      await initOfflineTripStorage();
+      await refreshOfflineQueueStatus();
+    })();
   }, []);
 
   useEffect(() => {
+    if (driverDbId === null || activeLocalTripId) {
+      return;
+    }
+
+    let cancelled = false;
+
+    void (async () => {
+      const session = await getLatestOngoingOfflineTripSession(driverDbId);
+      if (!session || cancelled) {
+        return;
+      }
+
+      const [rawPoints, matchedPoints, statusEvents] = await Promise.all([
+        getOfflineTripPointsByLocalTripId(session.local_trip_id),
+        getOfflineMatchedTripPointsByLocalTripId(session.local_trip_id),
+        getOfflineTripStatusEventsByLocalTripId(session.local_trip_id),
+      ]);
+      if (cancelled) {
+        return;
+      }
+
+      const rawPath = dedupeSequentialRoutePoints(
+        rawPoints.map((point) => ({
+          latitude: point.latitude,
+          longitude: point.longitude,
+        })),
+      );
+      const matchedPath = buildPreferredOfflineMatchedPath(matchedPoints);
+      const recoveredMatchedPath =
+        matchedPath.length > 1
+          ? matchedPath
+          : rawPath.length > 1
+            ? await buildRoadAlignedRoutePath({
+                candidatePath: rawPath,
+                fallbackPath: rawPath,
+                preserveDetailedGeometry: false,
+                trustCandidateGeometry: false,
+              })
+            : rawPath;
+      if (cancelled) {
+        return;
+      }
+
+      setActiveLocalTripId(session.local_trip_id);
+      if (typeof session.server_trip_id === 'number') {
+        setActiveTripDbId(String(session.server_trip_id));
+      }
+      setRestoredTripTrace({
+        rawStartPoint:
+          session.start_latitude !== null && session.start_longitude !== null
+            ? {
+                latitude: session.start_latitude,
+                longitude: session.start_longitude,
+              }
+            : null,
+        matchedPath: recoveredMatchedPath,
+        hasConfirmedMovement:
+          statusEvents.some((event) => event.status === 'movement_confirmed') ||
+          recoveredMatchedPath.length > 1,
+        startedAt: session.started_at,
+      });
+      await refreshOfflineQueueStatus();
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeLocalTripId, driverDbId]);
+
+  useEffect(() => {
+    if (!activeLocalTripId || !restoredTripTrace) {
+      return;
+    }
+
+    const canOpenRecoveredTrip =
+      screen === 'home' ||
+      screen === 'trip' ||
+      screen === 'startTrip' ||
+      screen === 'tripNavigation';
+    if (!canOpenRecoveredTrip) {
+      return;
+    }
+
+    if (!recoveredTripNotificationIdsRef.current.has(activeLocalTripId)) {
+      recoveredTripNotificationIdsRef.current.add(activeLocalTripId);
+      pushNotification({
+        category: 'trip',
+        title: 'Trip recovered',
+        message: 'Your active trip was restored from this device and tracking can continue.',
+        icon: 'refresh-cw',
+      });
+    }
+
+    setForceNewTripNavigationSession(false);
+    if (screen !== 'tripNavigation') {
+      setScreen('tripNavigation');
+    }
+  }, [activeLocalTripId, restoredTripTrace, screen]);
+
+  useEffect(() => {
     const unsubscribe = NetInfo.addEventListener((state) => {
-      isNetworkAvailableRef.current = Boolean(state.isConnected && state.isInternetReachable !== false);
-      if (state.isConnected && state.isInternetReachable !== false) {
-        void syncOfflineTripPoints();
+      const nextIsOnline = Boolean(state.isConnected && state.isInternetReachable !== false);
+      isNetworkAvailableRef.current = nextIsOnline;
+      if (nextIsOnline) {
+        void refreshTripHistoryAfterNetworkRestore();
       }
     });
 
     void NetInfo.fetch().then((state) => {
       isNetworkAvailableRef.current = Boolean(state.isConnected && state.isInternetReachable !== false);
       if (state.isConnected && state.isInternetReachable !== false) {
-        void syncOfflineTripPoints();
+        void refreshTripHistoryAfterNetworkRestore();
       }
     });
 
@@ -748,6 +2534,9 @@ export default function App() {
 
   useEffect(() => {
     if (driverDbId === null) {
+      setProfileQrDetails(createEmptyProfileQrDetails());
+      setProfileQrError(null);
+      setIsProfileQrLoading(false);
       setProfileHydrated(false);
       return;
     }
@@ -765,6 +2554,11 @@ export default function App() {
           contact?: string;
           plateNumber?: string;
           imageUri?: string | null;
+          qrId?: number | null;
+          qrToken?: string | null;
+          qrStatus?: DriverQrStatus | null;
+          qrIssuedAt?: string | null;
+          reportPath?: string | null;
         };
 
         if (parsed.name) {
@@ -782,6 +2576,13 @@ export default function App() {
         if (typeof parsed.imageUri !== 'undefined') {
           setProfileImageUri(parsed.imageUri);
         }
+        applyProfileQrDetails({
+          qr_id: parsed.qrId,
+          qr_token: parsed.qrToken,
+          qr_status: parsed.qrStatus,
+          qr_issued_at: parsed.qrIssuedAt,
+          report_path: parsed.reportPath,
+        });
       } catch {
         // Keep defaults on corrupted storage payload.
       } finally {
@@ -791,6 +2592,31 @@ export default function App() {
 
     void loadProfile();
   }, [driverDbId]);
+
+  useEffect(() => {
+    if (driverDbId === null || !profileHydrated) {
+      return;
+    }
+
+    void refreshDriverProfileFromBackend(driverDbId, { preserveError: true });
+  }, [driverDbId, profileHydrated]);
+
+  useEffect(() => {
+    if (driverDbId === null) {
+      setViolationItems([]);
+      return;
+    }
+
+    void refreshViolationItems(driverDbId);
+  }, [driverDbId]);
+
+  useEffect(() => {
+    if (screen !== 'profile' || driverDbId === null) {
+      return;
+    }
+
+    void refreshDriverProfileFromBackend(driverDbId);
+  }, [driverDbId, screen]);
 
   useEffect(() => {
     if (driverDbId === null) {
@@ -841,45 +2667,82 @@ export default function App() {
   }, [driverDbId]);
 
   useEffect(() => {
+    let cancelled = false;
+
+    setTripHistoryHydrated(false);
+    setTripHistoryHydratedDriverId(null);
+    tripHistoryHydratedDriverIdRef.current = null;
+
+    if (driverDbId === null) {
+      const demoOnly = [createDemoTrip()];
+      setTripHistory(upsertTripHistoryItems([], demoOnly));
+      const totals = computeTripTotals(demoOnly);
+      setTotalEarnings(totals.earnings);
+      setTotalTrips(totals.trips);
+      setTotalDistanceKm(totals.distance);
+      setTotalMinutes(totals.minutes);
+      setTripHistoryHydrated(true);
+      setTripHistoryHydratedDriverId(null);
+      tripHistoryHydratedDriverIdRef.current = null;
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setTripHistory([]);
+    setTotalEarnings(0);
+    setTotalTrips(0);
+    setTotalDistanceKm(0);
+    setTotalMinutes(0);
+
     const loadTripHistory = async () => {
       try {
-        const raw = await AsyncStorage.getItem(TRIP_HISTORY_STORAGE_KEY);
+        const raw = await AsyncStorage.getItem(getTripHistoryStorageKey(driverDbId));
         if (!raw) {
-          const demoOnly = [createDemoTrip()];
-          setTripHistory(demoOnly);
-          const totals = computeTripTotals(demoOnly);
-          setTotalEarnings(totals.earnings);
-          setTotalTrips(totals.trips);
-          setTotalDistanceKm(totals.distance);
-          setTotalMinutes(totals.minutes);
+          if (!cancelled) {
+            setTripHistory([]);
+            setTotalEarnings(0);
+            setTotalTrips(0);
+            setTotalDistanceKm(0);
+            setTotalMinutes(0);
+          }
           return;
         }
 
-        const parsed = JSON.parse(raw) as Array<TripHistoryItem & { routePath?: unknown }>;
+        const parsed = JSON.parse(raw) as Array<Partial<TripHistoryItem> & { routePath?: unknown }>;
         if (!Array.isArray(parsed)) {
+          if (!cancelled) {
+            setTripHistory([]);
+            setTotalEarnings(0);
+            setTotalTrips(0);
+            setTotalDistanceKm(0);
+            setTotalMinutes(0);
+          }
           return;
         }
 
-        const normalized = parsed.map((item) => {
-          const routePath = Array.isArray(item.routePath)
-            ? item.routePath.filter(
-                (point): point is { latitude: number; longitude: number } =>
-                  typeof point === 'object' &&
-                  point !== null &&
-                  typeof (point as { latitude?: unknown }).latitude === 'number' &&
-                  typeof (point as { longitude?: unknown }).longitude === 'number',
-              )
-            : [];
-          return {
-            ...item,
-            routePath: normalizeSavedRoutePath(routePath),
-          };
-        });
+        const normalized = parsed
+          .filter((item) => item.id !== 'TRIP-9001')
+          .map((item) =>
+            normalizeTripHistoryItem({
+              ...item,
+              routePath: normalizeSavedRoutePath(
+                Array.isArray(item.routePath) ? item.routePath : [],
+                [],
+                {
+                  preserveDetailedGeometry: shouldPreserveDetailedRouteGeometry(
+                    (item.routeMatchSummary as TripRouteMatchSummary | null | undefined) ?? null,
+                  ),
+                },
+              ),
+            }),
+          );
 
-        const hydratedList = [
-          createDemoTrip(),
-          ...normalized.filter((item) => item.id !== 'TRIP-9001'),
-        ];
+        if (cancelled) {
+          return;
+        }
+
+        const hydratedList = upsertTripHistoryItems([], normalized);
         setTripHistory(hydratedList);
 
         const parsedTotals = computeTripTotals(hydratedList);
@@ -888,14 +2751,28 @@ export default function App() {
         setTotalDistanceKm(parsedTotals.distance);
         setTotalMinutes(parsedTotals.minutes);
       } catch {
-        // Keep defaults on corrupted storage payload.
+        if (!cancelled) {
+          setTripHistory([]);
+          setTotalEarnings(0);
+          setTotalTrips(0);
+          setTotalDistanceKm(0);
+          setTotalMinutes(0);
+        }
       } finally {
-        setTripHistoryHydrated(true);
+        if (!cancelled) {
+          setTripHistoryHydrated(true);
+          setTripHistoryHydratedDriverId(driverDbId);
+          tripHistoryHydratedDriverIdRef.current = driverDbId;
+        }
       }
     };
 
-    loadTripHistory();
-  }, []);
+    void loadTripHistory();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [driverDbId]);
 
   useEffect(() => {
     if (!profileHydrated) {
@@ -908,6 +2785,11 @@ export default function App() {
       contact: profileContact,
       plateNumber: profilePlateNumber,
       imageUri: profileImageUri,
+      qrId: profileQrDetails.qrId,
+      qrToken: profileQrDetails.qrToken,
+      qrStatus: profileQrDetails.qrStatus,
+      qrIssuedAt: profileQrDetails.qrIssuedAt,
+      reportPath: profileQrDetails.reportPath,
     });
 
     if (driverDbId === null) {
@@ -917,7 +2799,61 @@ export default function App() {
     AsyncStorage.setItem(`${PROFILE_STORAGE_KEY}${driverDbId}`, payload).catch(() => {
       // Ignore write failures to avoid blocking UI.
     });
-  }, [profileName, profileDriverCode, profileContact, profilePlateNumber, profileImageUri, profileHydrated, driverDbId]);
+  }, [
+    profileName,
+    profileDriverCode,
+    profileContact,
+    profilePlateNumber,
+    profileImageUri,
+    profileQrDetails.qrId,
+    profileQrDetails.qrIssuedAt,
+    profileQrDetails.qrStatus,
+    profileQrDetails.qrToken,
+    profileQrDetails.reportPath,
+    profileHydrated,
+    driverDbId,
+  ]);
+  const isDarkMode = isLowBatteryMapMode;
+  const isNavbarFixedScreen =
+    screen === 'home' || screen === 'trip' || screen === 'violation' || screen === 'profile';
+  const themedAuthStyles = useMemo(
+    () => ({
+      ...styles,
+      inputWrapper: [
+        styles.inputWrapper,
+        isDarkMode
+          ? {
+              backgroundColor: MAXIM_UI_SURFACE_DARK,
+              borderWidth: 1,
+              borderColor: MAXIM_UI_BORDER_DARK,
+            }
+          : null,
+      ],
+      input: [styles.input, isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null],
+      smallLinkDark: [styles.smallLinkDark, isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null],
+      helperText: [styles.helperText, isDarkMode ? { color: MAXIM_UI_SUBTLE_DARK } : null],
+    }),
+    [isDarkMode],
+  );
+
+  useEffect(() => {
+    screenTransitionOpacity.setValue(0);
+    screenTransitionTranslateY.setValue(10);
+    Animated.parallel([
+      Animated.timing(screenTransitionOpacity, {
+        toValue: 1,
+        duration: 210,
+        easing: Easing.out(Easing.quad),
+        useNativeDriver: true,
+      }),
+      Animated.timing(screenTransitionTranslateY, {
+        toValue: 0,
+        duration: 240,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [screen, screenTransitionOpacity, screenTransitionTranslateY]);
 
   useEffect(() => {
     if (!notificationsHydrated || driverDbId === null) {
@@ -949,6 +2885,14 @@ export default function App() {
     pendingOpenTripScreenRef.current = false;
     setIsWaitingForTripLocation(false);
   }, [isHomeLocationVisible]);
+
+  useEffect(() => {
+    return () => {
+      if (isDriverOnlineRef.current && driverDbIdRef.current !== null) {
+        void setDriverPresenceOffline(driverDbIdRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const shouldTrackLiveLocation =
@@ -985,60 +2929,6 @@ export default function App() {
         return;
       }
 
-      const syncLocationToBackend = async (
-        location: Location.LocationObject | (Location.LocationObjectCoords & { timestamp?: number }),
-      ) => {
-        if (driverDbId === null) {
-          return null;
-        }
-
-        const coords = 'coords' in location ? location.coords : location;
-        const timestamp =
-          'timestamp' in location && typeof location.timestamp === 'number'
-            ? location.timestamp
-            : Date.now();
-        const accuracy =
-          typeof coords.accuracy === 'number' && Number.isFinite(coords.accuracy)
-            ? coords.accuracy
-            : null;
-
-        if (accuracy !== null && accuracy > MAX_LIVE_SYNC_ACCURACY_METERS) {
-          return null;
-        }
-
-        const nextPoint = {
-          latitude: coords.latitude,
-          longitude: coords.longitude,
-        };
-        const previousPoint = lastLiveSyncPointRef.current;
-        const previousTimestamp = lastLiveSyncTimestampRef.current;
-        if (previousPoint && previousTimestamp !== null) {
-          const jumpKm = distanceBetweenKm(previousPoint, nextPoint);
-          const elapsedSec = Math.max((timestamp - previousTimestamp) / 1000, 0);
-          if (jumpKm > MAX_LIVE_SYNC_JUMP_KM && elapsedSec <= 3) {
-            return null;
-          }
-        }
-
-        const { error } = await upsertDriverLocation({
-          driverId: driverDbId,
-          driverCode: profileDriverCode,
-          latitude: nextPoint.latitude,
-          longitude: nextPoint.longitude,
-          speed: coords.speed ?? null,
-          heading: coords.heading ?? null,
-          accuracy,
-          recordedAt: timestamp ? new Date(timestamp).toISOString() : undefined,
-        });
-
-        if (!error) {
-          lastLiveSyncPointRef.current = nextPoint;
-          lastLiveSyncTimestampRef.current = timestamp;
-        }
-
-        return error;
-      };
-
       const initialLocationPromise = Location.getCurrentPositionAsync({
         accuracy: Location.Accuracy.BestForNavigation,
         mayShowUserSettingsDialog: true,
@@ -1056,7 +2946,7 @@ export default function App() {
             return;
           }
 
-          void syncLocationToBackend(location).then((error) => {
+          void syncDriverPresenceLocation(location).then((error) => {
             if (error) {
               console.warn('Live driver tracking sync failed:', error);
             }
@@ -1073,7 +2963,7 @@ export default function App() {
         return;
       }
 
-      const initialError = await syncLocationToBackend(initialLocation);
+      const initialError = await syncDriverPresenceLocation(initialLocation);
       if (initialError) {
         console.warn('Initial live sync failed:', initialError);
       }
@@ -1087,15 +2977,27 @@ export default function App() {
       liveTrackingSubscriptionRef.current = null;
       lastLiveSyncPointRef.current = null;
       lastLiveSyncTimestampRef.current = null;
-      if (driverDbId !== null) {
-        void setDriverLocationOffline(driverDbId);
-      }
     };
   }, [driverDbId, isDriverOnline, profileDriverCode, routeLocationEnabled]);
 
   const handleGoOnline = async (options?: { openTripScreen?: boolean }) => {
     if (driverDbId === null || !profileDriverCode) {
       Alert.alert('Profile Missing', 'Log in again before going online.');
+      setIsWaitingForTripLocation(false);
+      return false;
+    }
+
+    const latestNetworkState = await NetInfo.fetch();
+    const hasReachableInternet = Boolean(
+      latestNetworkState.isConnected && latestNetworkState.isInternetReachable !== false,
+    );
+    isNetworkAvailableRef.current = hasReachableInternet;
+    if (!hasReachableInternet) {
+      Alert.alert(
+        'Internet required',
+        'Connect to the internet before going online or opening trip tools.',
+      );
+      setIsDriverOnline(false);
       setIsWaitingForTripLocation(false);
       return false;
     }
@@ -1122,53 +3024,6 @@ export default function App() {
       setScreen('startTrip');
     };
 
-    const syncLocationToBackend = async (
-      location: Location.LocationObject | (Location.LocationObjectCoords & { timestamp?: number }),
-    ) => {
-      const coords = 'coords' in location ? location.coords : location;
-      const timestamp = 'timestamp' in location && typeof location.timestamp === 'number' ? location.timestamp : undefined;
-      const accuracy =
-        typeof coords.accuracy === 'number' && Number.isFinite(coords.accuracy)
-          ? coords.accuracy
-          : null;
-
-      if (accuracy !== null && accuracy > MAX_FAST_START_ACCURACY_METERS) {
-        return null;
-      }
-
-      const nextPoint = {
-        latitude: coords.latitude,
-        longitude: coords.longitude,
-      };
-      const previousPoint = lastLiveSyncPointRef.current;
-      const previousTimestamp = lastLiveSyncTimestampRef.current;
-      if (previousPoint && previousTimestamp !== null && timestamp) {
-        const jumpKm = distanceBetweenKm(previousPoint, nextPoint);
-        const elapsedSec = Math.max((timestamp - previousTimestamp) / 1000, 0);
-        if (jumpKm > MAX_LIVE_SYNC_JUMP_KM && elapsedSec <= 3) {
-          return null;
-        }
-      }
-
-      const { error } = await upsertDriverLocation({
-        driverId: driverDbId,
-        driverCode: profileDriverCode,
-        latitude: nextPoint.latitude,
-        longitude: nextPoint.longitude,
-        speed: coords.speed ?? null,
-        heading: coords.heading ?? null,
-        accuracy,
-        recordedAt: timestamp ? new Date(timestamp).toISOString() : undefined,
-      });
-
-      if (!error) {
-        lastLiveSyncPointRef.current = nextPoint;
-        lastLiveSyncTimestampRef.current = timestamp ?? Date.now();
-      }
-
-      return error;
-    };
-
     try {
       hasShownTrackingPermissionErrorRef.current = false;
       setIsDriverOnline(true);
@@ -1184,6 +3039,20 @@ export default function App() {
 
       void (async () => {
         try {
+          const lastKnownLocation = await Location.getLastKnownPositionAsync({
+            maxAge: 5 * 60 * 1000,
+            requiredAccuracy: MAX_FAST_START_ACCURACY_METERS,
+          }).catch(() => null);
+
+          if (lastKnownLocation) {
+            const warmStartError = await syncDriverPresenceLocation(lastKnownLocation, {
+              maxAccuracyMeters: MAX_FAST_START_ACCURACY_METERS,
+            });
+            if (warmStartError) {
+              console.warn('Last known live sync failed:', warmStartError);
+            }
+          }
+
           const location = await Promise.race<Location.LocationObject | null>([
             Location.getCurrentPositionAsync({
               accuracy: Location.Accuracy.BestForNavigation,
@@ -1196,7 +3065,9 @@ export default function App() {
             return;
           }
 
-          const error = await syncLocationToBackend(location);
+          const error = await syncDriverPresenceLocation(location, {
+            maxAccuracyMeters: MAX_FAST_START_ACCURACY_METERS,
+          });
           if (error) {
             console.warn('High-accuracy live sync failed:', error);
           }
@@ -1273,46 +3144,127 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (driverDbId === null) {
+    if (driverDbId === null || tripHistoryHydratedDriverId !== driverDbId) {
       return;
     }
 
-    const loadTripsFromDb = async () => {
-      const { trips, error } = await listTripsWithRoutePoints(driverDbId, 250);
-      if (error) {
-        return;
-      }
-
-      const previousRoutesById = new Map(
-        tripHistoryRef.current.map((item) => [item.id, item.routePath]),
-      );
-      const mapped: TripHistoryItem[] = trips.map((t) =>
-        mapTripRecordToHistoryItem(
-          t,
-          previousRoutesById.get(`TRIP-${String(t.id).split('-')[0]?.toUpperCase() ?? String(t.id)}`) ?? [],
-        ),
-      );
-
-      setTripHistory(mapped);
-      const totals = computeTripTotals(mapped);
-      setTotalEarnings(totals.earnings);
-      setTotalTrips(totals.trips);
-      setTotalDistanceKm(totals.distance);
-      setTotalMinutes(totals.minutes);
-    };
-
-    void loadTripsFromDb();
-  }, [driverDbId]);
+    void refreshTripHistoryFromBackend(driverDbId);
+  }, [driverDbId, tripHistoryHydratedDriverId]);
 
   useEffect(() => {
-    if (!tripHistoryHydrated) {
+    const supabaseClient = supabase;
+    if (
+      driverDbId === null ||
+      tripHistoryHydratedDriverId !== driverDbId ||
+      !hasSupabaseConfig ||
+      !supabaseClient
+    ) {
       return;
     }
 
-    AsyncStorage.setItem(TRIP_HISTORY_STORAGE_KEY, JSON.stringify(tripHistory)).catch(() => {
+    let tripRefreshTimeout: ReturnType<typeof setTimeout> | null = null;
+    const scheduleTripRefresh = () => {
+      if (tripRefreshTimeout) {
+        clearTimeout(tripRefreshTimeout);
+      }
+      tripRefreshTimeout = setTimeout(() => {
+        void refreshTripHistoryFromBackend(driverDbId);
+      }, 250);
+    };
+
+    const tripHistoryChannel = supabaseClient
+      .channel(`driver-trip-history-${driverDbId}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'trips', filter: `driver_id=eq.${driverDbId}` },
+        scheduleTripRefresh,
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'trip_routes', filter: `driver_id=eq.${driverDbId}` },
+        scheduleTripRefresh,
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'trip_route_points' },
+        scheduleTripRefresh,
+      )
+      .subscribe();
+
+    const violationChannel = supabaseClient
+      .channel(`driver-violations-${driverDbId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'mobile_violations',
+          filter: `driver_id=eq.${driverDbId}`,
+        },
+        () => {
+          void refreshViolationItems(driverDbId);
+        },
+      )
+      .subscribe();
+    const violationAppealsChannel = supabaseClient
+      .channel(`driver-violation-appeals-${driverDbId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'violation_appeals',
+          filter: `driver_id=eq.${driverDbId}`,
+        },
+        () => {
+          void refreshViolationItems(driverDbId);
+        },
+      )
+      .subscribe();
+    const violationProofsChannel = supabaseClient
+      .channel(`driver-violation-proofs-${driverDbId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'violation_proofs',
+          filter: `driver_id=eq.${driverDbId}`,
+        },
+        () => {
+          void refreshViolationItems(driverDbId);
+        },
+      )
+      .subscribe();
+
+    return () => {
+      if (tripRefreshTimeout) {
+        clearTimeout(tripRefreshTimeout);
+      }
+      void supabaseClient.removeChannel(tripHistoryChannel);
+      void supabaseClient.removeChannel(violationChannel);
+      void supabaseClient.removeChannel(violationAppealsChannel);
+      void supabaseClient.removeChannel(violationProofsChannel);
+    };
+  }, [driverDbId, tripHistoryHydratedDriverId]);
+
+  useEffect(() => {
+    if (
+      !tripHistoryHydrated ||
+      driverDbId === null ||
+      tripHistoryHydratedDriverId !== driverDbId
+    ) {
+      return;
+    }
+
+    const persistedTripHistory = tripHistory.filter((item) => item.id !== 'TRIP-9001');
+    AsyncStorage.setItem(
+      getTripHistoryStorageKey(driverDbId),
+      JSON.stringify(persistedTripHistory),
+    ).catch(() => {
       // Ignore write failures to avoid blocking UI.
     });
-  }, [tripHistory, tripHistoryHydrated]);
+  }, [driverDbId, tripHistory, tripHistoryHydrated, tripHistoryHydratedDriverId]);
 
   const handlePhoneOnboardingContinue = () => {
     void (async () => {
@@ -1375,7 +3327,26 @@ export default function App() {
 
   const confirmTripActionModal = async () => {
     setShowTripActionModal(false);
+    if (activeLocalTripId) {
+      setForceNewTripNavigationSession(false);
+      setScreen('tripNavigation');
+      return;
+    }
+
     if (isDriverOnline) {
+      const latestNetworkState = await NetInfo.fetch();
+      const hasReachableInternet = Boolean(
+        latestNetworkState.isConnected && latestNetworkState.isInternetReachable !== false,
+      );
+      isNetworkAvailableRef.current = hasReachableInternet;
+      if (!hasReachableInternet) {
+        Alert.alert(
+          'Internet required',
+          'Connect to the internet before opening trip tools.',
+        );
+        return;
+      }
+
       setScreen('startTrip');
       return;
     }
@@ -1402,6 +3373,11 @@ export default function App() {
       return;
     }
     if (tab === 'route') {
+      if (activeLocalTripId) {
+        setForceNewTripNavigationSession(false);
+        setScreen('tripNavigation');
+        return;
+      }
       openTripActionModal();
       return;
     }
@@ -1419,6 +3395,10 @@ export default function App() {
   };
 
   const handleTrackingLogout = () => {
+    if (driverDbId !== null && isDriverOnlineRef.current) {
+      void setDriverPresenceOffline(driverDbId);
+    }
+    setIsDriverOnline(false);
     setDriverDbId(null);
     setActiveTripDbId(null);
     setActiveLocalTripId(null);
@@ -1428,10 +3408,14 @@ export default function App() {
     setPermissionOnboardingState(null);
     setPendingPhoneAccessStatus('granted');
     setRouteLocationEnabled(false);
+    setRestoredTripTrace(null);
     setScreen('login');
   };
 
   const handleTrackingOffline = () => {
+    if (driverDbId !== null) {
+      void setDriverPresenceOffline(driverDbId);
+    }
     pendingOpenTripScreenRef.current = false;
     setIsHomeLocationVisible(false);
     setScreen('home');
@@ -1443,22 +3427,82 @@ export default function App() {
       icon: 'moon',
     });
     setActiveLocalTripId(null);
+    setRestoredTripTrace(null);
     lastOfflineStoredPointRef.current = null;
   };
 
   const clearActiveTripState = () => {
     setActiveTripDbId(null);
     setActiveLocalTripId(null);
+    setRestoredTripTrace(null);
     lastOfflineStoredPointRef.current = null;
     activeTripStartPromiseRef.current = null;
   };
 
-  const handleTrackingTripStart = ({ startLocation }: { startLocation: { latitude: number; longitude: number } | null }) => {
+  const handleTrackingTripStart = async ({
+    startLocation,
+  }: {
+    startLocation: { latitude: number; longitude: number } | null;
+  }) => {
     if (driverDbId === null) {
-      return;
+      Alert.alert('Trip start unavailable', 'Sign in again before starting a trip.');
+      return false;
+    }
+
+    const latestNetworkState = await NetInfo.fetch();
+    const hasReachableInternet = Boolean(
+      latestNetworkState.isConnected && latestNetworkState.isInternetReachable !== false,
+    );
+    isNetworkAvailableRef.current = hasReachableInternet;
+    if (!hasReachableInternet) {
+      Alert.alert(
+        'Internet required',
+        'Connect to the internet before starting a trip. You can still finish an active trip if the connection drops later.',
+      );
+      return false;
+    }
+
+    if (!hasSupabaseConfig) {
+      Alert.alert(
+        'Trip start unavailable',
+        'The app is not connected to the trip server yet, so a new trip cannot start.',
+      );
+      return false;
     }
 
     const localTripId = `trip-${driverDbId}-${Date.now()}`;
+    const startedAt = new Date().toISOString();
+    const startPromise = startTrip(
+      driverDbId,
+      startLocation?.latitude,
+      startLocation?.longitude,
+    );
+    activeTripStartPromiseRef.current = startPromise.then(({ tripId, error }) => {
+      if (error || !tripId) {
+        return null;
+      }
+      return tripId;
+    });
+
+    const { tripId, error } = await startPromise;
+    if (error || !tripId) {
+      Alert.alert(
+        'Trip start unavailable',
+        isRecoverableConnectivityError(error ?? '')
+          ? 'Internet is required to start a trip. Check your connection, then try again.'
+          : error ?? 'The trip server did not create a trip. Try again before driving.',
+      );
+      activeTripStartPromiseRef.current = null;
+      return false;
+    }
+
+    const serverTripId = Number(tripId);
+    if (!Number.isFinite(serverTripId)) {
+      Alert.alert('Trip start unavailable', `The trip server returned an invalid trip id (${tripId}).`);
+      activeTripStartPromiseRef.current = null;
+      return false;
+    }
+
     pushNotification({
       category: 'trip',
       title: 'Trip started',
@@ -1466,55 +3510,61 @@ export default function App() {
       icon: 'map',
     });
     setActiveLocalTripId(localTripId);
+    setActiveTripDbId(tripId);
+    setRestoredTripTrace(null);
     lastOfflineStoredPointRef.current = null;
-    const startedAt = new Date().toISOString();
 
-    void insertOfflineTripSession({
+    await insertOfflineTripSession({
       localTripId,
+      serverTripId,
       driverId: driverDbId,
       startedAt,
       startLatitude: startLocation?.latitude ?? null,
       startLongitude: startLocation?.longitude ?? null,
     });
-
-    if (!hasSupabaseConfig || !isNetworkAvailableRef.current) {
-      activeTripStartPromiseRef.current = Promise.resolve(null);
-      return;
-    }
-
-    const p = (async () => {
-      const { tripId, error } = await startTrip(
-        driverDbId,
-        startLocation?.latitude,
-        startLocation?.longitude,
-      );
-      if (error) {
-        if (isRecoverableConnectivityError(error)) {
-          return null;
-        }
-        if (isTemporarilyIgnorableRouteError(error)) {
-          return null;
-        }
-        Alert.alert('Trip Sync Error', error);
-        return null;
-      }
-      if (tripId) {
-        setActiveTripDbId(tripId);
-        const serverTripId = Number(tripId);
-        if (Number.isFinite(serverTripId)) {
-          await attachServerTripIdToOfflineTrip(localTripId, serverTripId);
-          await attachTripRoutesToServerTrip(localTripId, serverTripId);
-        }
-      }
-      return tripId;
-    })();
-
-    activeTripStartPromiseRef.current = p;
+    await insertOfflineTripStatusEvent({
+      localTripId,
+      serverTripId,
+      driverId: driverDbId,
+      status: 'trip_started',
+      recordedAt: startedAt,
+      latitude: startLocation?.latitude ?? null,
+      longitude: startLocation?.longitude ?? null,
+      payload: {
+        localTripId,
+        serverTripId,
+        driverId: driverDbId,
+        driverCode: profileDriverCode,
+        tricycleNumber: profileDriverCode,
+        plateNumber: profilePlateNumber,
+        startedAt,
+        startPoint: startLocation,
+        tripStatus: 'ONGOING',
+      },
+    });
+    await refreshOfflineQueueStatus();
+    await attachTripRoutesToServerTrip(localTripId, serverTripId);
+    activeTripStartPromiseRef.current = Promise.resolve(tripId);
+    return true;
   };
 
   const handleTrackingGeofenceExit = ({ location }: { location: { latitude: number; longitude: number } | null }) => {
     if (driverDbId === null) {
       return;
+    }
+
+    const nowMs = Date.now();
+    const lastFeedbackAtMs = lastGeofenceViolationFeedbackAtRef.current ?? 0;
+    const shouldTriggerViolationFeedback = nowMs - lastFeedbackAtMs >= 5000;
+
+    if (shouldTriggerViolationFeedback) {
+      lastGeofenceViolationFeedbackAtRef.current = nowMs;
+      Vibration.cancel();
+      Vibration.vibrate([0, 400, 150, 400, 150, 400, 150, 400, 150, 400, 150, 400], false);
+      Alert.alert(
+        'Geofence violation detected',
+        'You exited the authorized Obrero geofence during an active trip.',
+      );
     }
 
     void (async () => {
@@ -1531,6 +3581,9 @@ export default function App() {
         details: 'Driver exited the authorized geofence during an active trip.',
       });
       if (!error) {
+        if (driverDbId !== null) {
+          void refreshViolationItems(driverDbId);
+        }
         pushNotification({
           category: 'violation',
           title: 'Violation recorded',
@@ -1541,15 +3594,125 @@ export default function App() {
     })();
   };
 
-  const handleTrackingTripComplete = (payload: {
+  const buildRawTelemetryFromOfflinePoints = (
+    offlineTripPoints: Awaited<ReturnType<typeof getOfflineTripPointsByLocalTripId>>,
+  ): RawTripTelemetryPoint[] =>
+    offlineTripPoints.map((point) => ({
+      latitude: point.latitude,
+      longitude: point.longitude,
+      speed: point.speed,
+      heading: point.heading,
+      accuracy: point.accuracy,
+      altitude: point.altitude,
+      provider: point.provider,
+      recordedAt: point.recorded_at,
+    }));
+
+  const buildCompletedTripHistoryRecord = ({
+    id,
+    tripDate,
+    fare,
+    durationSeconds,
+    routePath,
+    rawTelemetry,
+    rawStartPoint,
+    rawEndPoint,
+    matchedStartPoint,
+    matchedEndPoint,
+    dashedStartConnector = [],
+    dashedEndConnector = [],
+    syncStatus,
+    tripState,
+    matchedPointCount,
+    offlineSegmentsCount,
+    averageSpeedKph,
+    maxSpeedKph,
+    idleDurationSeconds,
+    gpsQualitySummary,
+    routeMatchSummary,
+    startDisplayName,
+    endDisplayName,
+    startCoordinate,
+    endCoordinate,
+    startedAt,
+    endedAt,
+    distanceKm,
+  }: {
+    id: string;
+    tripDate: string;
     fare: number;
-    distanceKm: number;
     durationSeconds: number;
     routePath: Array<{ latitude: number; longitude: number }>;
-    endLocation: { latitude: number; longitude: number } | null;
     rawTelemetry?: RawTripTelemetryPoint[];
-  }) => {
+    rawStartPoint?: { latitude: number; longitude: number } | null;
+    rawEndPoint?: { latitude: number; longitude: number } | null;
+    matchedStartPoint?: { latitude: number; longitude: number } | null;
+    matchedEndPoint?: { latitude: number; longitude: number } | null;
+    dashedStartConnector?: Array<{ latitude: number; longitude: number }>;
+    dashedEndConnector?: Array<{ latitude: number; longitude: number }>;
+    syncStatus: 'SYNC_PENDING' | 'SYNCED';
+    tripState:
+      | 'IDLE'
+      | 'TRIP_STARTING'
+      | 'PRE_ROAD'
+      | 'ON_ROAD'
+      | 'TRIP_ENDING'
+      | 'COMPLETED'
+      | 'SYNC_PENDING'
+      | 'SYNCED';
+    matchedPointCount?: number;
+    offlineSegmentsCount?: number;
+    averageSpeedKph?: number | null;
+    maxSpeedKph?: number | null;
+    idleDurationSeconds?: number;
+    gpsQualitySummary?: TripGpsQualitySummary | null;
+    routeMatchSummary?: import('./lib/tripTransactions').TripRouteMatchSummary | null;
+    startDisplayName?: string | null;
+    endDisplayName?: string | null;
+    startCoordinate?: { latitude: number; longitude: number } | null;
+    endCoordinate?: { latitude: number; longitude: number } | null;
+    startedAt?: string | null;
+    endedAt?: string | null;
+    distanceKm?: number | null;
+  }) =>
+    buildTripHistoryItem({
+      id,
+      tripDate,
+      fare,
+      durationSeconds,
+      matchedRoutePath: routePath,
+      rawTelemetry,
+      rawStartPoint: rawStartPoint ?? null,
+      rawEndPoint: rawEndPoint ?? null,
+      matchedStartPoint: matchedStartPoint ?? routePath[0] ?? null,
+      matchedEndPoint: matchedEndPoint ?? routePath.at(-1) ?? null,
+      dashedStartConnector,
+      dashedEndConnector,
+      syncStatus,
+      tripState,
+      driverName: profileName,
+      driverCode: profileDriverCode,
+      vehiclePlateNumber: profilePlateNumber,
+      matchedPointCount,
+      offlineSegmentsCount,
+      averageSpeedKph,
+      maxSpeedKph,
+      idleDurationSeconds,
+      gpsQualitySummary,
+      routeMatchSummary,
+      startDisplayName,
+      endDisplayName,
+      startCoordinate,
+      endCoordinate,
+      startedAt,
+      endedAt,
+      distanceKm,
+    });
+
+  const handleTrackingTripComplete = (payload: TripCompletionPayload) => {
     const { fare, distanceKm, durationSeconds, endLocation } = payload;
+    const routeMatchSummary = payload.routeMatchSummary ?? null;
+    const preserveDetailedRouteGeometry = shouldPreserveDetailedRouteGeometry(routeMatchSummary);
     const routePath = Array.isArray((payload as { routePath?: unknown }).routePath)
       ? ((payload as { routePath?: Array<{ latitude: number; longitude: number }> }).routePath ?? [])
       : [];
@@ -1573,7 +3736,60 @@ export default function App() {
     });
 
     if (driverDbId === null) {
+      const optimisticRoutePath = buildOptimisticTripRoutePath({
+        routePath,
+        rawTelemetry: payload.rawTelemetry,
+        routeMatchSummary,
+      });
       void (async () => {
+        const optimisticTripId = buildTripHistoryId({
+          fallbackOrdinal: tripHistoryRef.current.length + 1,
+        });
+        const optimisticHistoryItem = buildCompletedTripHistoryRecord({
+          id: optimisticTripId,
+          tripDate,
+          fare,
+          durationSeconds,
+          distanceKm,
+          startedAt: payload.startedAt ?? payload.rawTelemetry?.[0]?.recordedAt ?? null,
+          endedAt: payload.endedAt ?? payload.rawTelemetry?.at(-1)?.recordedAt ?? null,
+          routePath: optimisticRoutePath,
+          rawTelemetry: payload.rawTelemetry,
+          rawStartPoint:
+            payload.rawStartPoint ??
+            (payload.rawTelemetry?.[0]
+              ? {
+                  latitude: payload.rawTelemetry[0].latitude,
+                  longitude: payload.rawTelemetry[0].longitude,
+                }
+              : optimisticRoutePath[0] ?? null),
+          rawEndPoint:
+            payload.rawEndPoint ??
+            (payload.rawTelemetry?.at(-1)
+              ? {
+                  latitude: payload.rawTelemetry.at(-1)!.latitude,
+                  longitude: payload.rawTelemetry.at(-1)!.longitude,
+                }
+              : endLocation),
+          matchedStartPoint: payload.matchedStartPoint ?? optimisticRoutePath[0] ?? null,
+          matchedEndPoint: payload.matchedEndPoint ?? optimisticRoutePath.at(-1) ?? null,
+          dashedStartConnector: payload.dashedStartConnector ?? [],
+          syncStatus: 'SYNC_PENDING',
+          tripState: 'COMPLETED',
+          matchedPointCount: payload.matchedPointCount,
+          offlineSegmentsCount: payload.offlineSegmentsCount ?? 0,
+          averageSpeedKph: payload.averageSpeedKph ?? null,
+          maxSpeedKph: payload.maxSpeedKph ?? null,
+          idleDurationSeconds: payload.idleDurationSeconds,
+          gpsQualitySummary: payload.gpsQualitySummary ?? null,
+          routeMatchSummary,
+          startDisplayName: payload.startDisplayName ?? null,
+          endDisplayName: payload.endDisplayName ?? null,
+          startCoordinate: payload.startCoordinate ?? null,
+          endCoordinate: payload.endCoordinate ?? null,
+        });
+        setTripHistory((prev) => upsertTripHistoryItems(prev, [optimisticHistoryItem]));
+
         const reconstruction = await reconstructCompletedTripPath(
           payload.rawTelemetry ??
             routePath.map((point) => ({
@@ -1585,48 +3801,220 @@ export default function App() {
           status: reconstruction.status,
           provider: reconstruction.matchedProvider,
           rawAcceptedPoints: reconstruction.rawAcceptedPath.length,
+          smoothedPoints: reconstruction.smoothedAcceptedPath.length,
+          preprocessedPoints: reconstruction.preprocessedPath.length,
           reconstructedPoints: reconstruction.reconstructedPath.length,
+          rejectedOutliers: reconstruction.rejectedOutlierCount,
         });
-        const resolvedRoutePath = reconstruction.reconstructedPath;
-        setTripHistory((prev) => [
+        const reconstructedMatchedPath = normalizeSavedRoutePath(
+          reconstruction.reconstructedPath,
+          optimisticRoutePath,
           {
-            id: `TRIP-${String(1000 + prev.length + 1).padStart(4, '0')}`,
-            tripDate,
-            duration: durationLabel,
-            distance: `${distanceKm.toFixed(2)} km`,
-            fare: `\u20B1${fare.toFixed(2)}`,
-            violations: '0',
-            status: 'COMPLETED',
-            compliance: 100,
-            routePath: resolvedRoutePath,
+            preserveDetailedGeometry:
+              preserveDetailedRouteGeometry ||
+              shouldPreserveDetailedRouteGeometry(reconstruction.routeMatchMetadata),
           },
-          ...prev,
-        ]);
+        );
+        const resolvedRoutePath =
+          reconstruction.status === 'matched' && reconstructedMatchedPath.length > 1
+            ? reconstructedMatchedPath
+            : normalizeSavedRoutePath(reconstruction.reconstructedPath, optimisticRoutePath, {
+                preserveDetailedGeometry:
+                  preserveDetailedRouteGeometry ||
+                  shouldPreserveDetailedRouteGeometry(reconstruction.routeMatchMetadata),
+              });
+        const preferredLocalRouteMatchSummary = pickPreferredRouteMatchSummary(
+          reconstruction.routeMatchMetadata ?? null,
+          routeMatchSummary,
+        );
+        const roadAlignedRoutePath = await buildRoadAlignedRoutePath({
+          candidatePath:
+            resolvedRoutePath.length > 2
+              ? resolvedRoutePath
+              : reconstruction.status === 'matched' && reconstruction.reconstructedPath.length > 1
+                ? reconstruction.reconstructedPath
+                : reconstruction.rawAcceptedPath.length > 1
+                ? reconstruction.rawAcceptedPath
+                : resolvedRoutePath,
+          fallbackPath: resolvedRoutePath.length > 1 ? resolvedRoutePath : optimisticRoutePath,
+          preserveDetailedGeometry:
+            preserveDetailedRouteGeometry ||
+            shouldPreserveDetailedRouteGeometry(reconstruction.routeMatchMetadata),
+          trustCandidateGeometry:
+            resolvedRoutePath.length > 1 &&
+            (shouldPreserveDetailedRouteGeometry(preferredLocalRouteMatchSummary) ||
+              reconstruction.preprocessedPath.length > 1 ||
+              reconstruction.rawAcceptedPath.length > 1),
+        });
+        const finalLocalRouteMatchSummary = pickPreferredRouteMatchSummary(
+          reconstruction.routeMatchMetadata ?? null,
+          routeMatchSummary,
+        );
+        const finalLocalRawEndPoint =
+          payload.rawEndPoint ??
+          (payload.rawTelemetry?.at(-1)
+            ? {
+                latitude: payload.rawTelemetry.at(-1)!.latitude,
+                longitude: payload.rawTelemetry.at(-1)!.longitude,
+              }
+            : endLocation);
+        const finalLocalEndpointState = await resolveFinalizedTripEndpointState({
+          routePath: roadAlignedRoutePath,
+          rawEndPoint: finalLocalRawEndPoint,
+        });
+        const finalLocalStartEndpointState = await resolveFinalizedTripStartEndpointState({
+          routePath: roadAlignedRoutePath,
+          rawStartPoint: payload.rawStartPoint ?? null,
+        });
+        const finalLocalMatchedStartPoint =
+          finalLocalStartEndpointState.matchedStartPoint ??
+          roadAlignedRoutePath[0] ??
+          payload.matchedStartPoint ??
+          resolvedRoutePath[0] ??
+          null;
+        const finalLocalMatchedEndPoint =
+          finalLocalEndpointState.matchedEndPoint ??
+          roadAlignedRoutePath.at(-1) ??
+          payload.matchedEndPoint ??
+          resolvedRoutePath.at(-1) ??
+          null;
+        const finalLocalLabels = await resolveTripDisplayLocationLabels({
+          matchedStartPoint: finalLocalMatchedStartPoint,
+          matchedEndPoint: finalLocalMatchedEndPoint,
+          routePath: roadAlignedRoutePath,
+          filteredStartPoint: payload.rawStartPoint ?? null,
+          filteredEndPoint: finalLocalRawEndPoint,
+        });
+        setTripHistory((prev) =>
+          upsertTripHistoryItems(prev, [
+            buildCompletedTripHistoryRecord({
+              id: optimisticTripId,
+              tripDate,
+              fare,
+              durationSeconds,
+              distanceKm,
+              startedAt: payload.startedAt ?? payload.rawTelemetry?.[0]?.recordedAt ?? null,
+              endedAt: payload.endedAt ?? payload.rawTelemetry?.at(-1)?.recordedAt ?? null,
+              routePath: roadAlignedRoutePath,
+              rawTelemetry: payload.rawTelemetry,
+              rawStartPoint:
+                payload.rawStartPoint ??
+                (payload.rawTelemetry?.[0]
+                  ? {
+                      latitude: payload.rawTelemetry[0].latitude,
+                      longitude: payload.rawTelemetry[0].longitude,
+                    }
+                  : null),
+              rawEndPoint:
+                finalLocalRawEndPoint,
+              matchedStartPoint: finalLocalMatchedStartPoint,
+              matchedEndPoint: finalLocalMatchedEndPoint,
+              dashedStartConnector:
+                finalLocalStartEndpointState.dashedStartConnector.length > 0
+                  ? finalLocalStartEndpointState.dashedStartConnector
+                  : payload.dashedStartConnector ?? [],
+              dashedEndConnector: finalLocalEndpointState.dashedEndConnector,
+              syncStatus: 'SYNC_PENDING',
+              tripState: 'COMPLETED',
+              matchedPointCount: payload.matchedPointCount ?? roadAlignedRoutePath.length,
+              offlineSegmentsCount: payload.offlineSegmentsCount ?? 0,
+              averageSpeedKph: payload.averageSpeedKph ?? null,
+              maxSpeedKph: payload.maxSpeedKph ?? null,
+              idleDurationSeconds: payload.idleDurationSeconds,
+              gpsQualitySummary: payload.gpsQualitySummary ?? null,
+              routeMatchSummary: finalLocalRouteMatchSummary,
+              startDisplayName: finalLocalLabels.startDisplayName,
+              endDisplayName: finalLocalLabels.endDisplayName,
+              startCoordinate: finalLocalLabels.startCoordinate,
+              endCoordinate: finalLocalLabels.endCoordinate,
+            }),
+          ]),
+        );
       })();
       return;
     }
 
     void (async () => {
       const localTripId = activeLocalTripId;
+      const optimisticTripId = buildTripHistoryId({
+        serverTripId: activeTripDbId,
+        localTripId,
+        fallbackOrdinal: tripHistoryRef.current.length + 1,
+      });
+      const optimisticRoutePath = buildOptimisticTripRoutePath({
+        routePath,
+        rawTelemetry: payload.rawTelemetry,
+        routeMatchSummary,
+      });
+      const shouldAttemptImmediateSync = hasSupabaseConfig && isNetworkAvailableRef.current;
+      setTripHistory((prev) =>
+        upsertTripHistoryItems(prev, [
+          buildCompletedTripHistoryRecord({
+            id: optimisticTripId,
+            tripDate,
+            fare,
+            durationSeconds,
+            distanceKm,
+            startedAt: payload.startedAt ?? payload.rawTelemetry?.[0]?.recordedAt ?? null,
+            endedAt: payload.endedAt ?? payload.rawTelemetry?.at(-1)?.recordedAt ?? null,
+            routePath: optimisticRoutePath,
+            rawTelemetry: payload.rawTelemetry,
+            rawStartPoint:
+              payload.rawStartPoint ??
+              (payload.rawTelemetry?.[0]
+                ? {
+                    latitude: payload.rawTelemetry[0].latitude,
+                    longitude: payload.rawTelemetry[0].longitude,
+                  }
+                : optimisticRoutePath[0] ?? null),
+            rawEndPoint:
+              payload.rawEndPoint ??
+              (payload.rawTelemetry?.at(-1)
+                ? {
+                    latitude: payload.rawTelemetry.at(-1)!.latitude,
+                    longitude: payload.rawTelemetry.at(-1)!.longitude,
+                  }
+                : endLocation),
+            matchedStartPoint: payload.matchedStartPoint ?? optimisticRoutePath[0] ?? null,
+            matchedEndPoint: payload.matchedEndPoint ?? optimisticRoutePath.at(-1) ?? null,
+            dashedStartConnector: payload.dashedStartConnector ?? [],
+            syncStatus: shouldAttemptImmediateSync ? 'SYNCED' : 'SYNC_PENDING',
+            tripState: shouldAttemptImmediateSync ? 'COMPLETED' : 'SYNC_PENDING',
+            matchedPointCount: payload.matchedPointCount ?? optimisticRoutePath.length,
+            offlineSegmentsCount: payload.offlineSegmentsCount ?? 0,
+            averageSpeedKph: payload.averageSpeedKph ?? null,
+            maxSpeedKph: payload.maxSpeedKph ?? null,
+            idleDurationSeconds: payload.idleDurationSeconds,
+            gpsQualitySummary: payload.gpsQualitySummary ?? null,
+            routeMatchSummary,
+            startDisplayName: payload.startDisplayName ?? null,
+            endDisplayName: payload.endDisplayName ?? null,
+            startCoordinate: payload.startCoordinate ?? null,
+            endCoordinate: payload.endCoordinate ?? null,
+          }),
+        ]),
+      );
+
       const endedAt = new Date().toISOString();
       const offlineTripPoints = localTripId
         ? await getOfflineTripPointsByLocalTripId(localTripId)
         : [];
-      const reconstruction = await reconstructCompletedTripPath(
+      const offlineMatchedPoints = localTripId
+        ? await getOfflineMatchedTripPointsByLocalTripId(localTripId)
+        : [];
+      const offlineStatusEvents = localTripId
+        ? await getOfflineTripStatusEventsByLocalTripId(localTripId)
+        : [];
+      const rawTelemetry =
         offlineTripPoints.length > 0
-          ? offlineTripPoints.map((point) => ({
-              latitude: point.latitude,
-              longitude: point.longitude,
-              speed: point.speed,
-              heading: point.heading,
-              accuracy: point.accuracy,
-              recordedAt: point.recorded_at,
-            }))
+          ? buildRawTelemetryFromOfflinePoints(offlineTripPoints)
           : (payload.rawTelemetry ??
             routePath.map((point) => ({
               ...point,
               recordedAt: new Date().toISOString(),
-            }))),
+            })));
+      const reconstruction = await reconstructCompletedTripPath(
+        rawTelemetry,
       );
       console.info('[TripReconstruction] Completed trip reconstruction.', {
         localTripId,
@@ -1635,35 +4023,240 @@ export default function App() {
         rawAcceptedPoints: reconstruction.rawAcceptedPath.length,
         reconstructedPoints: reconstruction.reconstructedPath.length,
       });
-      const resolvedRoutePath = reconstruction.reconstructedPath.length > 0
-        ? reconstruction.reconstructedPath
-        : dedupeSequentialRoutePoints(routePath);
-
-      setTripHistory((prev) => [
+      const locallyMatchedPath = buildPreferredOfflineMatchedPath(offlineMatchedPoints);
+      const reconstructedMatchedPath = normalizeSavedRoutePath(
+        reconstruction.reconstructedPath,
+        dedupeSequentialRoutePoints(routePath),
         {
-          id: `TRIP-${String(1000 + prev.length + 1).padStart(4, '0')}`,
-          tripDate,
-          duration: durationLabel,
-          distance: `${distanceKm.toFixed(2)} km`,
-          fare: `\u20B1${fare.toFixed(2)}`,
-          violations: '0',
-          status: 'COMPLETED',
-          compliance: 100,
-          routePath: resolvedRoutePath,
+          preserveDetailedGeometry:
+            preserveDetailedRouteGeometry ||
+            shouldPreserveDetailedRouteGeometry(reconstruction.routeMatchMetadata),
         },
-        ...prev,
-      ]);
+      );
+      const resolvedRoutePath =
+        reconstruction.status === 'matched' && reconstructedMatchedPath.length > 1
+          ? reconstructedMatchedPath
+          : locallyMatchedPath.length > 1
+          ? locallyMatchedPath
+          : normalizeSavedRoutePath(
+              reconstruction.reconstructedPath,
+              buildOptimisticTripRoutePath({
+                routePath,
+                rawTelemetry,
+                routeMatchSummary,
+              }),
+              {
+                preserveDetailedGeometry:
+                  preserveDetailedRouteGeometry ||
+                  shouldPreserveDetailedRouteGeometry(reconstruction.routeMatchMetadata),
+              },
+            );
+      const finalRouteMatchSummary = pickPreferredRouteMatchSummary(
+        reconstruction.routeMatchMetadata ?? null,
+        routeMatchSummary,
+      );
+      const roadAlignedRoutePath = await buildRoadAlignedRoutePath({
+        candidatePath:
+          resolvedRoutePath.length > 2
+            ? resolvedRoutePath
+            : reconstruction.status === 'matched' && reconstruction.reconstructedPath.length > 1
+              ? reconstruction.reconstructedPath
+              : reconstruction.rawAcceptedPath.length > 1
+                ? reconstruction.rawAcceptedPath
+                : resolvedRoutePath,
+        fallbackPath:
+          resolvedRoutePath.length > 1
+            ? resolvedRoutePath
+            : buildOptimisticTripRoutePath({
+                routePath,
+                rawTelemetry,
+                routeMatchSummary,
+              }),
+        preserveDetailedGeometry:
+          preserveDetailedRouteGeometry ||
+          shouldPreserveDetailedRouteGeometry(reconstruction.routeMatchMetadata),
+        trustCandidateGeometry:
+          resolvedRoutePath.length > 1 &&
+          (shouldPreserveDetailedRouteGeometry(finalRouteMatchSummary) ||
+            reconstruction.preprocessedPath.length > 1 ||
+            reconstruction.rawAcceptedPath.length > 1),
+      });
+      const rawStartPoint =
+        offlineTripPoints[0]
+          ? { latitude: offlineTripPoints[0].latitude, longitude: offlineTripPoints[0].longitude }
+          : payload.rawTelemetry?.[0]
+            ? {
+                latitude: payload.rawTelemetry[0].latitude,
+                longitude: payload.rawTelemetry[0].longitude,
+              }
+            : null;
+      const rawEndPoint =
+        offlineTripPoints.length > 0
+          ? {
+              latitude: offlineTripPoints[offlineTripPoints.length - 1].latitude,
+              longitude: offlineTripPoints[offlineTripPoints.length - 1].longitude,
+            }
+          : payload.rawTelemetry?.at(-1)
+            ? {
+                latitude: payload.rawTelemetry.at(-1)!.latitude,
+                longitude: payload.rawTelemetry.at(-1)!.longitude,
+              }
+            : endLocation;
+      const finalizedEndpointState = await resolveFinalizedTripEndpointState({
+        routePath: roadAlignedRoutePath,
+        rawEndPoint,
+      });
+      const finalizedStartEndpointState = await resolveFinalizedTripStartEndpointState({
+        routePath: roadAlignedRoutePath,
+        rawStartPoint,
+      });
+      const finalMatchedStartPoint =
+        finalizedStartEndpointState.matchedStartPoint ??
+        roadAlignedRoutePath[0] ??
+        payload.matchedStartPoint ??
+        resolvedRoutePath[0] ??
+        null;
+      const finalMatchedEndPoint =
+        finalizedEndpointState.matchedEndPoint ??
+        roadAlignedRoutePath.at(-1) ??
+        payload.matchedEndPoint ??
+        resolvedRoutePath.at(-1) ??
+        null;
+      const tripDisplayLabels = await resolveTripDisplayLocationLabels({
+        matchedStartPoint: finalMatchedStartPoint,
+        matchedEndPoint: finalMatchedEndPoint,
+        routePath: roadAlignedRoutePath,
+        filteredStartPoint: rawStartPoint,
+        filteredEndPoint: rawEndPoint,
+      });
+      const finalMatchedPointCount = Math.max(
+        roadAlignedRoutePath.length,
+        payload.matchedPointCount ?? 0,
+        finalRouteMatchSummary?.matchedPointCount ?? 0,
+        offlineMatchedPoints.length,
+      );
+      const finalMatchedPointSource: OfflineMatchedPointSource =
+        shouldPreserveDetailedRouteGeometry(finalRouteMatchSummary)
+          ? 'reconstructed'
+          : 'local-fallback';
+      const reconstructedOfflineMatchedPoints =
+        localTripId && driverDbId !== null && roadAlignedRoutePath.length > 1
+          ? buildMatchedTracePointsFromSegment({
+              path: roadAlignedRoutePath,
+              rawSamples: rawTelemetry,
+              source: finalMatchedPointSource,
+            }).map((point) => ({
+              localTripId,
+              serverTripId: activeTripDbId ? Number(activeTripDbId) : null,
+              driverId: driverDbId,
+              latitude: point.latitude,
+              longitude: point.longitude,
+              recordedAt: point.recordedAt,
+              matchSource: point.source,
+            }))
+          : [];
+      const offlineSegmentsCount =
+        payload.offlineSegmentsCount ??
+        countOfflineSegments(offlineTripPoints.map((point) => point.capture_status));
+      const fallbackTripState = shouldAttemptImmediateSync ? 'COMPLETED' : 'SYNC_PENDING';
+
+      setTripHistory((prev) =>
+        upsertTripHistoryItems(prev, [
+          buildCompletedTripHistoryRecord({
+            id: optimisticTripId,
+            tripDate,
+            fare,
+            durationSeconds,
+            distanceKm,
+            startedAt: rawTelemetry[0]?.recordedAt ?? payload.startedAt ?? null,
+            endedAt,
+            routePath: roadAlignedRoutePath,
+            rawTelemetry,
+            rawStartPoint,
+            rawEndPoint,
+            matchedStartPoint: finalMatchedStartPoint,
+            matchedEndPoint: finalMatchedEndPoint,
+            dashedStartConnector:
+              finalizedStartEndpointState.dashedStartConnector.length > 0
+                ? finalizedStartEndpointState.dashedStartConnector
+                : payload.dashedStartConnector ?? [],
+            dashedEndConnector: finalizedEndpointState.dashedEndConnector,
+            syncStatus: shouldAttemptImmediateSync ? 'SYNCED' : 'SYNC_PENDING',
+            tripState: fallbackTripState,
+            matchedPointCount: finalMatchedPointCount,
+            offlineSegmentsCount,
+            averageSpeedKph: payload.averageSpeedKph ?? null,
+            maxSpeedKph: payload.maxSpeedKph ?? null,
+            idleDurationSeconds: payload.idleDurationSeconds,
+            gpsQualitySummary: payload.gpsQualitySummary ?? null,
+            routeMatchSummary: finalRouteMatchSummary,
+            startDisplayName: tripDisplayLabels.startDisplayName,
+            endDisplayName: tripDisplayLabels.endDisplayName,
+            startCoordinate: tripDisplayLabels.startCoordinate,
+            endCoordinate: tripDisplayLabels.endCoordinate,
+          }),
+        ]),
+      );
 
       if (localTripId) {
+        if (reconstructedOfflineMatchedPoints.length > 0) {
+          await insertOfflineMatchedTripPoints(reconstructedOfflineMatchedPoints);
+        }
         await completeOfflineTripSession({
           localTripId,
-          endLatitude: endLocation?.latitude ?? null,
-          endLongitude: endLocation?.longitude ?? null,
+          endLatitude: finalMatchedEndPoint?.latitude ?? rawEndPoint?.latitude ?? null,
+          endLongitude: finalMatchedEndPoint?.longitude ?? rawEndPoint?.longitude ?? null,
           endedAt,
           fare,
           distanceKm,
           durationSeconds,
         });
+        await insertOfflineTripStatusEvent({
+          localTripId,
+          serverTripId: activeTripDbId ? Number(activeTripDbId) : null,
+          driverId: driverDbId,
+          status: 'trip_completed',
+          recordedAt: endedAt,
+          latitude: finalMatchedEndPoint?.latitude ?? rawEndPoint?.latitude ?? null,
+          longitude: finalMatchedEndPoint?.longitude ?? rawEndPoint?.longitude ?? null,
+          payload: {
+            localTripId,
+            serverTripId: activeTripDbId ? Number(activeTripDbId) : null,
+            driverId: driverDbId,
+            driverCode: profileDriverCode,
+            tricycleNumber: profileDriverCode,
+            plateNumber: profilePlateNumber,
+            startedAt: rawTelemetry[0]?.recordedAt ?? payload.startedAt ?? null,
+            endedAt,
+            tripStatus: 'COMPLETED',
+            syncStatus: shouldAttemptImmediateSync ? 'SYNCED' : 'SYNC_PENDING',
+            fare,
+            distanceKm,
+            durationSeconds,
+            rawStartPoint,
+            rawEndPoint,
+            matchedStartPoint: finalMatchedStartPoint,
+            matchedEndPoint: finalMatchedEndPoint,
+            startDisplayName: tripDisplayLabels.startDisplayName,
+            endDisplayName: tripDisplayLabels.endDisplayName,
+            startCoordinate: tripDisplayLabels.startCoordinate,
+            endCoordinate: tripDisplayLabels.endCoordinate,
+            routePath: roadAlignedRoutePath,
+            routeMatchSummary: finalRouteMatchSummary,
+            gpsQualitySummary: payload.gpsQualitySummary ?? null,
+            rawTelemetry,
+            offlineSegmentsCount,
+            matchedPointCount: finalMatchedPointCount,
+            rawGpsPointCount: rawTelemetry.length,
+            averageSpeedKph: payload.averageSpeedKph ?? null,
+            maxSpeedKph: payload.maxSpeedKph ?? null,
+            idleDurationSeconds: payload.idleDurationSeconds ?? null,
+            compliance: 100,
+            violations: '0',
+            statusEvents: offlineStatusEvents.length,
+          },
+        });
+        await refreshOfflineQueueStatus();
       }
 
       if (!hasSupabaseConfig || !isNetworkAvailableRef.current) {
@@ -1671,9 +4264,49 @@ export default function App() {
         return;
       }
 
+      const markOptimisticTripUnsynced = () => {
+        setTripHistory((prev) =>
+          upsertTripHistoryItems(prev, [
+            buildCompletedTripHistoryRecord({
+              id: optimisticTripId,
+              tripDate,
+              fare,
+              durationSeconds,
+              distanceKm,
+              startedAt: rawTelemetry[0]?.recordedAt ?? payload.startedAt ?? null,
+              endedAt,
+              routePath: roadAlignedRoutePath,
+              rawTelemetry,
+              rawStartPoint,
+              rawEndPoint,
+              matchedStartPoint: finalMatchedStartPoint,
+              matchedEndPoint: finalMatchedEndPoint,
+              dashedStartConnector:
+                finalizedStartEndpointState.dashedStartConnector.length > 0
+                  ? finalizedStartEndpointState.dashedStartConnector
+                  : payload.dashedStartConnector ?? [],
+              dashedEndConnector: finalizedEndpointState.dashedEndConnector,
+              syncStatus: 'SYNC_PENDING',
+              tripState: 'SYNC_PENDING',
+              matchedPointCount: finalMatchedPointCount,
+              offlineSegmentsCount,
+              averageSpeedKph: payload.averageSpeedKph ?? null,
+              maxSpeedKph: payload.maxSpeedKph ?? null,
+              idleDurationSeconds: payload.idleDurationSeconds,
+              gpsQualitySummary: payload.gpsQualitySummary ?? null,
+              routeMatchSummary: finalRouteMatchSummary,
+              startDisplayName: tripDisplayLabels.startDisplayName,
+              endDisplayName: tripDisplayLabels.endDisplayName,
+              startCoordinate: tripDisplayLabels.startCoordinate,
+              endCoordinate: tripDisplayLabels.endCoordinate,
+            }),
+          ]),
+        );
+      };
+
       const startLocation =
-        resolvedRoutePath.length > 0
-          ? { latitude: resolvedRoutePath[0].latitude, longitude: resolvedRoutePath[0].longitude }
+        roadAlignedRoutePath.length > 0
+          ? { latitude: roadAlignedRoutePath[0].latitude, longitude: roadAlignedRoutePath[0].longitude }
           : null;
       const resolvedTripId =
         activeTripDbId ?? (await activeTripStartPromiseRef.current?.catch(() => null)) ?? null;
@@ -1706,29 +4339,53 @@ export default function App() {
         })());
 
       if (!tripId) {
+        markOptimisticTripUnsynced();
         return;
       }
 
-      const endLat = endLocation?.latitude ?? startLocation?.latitude;
-      const endLng = endLocation?.longitude ?? startLocation?.longitude;
-      if (typeof endLat !== 'number' || typeof endLng !== 'number') {
+      const resolvedEndLat =
+        finalizedEndpointState.matchedEndPoint?.latitude ?? endLocation?.latitude ?? startLocation?.latitude;
+      const resolvedEndLng =
+        finalizedEndpointState.matchedEndPoint?.longitude ?? endLocation?.longitude ?? startLocation?.longitude;
+      if (typeof resolvedEndLat !== 'number' || typeof resolvedEndLng !== 'number') {
+        markOptimisticTripUnsynced();
         return;
       }
 
       const { error } = await completeTrip({
         tripId,
-        endLat,
-        endLng,
+        endLat: resolvedEndLat,
+        endLng: resolvedEndLng,
         distanceKm,
         fare,
         durationSeconds,
-        routePoints: resolvedRoutePath,
+        routePoints: roadAlignedRoutePath,
+        routeMatchSummary: finalRouteMatchSummary,
+        gpsQualitySummary: payload.gpsQualitySummary ?? null,
+        matchedPointCount: finalMatchedPointCount,
+        rawGpsPointCount: rawTelemetry.length,
+        rawStartPoint,
+        matchedStartPoint: finalMatchedStartPoint,
+        rawEndPoint,
+        matchedEndPoint: finalMatchedEndPoint,
+        startDisplayName: tripDisplayLabels.startDisplayName,
+        endDisplayName: tripDisplayLabels.endDisplayName,
+        startCoordinate: tripDisplayLabels.startCoordinate,
+        endCoordinate: tripDisplayLabels.endCoordinate,
+        dashedStartConnector:
+          finalizedStartEndpointState.dashedStartConnector.length > 0
+            ? finalizedStartEndpointState.dashedStartConnector
+            : payload.dashedStartConnector ?? [],
+        dashedEndConnector: finalizedEndpointState.dashedEndConnector,
+        offlineSegmentsCount,
+        endpointSelectionSummary: finalizedEndpointState.endpointSelectionSummary,
       });
 
       if (error) {
         if (!isRecoverableConnectivityError(error)) {
           Alert.alert('Trip Sync Error', error);
         }
+        markOptimisticTripUnsynced();
         clearActiveTripState();
         return;
       }
@@ -1737,22 +4394,110 @@ export default function App() {
         await markOfflineTripSessionCompletedSynced(localTripId);
       }
 
+      const syncedHistoryId = buildTripHistoryId({
+        serverTripId: tripId,
+        localTripId,
+        fallbackOrdinal: tripHistoryRef.current.length + 1,
+      });
+      setTripHistory((prev) =>
+        upsertTripHistoryItems(
+          optimisticTripId !== syncedHistoryId
+            ? prev.filter((item) => item.id !== optimisticTripId)
+            : prev,
+          [
+          buildCompletedTripHistoryRecord({
+            id: syncedHistoryId,
+            tripDate,
+            fare,
+            durationSeconds,
+            distanceKm,
+            startedAt: rawTelemetry[0]?.recordedAt ?? payload.startedAt ?? null,
+            endedAt,
+            routePath: roadAlignedRoutePath,
+            rawTelemetry,
+            rawStartPoint,
+            rawEndPoint,
+            matchedStartPoint: finalMatchedStartPoint,
+            matchedEndPoint: finalMatchedEndPoint,
+            dashedStartConnector:
+              finalizedStartEndpointState.dashedStartConnector.length > 0
+                ? finalizedStartEndpointState.dashedStartConnector
+                : payload.dashedStartConnector ?? [],
+            dashedEndConnector: finalizedEndpointState.dashedEndConnector,
+            syncStatus: 'SYNCED',
+            tripState: 'SYNCED',
+            matchedPointCount: finalMatchedPointCount,
+            offlineSegmentsCount,
+            averageSpeedKph: payload.averageSpeedKph ?? null,
+            maxSpeedKph: payload.maxSpeedKph ?? null,
+            idleDurationSeconds: payload.idleDurationSeconds,
+            gpsQualitySummary: payload.gpsQualitySummary ?? null,
+            routeMatchSummary: finalRouteMatchSummary,
+            startDisplayName: tripDisplayLabels.startDisplayName,
+            endDisplayName: tripDisplayLabels.endDisplayName,
+            startCoordinate: tripDisplayLabels.startCoordinate,
+            endCoordinate: tripDisplayLabels.endCoordinate,
+          }),
+        ]),
+      );
+
       clearActiveTripState();
 
       const refreshed = await listTripsWithRoutePoints(driverDbId, 250);
       if (!refreshed.error) {
         const previousRoutesById = new Map(
-          tripHistoryRef.current.map((item) => [item.id, item.routePath]),
+          tripHistoryRef.current.map((item) => [item.id, item]),
         );
         const mapped: TripHistoryItem[] = refreshed.trips.map((t) => {
-          const fallbackRoute =
-            previousRoutesById.get(
-              `TRIP-${String(t.id).split('-')[0]?.toUpperCase() ?? String(t.id)}`,
-            ) ?? resolvedRoutePath;
-          return mapTripRecordToHistoryItem(t, fallbackRoute);
+          const fallbackTrip = previousRoutesById.get(
+            `TRIP-${String(t.id).split('-')[0]?.toUpperCase() ?? String(t.id)}`,
+          );
+          return {
+            ...mapTripRecordToHistoryItem(
+              t,
+              fallbackTrip
+                ? fallbackTrip
+                  : buildCompletedTripHistoryRecord({
+                    id: syncedHistoryId,
+                    tripDate,
+                    fare,
+                    durationSeconds,
+                    distanceKm,
+                    startedAt: rawTelemetry[0]?.recordedAt ?? payload.startedAt ?? null,
+                    endedAt,
+                    routePath: roadAlignedRoutePath,
+                    rawTelemetry,
+                    rawStartPoint,
+                    rawEndPoint,
+                    matchedStartPoint: finalMatchedStartPoint,
+                    matchedEndPoint: finalMatchedEndPoint,
+                    dashedStartConnector:
+                      finalizedStartEndpointState.dashedStartConnector.length > 0
+                        ? finalizedStartEndpointState.dashedStartConnector
+                        : payload.dashedStartConnector ?? [],
+                    dashedEndConnector: finalizedEndpointState.dashedEndConnector,
+                    syncStatus: 'SYNCED',
+                    tripState: 'SYNCED',
+                    matchedPointCount: finalMatchedPointCount,
+                    offlineSegmentsCount,
+                    averageSpeedKph: payload.averageSpeedKph ?? null,
+                    maxSpeedKph: payload.maxSpeedKph ?? null,
+                    idleDurationSeconds: payload.idleDurationSeconds,
+                    gpsQualitySummary: payload.gpsQualitySummary ?? null,
+                    routeMatchSummary: finalRouteMatchSummary,
+                    startDisplayName: tripDisplayLabels.startDisplayName,
+                    endDisplayName: tripDisplayLabels.endDisplayName,
+                    startCoordinate: tripDisplayLabels.startCoordinate,
+                    endCoordinate: tripDisplayLabels.endCoordinate,
+                  }),
+            ),
+            rawStartPoint: fallbackTrip?.rawStartPoint ?? null,
+          };
         });
-        setTripHistory(mapped);
-        const totals = computeTripTotals(mapped);
+        const mergedHistory = reconcileSyncedTripHistoryItems(tripHistoryRef.current, mapped);
+        tripHistoryRef.current = mergedHistory;
+        setTripHistory(mergedHistory);
+        const totals = computeTripTotals(mergedHistory);
         setTotalEarnings(totals.earnings);
         setTotalTrips(totals.trips);
         setTotalDistanceKm(totals.distance);
@@ -1763,20 +4508,200 @@ export default function App() {
     })();
   };
 
+  const handleDeleteTrip = async (tripId: string) => {
+    const localTripId = getLocalTripIdFromHistoryId(tripId);
+    const nextTripHistory = removeTripHistoryItem(tripHistoryRef.current, tripId);
+    setTripHistory(nextTripHistory);
+    tripHistoryRef.current = nextTripHistory;
+    const totals = computeTripTotals(nextTripHistory);
+    setTotalEarnings(totals.earnings);
+    setTotalTrips(totals.trips);
+    setTotalDistanceKm(totals.distance);
+    setTotalMinutes(totals.minutes);
+
+    if (localTripId) {
+      await deleteOfflineTrip(localTripId);
+      return;
+    }
+
+    if (!hasSupabaseConfig) {
+      return;
+    }
+
+    const parsedTripId = Number(tripId.replace(/^TRIP-/, ''));
+    if (!Number.isFinite(parsedTripId)) {
+      return;
+    }
+
+    const { error } = await deleteTripFromBackend(parsedTripId);
+    if (error) {
+      Alert.alert('Delete Trip Error', error);
+      if (driverDbId !== null) {
+        await refreshTripHistoryFromBackend(driverDbId);
+      }
+    }
+  };
+
+  const handleRefreshTripHistory = async () => {
+    if (isTripHistoryRefreshing) {
+      return tripHistoryRef.current;
+    }
+
+    if (!hasSupabaseConfig) {
+      throw new Error('Supabase is not configured, so pending trips cannot sync yet.');
+    }
+
+    if (!isNetworkAvailableRef.current) {
+      throw new Error('The app still reports no reachable internet connection. Toggle Wi-Fi/mobile data or restart the app, then try again.');
+    }
+
+    setIsTripHistoryRefreshing(true);
+    try {
+      let latestHistory: TripHistoryItem[] | null = null;
+      tripRouteRepairAttemptedIdsRef.current = new Set();
+
+      const syncResult = await syncOfflineTripPoints();
+      if (!syncResult.ok) {
+        throw new Error(syncResult.error ?? 'Trip sync failed before the app could refresh trip history.');
+      }
+
+      if (driverDbId !== null) {
+        latestHistory = await refreshTripHistoryFromBackend(driverDbId);
+      }
+
+      const repairedCount = await repairTripHistoryRoutes({
+        targetDriverId: driverDbId,
+        maxCount: MAX_TRIP_ROUTE_REPAIRS_PER_PASS,
+      });
+
+      if (repairedCount > 0 && driverDbId !== null) {
+        latestHistory = await refreshTripHistoryFromBackend(driverDbId);
+      }
+
+      return latestHistory ?? tripHistoryRef.current;
+    } finally {
+      setIsTripHistoryRefreshing(false);
+    }
+  };
+
+  const handleSyncPendingTrip = async (tripId: string) => {
+    if (isTripHistoryRefreshing) {
+      return tripHistoryRef.current;
+    }
+
+    if (!hasSupabaseConfig || !isNetworkAvailableRef.current) {
+      Alert.alert(
+        'Sync unavailable',
+        'Connect to the internet first so this trip can sync and rerun the OSRM road match.',
+      );
+      return tripHistoryRef.current;
+    }
+
+    setIsTripHistoryRefreshing(true);
+    try {
+      const targetLocalTripIdFromHistoryId = tripId.startsWith('TRIP-trip-')
+        ? getLocalTripIdFromHistoryId(tripId)
+        : null;
+      const targetServerTripId =
+        targetLocalTripIdFromHistoryId === null ? parseServerTripIdFromHistoryId(tripId) : null;
+      const targetOfflineSession =
+        targetLocalTripIdFromHistoryId !== null
+          ? await getOfflineTripSession(targetLocalTripIdFromHistoryId)
+          : targetServerTripId !== null
+            ? await getOfflineTripSessionByServerTripId(targetServerTripId)
+            : null;
+      const targetLocalTripId = targetOfflineSession?.local_trip_id ?? targetLocalTripIdFromHistoryId;
+      if (!targetLocalTripId) {
+        if (driverDbId !== null) {
+          return (await refreshTripHistoryFromBackend(driverDbId)) ?? tripHistoryRef.current;
+        }
+        return tripHistoryRef.current;
+      }
+
+      const syncResult = await syncOfflineTripPoints(targetLocalTripId);
+      const refreshedOfflineSession = await getOfflineTripSession(targetLocalTripId);
+      let latestHistory =
+        driverDbId !== null
+          ? await refreshTripHistoryFromBackend(driverDbId)
+          : tripHistoryRef.current;
+
+      const repairedCount = await repairTripHistoryRoutes({
+        targetDriverId: driverDbId,
+        maxCount: MAX_TRIP_ROUTE_REPAIRS_PER_PASS,
+      });
+      if (repairedCount > 0 && driverDbId !== null) {
+        latestHistory = await refreshTripHistoryFromBackend(driverDbId);
+      }
+
+      const syncedServerTripId =
+        refreshedOfflineSession && typeof refreshedOfflineSession.server_trip_id === 'number'
+          ? refreshedOfflineSession.server_trip_id
+          : null;
+      const didSessionFinishSync =
+        syncResult.ok &&
+        refreshedOfflineSession?.completed_synced === 1 &&
+        syncedServerTripId !== null;
+      if (didSessionFinishSync) {
+        promoteOfflineHistoryItemToServerTrip({
+          sourceHistoryId: tripId,
+          localTripId: targetLocalTripId,
+          serverTripId: syncedServerTripId,
+        });
+        latestHistory = tripHistoryRef.current;
+      }
+
+      const relevantPendingIds = new Set(
+        [
+          tripId,
+          `TRIP-${targetLocalTripId}`,
+          typeof refreshedOfflineSession?.server_trip_id === 'number'
+            ? `TRIP-${refreshedOfflineSession.server_trip_id}`
+            : null,
+        ].filter((value): value is string => typeof value === 'string' && value.length > 0),
+      );
+      const nextHistory = latestHistory ?? tripHistoryRef.current;
+      const pendingTripStillExists = nextHistory.some(
+        (item) => item.syncStatus === 'SYNC_PENDING' && relevantPendingIds.has(item.id),
+      );
+      if (pendingTripStillExists) {
+        Alert.alert(
+          'Sync did not finish',
+          !targetLocalTripId
+            ? 'This pending trip is missing its local sync session. Refresh trips, then try again.'
+            : syncResult.ok
+              ? 'This trip is still waiting to sync. Check your connection, then tap Sync now again.'
+              : syncResult.error ?? 'This trip could not sync yet. Check your connection, then tap Sync now again.',
+        );
+      }
+
+      return nextHistory;
+    } finally {
+      setIsTripHistoryRefreshing(false);
+    }
+  };
+
   const trackingScreenSharedProps = {
     onLogout: handleTrackingLogout,
     onNavigate: handleMainTabNavigate,
-    totalEarnings,
-    totalTrips,
-    totalDistanceKm,
-    totalMinutes,
+    totalEarnings: filteredHomeTotals.earnings,
+    totalTrips: filteredHomeTotals.trips,
+    totalDistanceKm: filteredHomeTotals.distance,
+    totalMinutes: filteredHomeTotals.minutes,
+    homeStatsFilter,
+    onChangeHomeStatsFilter: setHomeStatsFilter,
     onGoOnline: () => {
-      void handleGoOnline();
+      void handleGoOnline({ openTripScreen: true });
     },
     onGoOffline: handleTrackingOffline,
     onBackToHome: () => setScreen('home'),
-    onRequestTripNavigation: () => setScreen('tripNavigation'),
-    onExitTripNavigation: () => setScreen('trip'),
+    onRequestTripNavigation: () => {
+      setForceNewTripNavigationSession(!activeLocalTripId);
+      setScreen('tripNavigation');
+    },
+    onExitTripNavigation: () => {
+      setForceNewTripNavigationSession(false);
+      setScreen('trip');
+    },
     isDriverOnline,
     locationEnabled: routeLocationEnabled,
     tripOpenPending: isWaitingForTripLocation,
@@ -1789,9 +4714,10 @@ export default function App() {
     profileDriverCode,
     profilePlateNumber,
     profileImageUri,
-    mapTypeOption,
-    onChangeMapTypeOption: setMapTypeOption,
-    onOpenSimulation: () => setScreen('simulation'),
+    activeTripNumber: activeTripDbId ? `TRIP-${activeTripDbId}` : activeLocalTripId ? `TRIP-${activeLocalTripId}` : null,
+    localSnapRoadPath,
+    restoredTripTrace,
+    isLowBatteryMapMode,
     onTripStart: handleTrackingTripStart,
     onTripPointRecord: ({
       latitude,
@@ -1800,6 +4726,8 @@ export default function App() {
       speed,
       heading,
       accuracy,
+      altitude,
+      provider,
     }: {
       latitude: number;
       longitude: number;
@@ -1807,6 +4735,8 @@ export default function App() {
       speed?: number | null;
       heading?: number | null;
       accuracy?: number | null;
+      altitude?: number | null;
+      provider?: string | null;
     }) => {
       if (driverDbId === null || !activeLocalTripId) {
         return;
@@ -1827,17 +4757,94 @@ export default function App() {
         latitude,
         longitude,
       };
-      void insertOfflineTripPoint({
+      void (async () => {
+        await insertOfflineTripPoint({
+          localTripId: activeLocalTripId,
+          serverTripId: serverTripId !== null && Number.isFinite(serverTripId) ? serverTripId : null,
+          driverId: driverDbId,
+          latitude,
+          longitude,
+          speed,
+          heading,
+          accuracy,
+          altitude,
+          provider,
+          recordedAt,
+          captureStatus: isNetworkAvailableRef.current ? 'online' : 'offline',
+        });
+        if (isNetworkAvailableRef.current) {
+          await syncOfflineTripPoints();
+        } else {
+          await refreshOfflineQueueStatus();
+        }
+      })();
+    },
+    onTripMatchedPathRecord: ({ points }: {
+      points: Array<{
+        latitude: number;
+        longitude: number;
+        recordedAt: string;
+        source: OfflineMatchedPointSource;
+      }>;
+    }) => {
+      if (driverDbId === null || !activeLocalTripId || points.length === 0) {
+        return;
+      }
+
+      const serverTripId = activeTripDbId ? Number(activeTripDbId) : null;
+      void (async () => {
+        await insertOfflineMatchedTripPoints(
+          points.map((point) => ({
+            localTripId: activeLocalTripId,
+            serverTripId: serverTripId !== null && Number.isFinite(serverTripId) ? serverTripId : null,
+            driverId: driverDbId,
+            latitude: point.latitude,
+            longitude: point.longitude,
+            recordedAt: point.recordedAt,
+            matchSource: point.source,
+          })),
+        );
+        if (isNetworkAvailableRef.current) {
+          await syncOfflineTripPoints();
+        } else {
+          await refreshOfflineQueueStatus();
+        }
+      })();
+    },
+    onTripStatusChange: ({
+      status,
+      recordedAt,
+      latitude,
+      longitude,
+      metadata,
+    }: {
+      status:
+        | 'trip_started'
+        | 'movement_confirmed'
+        | 'trip_completed'
+        | 'connectivity_offline'
+        | 'connectivity_online'
+        | 'app_recovered';
+      recordedAt: string;
+      latitude?: number | null;
+      longitude?: number | null;
+      metadata?: Record<string, unknown> | null;
+    }) => {
+      if (driverDbId === null || !activeLocalTripId) {
+        return;
+      }
+
+      const serverTripId = activeTripDbId ? Number(activeTripDbId) : null;
+      void insertOfflineTripStatusEvent({
         localTripId: activeLocalTripId,
         serverTripId: serverTripId !== null && Number.isFinite(serverTripId) ? serverTripId : null,
         driverId: driverDbId,
-        latitude,
-        longitude,
-        speed,
-        heading,
-        accuracy,
+        status,
         recordedAt,
-      });
+        latitude: latitude ?? null,
+        longitude: longitude ?? null,
+        payload: metadata ?? null,
+      }).then(() => refreshOfflineQueueStatus());
     },
     onGeofenceExit: handleTrackingGeofenceExit,
     onTripComplete: handleTrackingTripComplete,
@@ -1850,10 +4857,28 @@ export default function App() {
 
   return (
     <SafeAreaProvider>
-      <View style={styles.safeArea}>
+      <SafeAreaInsetsContext.Consumer>
+        {(insets) => {
+          const bottomInset = insets?.bottom ?? 0;
+
+          return (
+      <View style={[styles.safeArea, isDarkMode ? { backgroundColor: MAXIM_UI_BG_DARK } : null]}>
         <KeyboardAvoidingView
           behavior={Platform.select({ ios: 'padding', android: undefined })}
           style={styles.grow}
+        >
+        <Animated.View
+          style={[
+            {
+              flex: 1,
+            },
+            isNavbarFixedScreen
+              ? null
+              : {
+                  opacity: screenTransitionOpacity,
+                  transform: [{ translateY: screenTransitionTranslateY }],
+                },
+          ]}
         >
         {screen === 'permissionPhone' ? (
           <PermissionOnboardingScreen
@@ -1864,6 +4889,7 @@ export default function App() {
             onContinue={handlePhoneOnboardingContinue}
             onSkip={handlePhoneOnboardingSkip}
             isSubmitting={isPermissionOnboardingSubmitting}
+            isDarkMode={isDarkMode}
           />
         ) : screen === 'permissionLocation' ? (
           <PermissionOnboardingScreen
@@ -1874,30 +4900,41 @@ export default function App() {
             onContinue={handleLocationOnboardingContinue}
             onSkip={handleLocationOnboardingSkip}
             isSubmitting={isPermissionOnboardingSubmitting}
+            isDarkMode={isDarkMode}
           />
         ) : screen === 'home' ? (
           <HomeScreen {...trackingScreenSharedProps} isTripScreen={false} />
         ) : screen === 'startTrip' ? (
           <StartTripScreen {...trackingScreenSharedProps} />
         ) : screen === 'tripNavigation' ? (
-          <TripNavigationScreen {...trackingScreenSharedProps} />
-        ) : screen === 'simulation' ? (
-          <SimulationScreen
-            profileName={profileName}
-            profileDriverCode={profileDriverCode}
-            profilePlateNumber={profilePlateNumber}
-            profileImageUri={profileImageUri}
-            onBack={() => setScreen('home')}
+          <TripNavigationScreen
+            {...trackingScreenSharedProps}
+            forceNewTripSession={forceNewTripNavigationSession}
+            initialTripLocation={
+              lastLiveSyncPointRef.current
+                ? {
+                    latitude: lastLiveSyncPointRef.current.latitude,
+                    longitude: lastLiveSyncPointRef.current.longitude,
+                    timestampMs: lastLiveSyncTimestampRef.current,
+                  }
+                : null
+            }
           />
         ) : screen === 'trip' ? (
           <TripScreen
             onLogout={handleTrackingLogout}
             onNavigate={handleMainTabNavigate}
             tripHistory={tripHistory}
+            offlineQueueStatus={offlineQueueStatus}
+            onDeleteTrip={handleDeleteTrip}
+            onRefreshTripHistory={handleRefreshTripHistory}
+            onSyncTrip={handleSyncPendingTrip}
+            isRefreshingTripHistory={isTripHistoryRefreshing}
             profileName={profileName}
             profileDriverCode={profileDriverCode}
             profilePlateNumber={profilePlateNumber}
             profileImageUri={profileImageUri}
+            isLowBatteryMapMode={isLowBatteryMapMode}
             activeTab="trip"
             styles={styles}
           />
@@ -1906,6 +4943,17 @@ export default function App() {
             onLogout={handleTrackingLogout}
             onNavigate={handleMainTabNavigate}
             driverDbId={driverDbId}
+            violationItems={violationItems}
+            profileName={profileName}
+            profileDriverCode={profileDriverCode}
+            profilePlateNumber={profilePlateNumber}
+            profileImageUri={profileImageUri}
+            isLowBatteryMapMode={isLowBatteryMapMode}
+            onViolationChanged={() => {
+              if (driverDbId !== null) {
+                void refreshViolationItems(driverDbId);
+              }
+            }}
             styles={styles}
           />
         ) : screen === 'profile' ? (
@@ -1917,6 +4965,14 @@ export default function App() {
             profileContact={profileContact}
             profilePlateNumber={profilePlateNumber}
             profileImageUri={profileImageUri}
+            profileQrId={profileQrDetails.qrId}
+            profileQrIssuedAt={profileQrDetails.qrIssuedAt}
+            profileQrReportPath={profileQrDetails.reportPath}
+            profileQrStatus={profileQrDetails.qrStatus}
+            profileQrError={profileQrError}
+            isProfileQrLoading={isProfileQrLoading}
+            totalViolationCount={violationItems.length}
+            isLowBatteryMapMode={isLowBatteryMapMode}
             onUpdateProfile={async ({ name, contact, imageUri }) => {
               const changedFields: string[] = [];
               if (name !== profileName) {
@@ -1974,7 +5030,7 @@ export default function App() {
           />
         ) : (
           <ScrollView
-            style={styles.scrollView}
+            style={[styles.scrollView, isDarkMode ? { backgroundColor: MAXIM_UI_BG_DARK } : null]}
             contentContainerStyle={[
               styles.scrollContainer,
               screen === 'getStarted' && styles.scrollContainerNoTop,
@@ -1982,13 +5038,19 @@ export default function App() {
             bounces={false}
           >
               {screen === 'getStarted' ? (
-                <GetStartedScreen onGetStarted={() => setScreen('login')} styles={styles} />
+                <GetStartedScreen
+                  onGetStarted={() => setScreen('login')}
+                  styles={styles}
+                  isDarkMode={isDarkMode}
+                />
               ) : (
                 <View
                   style={[
                     styles.fullScreenCard,
+                    { paddingBottom: 28 + bottomInset },
                     screen === 'login' && styles.loginScreenLowered,
                     screen === 'createPassword' && styles.forgotScreenLowered,
+                    isDarkMode ? { backgroundColor: MAXIM_UI_BG_DARK } : null,
                   ]}
                 >
                   <Pressable
@@ -1997,9 +5059,22 @@ export default function App() {
                     }
                   style={[
                     styles.backButton,
+                    isDarkMode
+                      ? {
+                          backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
+                          borderWidth: 1,
+                          borderColor: MAXIM_UI_BORDER_SOFT_DARK,
+                          shadowOpacity: 0,
+                          elevation: 0,
+                        }
+                      : null,
                   ]}
                 >
-                  <AppIcon name="chevron-left" size={20} color="#030318" />
+                  <AppIcon
+                    name="chevron-left"
+                    size={20}
+                    color={isDarkMode ? MAXIM_UI_TEXT_DARK : '#030318'}
+                  />
                 </Pressable>
 
                 <Text
@@ -2010,6 +5085,7 @@ export default function App() {
                     (screen === 'login' ||
                       screen === 'createPassword') &&
                       styles.authTitleSmall,
+                    isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null,
                   ]}
                 >
                   {content.title}
@@ -2017,6 +5093,7 @@ export default function App() {
                 <Text
                   style={[
                     styles.subtitle,
+                    isDarkMode ? { color: MAXIM_UI_SUBTLE_DARK } : null,
                   ]}
                 >
                   {content.subtitle}
@@ -2028,7 +5105,8 @@ export default function App() {
                     onCreatePassword={() => setScreen('createPassword')}
                     onLogin={handleDriverLogin}
                     isAuthenticating={isAuthenticating}
-                    styles={styles}
+                    styles={themedAuthStyles}
+                    isDarkMode={isDarkMode}
                   />
                 </View>
                 ) : null}
@@ -2038,7 +5116,8 @@ export default function App() {
                     onBackToLogin={() => setScreen('login')}
                     onSubmit={handleCreatePassword}
                     isSubmitting={isSettingPassword}
-                    styles={styles}
+                    styles={themedAuthStyles}
+                    isDarkMode={isDarkMode}
                   />
                 ) : null}
               </View>
@@ -2056,10 +5135,18 @@ export default function App() {
           confirmLabel={tripActionModalContent.confirmLabel}
           cancelLabel="Cancel"
         />
+        </Animated.View>
       </KeyboardAvoidingView>
 
-        <StatusBar style="dark" translucent backgroundColor="transparent" />
+        <StatusBar
+          style={isDarkMode ? 'light' : 'dark'}
+          translucent={false}
+          backgroundColor={isDarkMode ? MAXIM_UI_BG_DARK : '#F5F6F8'}
+        />
       </View>
+          );
+        }}
+      </SafeAreaInsetsContext.Consumer>
     </SafeAreaProvider>
   );
 }
@@ -2110,7 +5197,6 @@ const styles = StyleSheet.create({
   homeScreen: {
     flex: 1,
     backgroundColor: '#F3F5F7',
-    paddingTop: Platform.OS === 'android' ? STATUS_BAR_HEIGHT : 0,
   },
   homeContentArea: {
     flex: 1,

@@ -8,6 +8,7 @@ type InputFieldProps = {
 } & Pick<
   TextInputProps,
   | 'placeholder'
+  | 'placeholderTextColor'
   | 'secureTextEntry'
   | 'value'
   | 'onChangeText'
@@ -23,11 +24,10 @@ export function InputField({ icon, trailingIcon, styles, ...textInputProps }: In
       {icon ? <View style={styles.inputIcon}>{icon}</View> : null}
       <TextInput
         style={styles.input}
-        placeholderTextColor="#9CA3AF"
+        placeholderTextColor={textInputProps.placeholderTextColor ?? '#9CA3AF'}
         {...textInputProps}
       />
       {trailingIcon ? <View style={styles.trailingIcon}>{trailingIcon}</View> : null}
     </View>
   );
 }
-
