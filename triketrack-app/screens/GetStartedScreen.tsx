@@ -1,39 +1,72 @@
-import { Pressable, StyleSheet, Text, View } from 'react-native';
-import { TrikeTrackLogo } from '../components/branding';
-import { MAXIM_UI_BG_DARK, MAXIM_UI_MUTED_DARK } from './homeScreenShared';
+import { ActivityIndicator, Image, StyleSheet, Text, View } from 'react-native';
+import {
+  MAXIM_UI_BG_DARK,
+  MAXIM_UI_MUTED_DARK,
+} from './homeScreenShared';
 
 type GetStartedScreenProps = {
-  onGetStarted: () => void;
   styles: Record<string, any>;
   isDarkMode?: boolean;
+  authText?: string;
 };
 
-export function GetStartedScreen({ onGetStarted, isDarkMode = false }: GetStartedScreenProps) {
+export function GetStartedScreen({ isDarkMode = false, authText }: GetStartedScreenProps) {
   return (
-    <Pressable
+    <View
       style={[localStyles.container, isDarkMode ? { backgroundColor: MAXIM_UI_BG_DARK } : null]}
-      onPress={onGetStarted}
     >
-      <TrikeTrackLogo />
-      <Text style={[localStyles.hint, isDarkMode ? { color: MAXIM_UI_MUTED_DARK } : null]}>
-        Tap anywhere to get started
-      </Text>
-    </Pressable>
+      <View style={localStyles.logoBlock}>
+        <Image
+          source={require('../assets/logo.png')}
+          style={localStyles.logo}
+          resizeMode="contain"
+        />
+      </View>
+      {authText ? (
+        <View style={localStyles.statusRow}>
+          <Text style={[localStyles.authText, isDarkMode ? { color: MAXIM_UI_MUTED_DARK } : null]}>
+            Connecting to service...
+          </Text>
+          <ActivityIndicator size="small" color={isDarkMode ? '#7CE6C8' : '#147D64'} />
+        </View>
+      ) : null}
+    </View>
   );
 }
 
 const localStyles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#57c7a8',
+    minHeight: 680,
+    backgroundColor: '#F7FBFA',
+    paddingHorizontal: 24,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  hint: {
-    marginTop: 22,
-    fontSize: 13,
-    lineHeight: 16,
-    color: 'rgba(255,255,255,0.85)',
+  logoBlock: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  statusRow: {
+    position: 'absolute',
+    left: 24,
+    right: 24,
+    bottom: 112,
+    minHeight: 24,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+  },
+  logo: {
+    width: 246,
+    height: 246,
+  },
+  authText: {
+    color: '#768293',
+    fontSize: 14,
+    lineHeight: 18,
     fontFamily: 'CircularStdMedium500',
+    textAlign: 'center',
   },
 });

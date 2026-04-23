@@ -19,6 +19,10 @@ type TripScreenProps = {
   onLogout?: () => void;
   onNavigate?: (tab: BottomTab) => void;
   tripHistory: TripHistoryItem[];
+  focusTripRequest?: {
+    tripId: string;
+    requestedAt: number;
+  } | null;
   offlineQueueStatus?: {
     pendingTripCount: number;
     pendingGpsPointCount: number;
@@ -61,6 +65,7 @@ export function TripScreen({
   onLogout: _onLogout,
   onNavigate,
   tripHistory,
+  focusTripRequest = null,
   offlineQueueStatus,
   onDeleteTrip,
   onRefreshTripHistory,
@@ -102,6 +107,31 @@ export function TripScreen({
 
     setSelectedTrip(null);
   }, [isRefreshingTripHistory, selectedTrip, syncingTripId, tripHistory]);
+
+  useEffect(() => {
+    if (!focusTripRequest?.tripId) {
+      return;
+    }
+
+    const focusedTrip =
+      tripHistory.find((item) => item.id === focusTripRequest.tripId) ??
+      tripHistory.find((item) => {
+        const normalizedTarget = focusTripRequest.tripId.replace(/^TRIP-/, '');
+        return item.id.replace(/^TRIP-/, '') === normalizedTarget;
+      }) ??
+      null;
+
+    if (!focusedTrip) {
+      return;
+    }
+
+    setIsManagingTrips(false);
+    setSelectedTripIds([]);
+    setSelectedUnsyncedTripIds([]);
+    setQuery('');
+    setListTab('ALL');
+    setSelectedTrip(focusedTrip);
+  }, [focusTripRequest?.requestedAt, focusTripRequest?.tripId, tripHistory]);
 
   useEffect(() => {
     const existingTripIds = new Set(tripHistory.map((item) => item.id));

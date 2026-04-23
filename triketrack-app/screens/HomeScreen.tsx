@@ -137,6 +137,7 @@ type HomeScreenProps = {
   unreadNotificationCount: number;
   onMarkNotificationRead: (notificationId: string) => void;
   onMarkAllNotificationsRead: () => void;
+  onOpenNotification: (notification: NotificationCenterItem) => void;
   onTripComplete: (payload: TripCompletionPayload) => void;
   onTripStart?: (payload: {
     startLocation: { latitude: number; longitude: number } | null;
@@ -214,6 +215,7 @@ export function HomeScreen({
   unreadNotificationCount,
   onMarkNotificationRead,
   onMarkAllNotificationsRead,
+  onOpenNotification,
   onTripComplete,
   onTripStart,
   onTripPointRecord,
@@ -2514,7 +2516,10 @@ export function HomeScreen({
         onRequestClose={() => setShowNotificationCenter(false)}
         notifications={notifications}
         unreadCount={unreadNotificationCount}
-        onPressNotification={onMarkNotificationRead}
+        onPressNotification={(notification) => {
+          setShowNotificationCenter(false);
+          onOpenNotification(notification);
+        }}
         onMarkAllRead={onMarkAllNotificationsRead}
         isLowBatteryMapMode={isDarkMap}
       />

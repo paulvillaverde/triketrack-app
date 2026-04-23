@@ -29,6 +29,10 @@ type ViolationScreenProps = {
   onNavigate?: (tab: BottomTab) => void;
   driverDbId?: number | null;
   violationItems?: ViolationItem[];
+  focusViolationRequest?: {
+    violationId: string;
+    requestedAt: number;
+  } | null;
   profileName: string;
   profileDriverCode: string;
   profilePlateNumber: string;
@@ -171,6 +175,7 @@ export function ViolationScreen({
   onNavigate,
   driverDbId,
   violationItems: violationItemsProp,
+  focusViolationRequest = null,
   profileName,
   profileDriverCode,
   profilePlateNumber,
@@ -219,6 +224,24 @@ export function ViolationScreen({
     () => violationItems.find((item) => item.id === selectedViolationId) ?? null,
     [selectedViolationId, violationItems],
   );
+
+  useEffect(() => {
+    if (!focusViolationRequest?.violationId) {
+      return;
+    }
+
+    const focusedViolation = violationItems.find((item) => item.id === focusViolationRequest.violationId);
+    if (!focusedViolation) {
+      return;
+    }
+
+    setFilter('ALL');
+    setQuery('');
+    setSelectedReason('');
+    setDetails('');
+    setSelectedViolationId(focusedViolation.id);
+  }, [focusViolationRequest?.requestedAt, focusViolationRequest?.violationId, violationItems]);
+
   const selectedViolationCoordinate = useMemo(() => {
     if (
       !selectedViolation ||
@@ -889,6 +912,24 @@ export function ViolationScreen({
             </Pressable>
           </View>
 
+          {rows.length === 0 ? (
+            <View
+              style={[
+                localStyles.emptySection,
+                isLowBatteryMapMode
+                  ? {
+                      backgroundColor: MAXIM_UI_SURFACE_DARK,
+                      borderColor: MAXIM_UI_BORDER_DARK,
+                    }
+                  : null,
+              ]}
+            >
+              <Text style={[localStyles.emptyText, isLowBatteryMapMode ? { color: MAXIM_UI_MUTED_DARK } : null]}>
+                No violations found in this section
+              </Text>
+            </View>
+          ) : null}
+
           {rows.map((item) => {
             const { datePart, timePart } = formatViolationCardDateParts(item);
             return (
@@ -1221,6 +1262,23 @@ const localStyles = StyleSheet.create({
   },
   filterTextActive: {
     color: '#1D4ED8',
+  },
+  emptySection: {
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    borderRadius: 16,
+    paddingVertical: 13,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 10,
+  },
+  emptyText: {
+    fontSize: 13,
+    lineHeight: 16,
+    color: '#64748B',
+    fontFamily: 'CircularStdMedium500',
+    textAlign: 'center',
   },
   invoiceCard: {
     backgroundColor: '#FFFFFF',

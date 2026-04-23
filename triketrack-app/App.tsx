@@ -37,7 +37,9 @@ import {
   setDriverPassword,
   startTrip,
   supabase,
+  type DriverProfileRecord,
   type DriverQrStatus,
+  type DriverRecord,
   uploadDriverAvatar,
   upsertDriverLocation,
   insertTripRouteBatch,
@@ -105,6 +107,7 @@ import { PermissionOnboardingScreen } from './screens/PermissionOnboardingScreen
 import {
   TripActionModal,
   type NotificationCenterItem,
+  type NotificationCenterTarget,
 } from './components/modals';
 import { AppIcon, type AppIconName } from './components/ui';
 import { useLowBatteryMapMode } from './lib/useLowBatteryMapMode';
@@ -142,10 +145,12 @@ type PermissionOnboardingState = {
 type HomeStatsFilter = 'TODAY' | 'YESTERDAY' | 'LAST_WEEK' | 'LAST_30_DAYS';
 
 type NotificationDraft = {
-  category: 'account' | 'profile' | 'trip' | 'violation';
+  category: 'account' | 'profile' | 'trip' | 'violation' | 'appeal';
   title: string;
   message: string;
   icon: AppIconName;
+  target?: NotificationCenterTarget;
+  dedupeKey?: string;
 };
 
 type OfflineQueueStatus = {
@@ -183,6 +188,127 @@ const createEmptyOfflineQueueStatus = (): OfflineQueueStatus => ({
   lastError: null,
   nextRetryAt: null,
 });
+
+const NOTIFICATION_MAX_ITEMS = 60;
+const NOTIFICATION_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const NOTIFICATION_DUPLICATE_WINDOW_MS = 2 * 60 * 60 * 1000;
+const NOTIFICATION_ALLOWED_CATEGORIES = new Set<NotificationCenterItem['category']>([
+  'account',
+  'profile',
+  'trip',
+  'violation',
+  'appeal',
+]);
+const NOTIFICATION_ALLOWED_TARGET_SCREENS = new Set<NotificationCenterTarget['screen']>([
+  'home',
+  'profile',
+  'trip',
+  'startTrip',
+  'tripNavigation',
+  'violation',
+]);
+
+const parseNotificationDateMs = (createdAt: string) => {
+  const parsed = new Date(createdAt).getTime();
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const normalizeNotificationTarget = (target: unknown): NotificationCenterTarget | undefined => {
+  if (!target || typeof target !== 'object') {
+    return undefined;
+  }
+
+  const candidate = target as Partial<NotificationCenterTarget>;
+  if (
+    typeof candidate.screen !== 'string' ||
+    !NOTIFICATION_ALLOWED_TARGET_SCREENS.has(candidate.screen as NotificationCenterTarget['screen'])
+  ) {
+    return undefined;
+  }
+
+  return {
+    screen: candidate.screen as NotificationCenterTarget['screen'],
+    itemId:
+      typeof candidate.itemId === 'string' && candidate.itemId.trim().length > 0
+        ? candidate.itemId
+        : null,
+  };
+};
+
+const getNotificationDedupeKey = (item: Pick<NotificationCenterItem, 'category' | 'title' | 'message' | 'target' | 'dedupeKey'>) =>
+  item.dedupeKey?.trim() ||
+  [
+    item.category,
+    item.title.trim().toLowerCase(),
+    item.message.trim().toLowerCase(),
+    item.target?.screen ?? '',
+    item.target?.itemId ?? '',
+  ].join(':');
+
+const isRelevantNotification = (item: NotificationCenterItem, nowMs = Date.now()) => {
+  const createdAtMs = parseNotificationDateMs(item.createdAt);
+  if (createdAtMs === null) {
+    return false;
+  }
+
+  return (
+    NOTIFICATION_ALLOWED_CATEGORIES.has(item.category) &&
+    item.title.trim().length > 0 &&
+    item.message.trim().length > 0 &&
+    createdAtMs <= nowMs + 5 * 60 * 1000 &&
+    nowMs - createdAtMs <= NOTIFICATION_RETENTION_MS
+  );
+};
+
+const normalizeNotificationItems = (items: NotificationCenterItem[], nowMs = Date.now()) => {
+  const seenKeys = new Set<string>();
+
+  return items
+    .filter((item) => isRelevantNotification(item, nowMs))
+    .sort((a, b) => {
+      const aMs = parseNotificationDateMs(a.createdAt) ?? 0;
+      const bMs = parseNotificationDateMs(b.createdAt) ?? 0;
+      return bMs - aMs;
+    })
+    .filter((item) => {
+      const key = getNotificationDedupeKey(item);
+      if (seenKeys.has(key)) {
+        return false;
+      }
+      seenKeys.add(key);
+      return true;
+    })
+    .slice(0, NOTIFICATION_MAX_ITEMS);
+};
+
+const normalizeStoredNotificationItem = (item: Partial<NotificationCenterItem>): NotificationCenterItem | null => {
+  if (
+    typeof item.id !== 'string' ||
+    typeof item.title !== 'string' ||
+    typeof item.message !== 'string' ||
+    typeof item.createdAt !== 'string' ||
+    typeof item.icon !== 'string' ||
+    typeof item.read !== 'boolean' ||
+    typeof item.category !== 'string' ||
+    !NOTIFICATION_ALLOWED_CATEGORIES.has(item.category as NotificationCenterItem['category'])
+  ) {
+    return null;
+  }
+
+  return {
+    id: item.id,
+    category: item.category as NotificationCenterItem['category'],
+    title: item.title,
+    message: item.message,
+    createdAt: item.createdAt,
+    read: item.read,
+    icon: item.icon as AppIconName,
+    target: normalizeNotificationTarget(item.target),
+    dedupeKey: typeof item.dedupeKey === 'string' ? item.dedupeKey : undefined,
+  };
+};
+
+const STARTUP_AUTH_MIN_DISPLAY_MS = 2000;
 
 const createDemoTrip = (): TripHistoryItem => {
   const today = new Date();
@@ -739,6 +865,7 @@ const SCREEN_CONTENT: Record<Screen, { title: string; subtitle: string }> = {
 
 export default function App() {
   const PROFILE_STORAGE_KEY = 'triketrack_profile_v2_';
+  const DRIVER_SESSION_STORAGE_KEY = 'triketrack_driver_session_v1';
   const TRIP_HISTORY_STORAGE_KEY = 'triketrack_trip_history_v2_';
   const NOTIFICATION_STORAGE_KEY = 'triketrack_notifications_v1_';
   const PERMISSION_ONBOARDING_STORAGE_KEY = 'triketrack_permission_onboarding_v1';
@@ -748,6 +875,7 @@ export default function App() {
     NissanOpti: require('./assets/fonts/NissanOpti.otf'),
   });
   const [screen, setScreen] = useState<Screen>('getStarted');
+  const [startupAuthText, setStartupAuthText] = useState('Connecting to service...');
   const [routeLocationEnabled, setRouteLocationEnabled] = useState(false);
   const [isDriverOnline, setIsDriverOnline] = useState(false);
   const [showTripActionModal, setShowTripActionModal] = useState(false);
@@ -801,6 +929,14 @@ export default function App() {
   const tripRouteRepairInFlightRef = useRef(false);
   const [notifications, setNotifications] = useState<NotificationCenterItem[]>([]);
   const [notificationsHydrated, setNotificationsHydrated] = useState(false);
+  const [tripNotificationFocusRequest, setTripNotificationFocusRequest] = useState<{
+    tripId: string;
+    requestedAt: number;
+  } | null>(null);
+  const [violationNotificationFocusRequest, setViolationNotificationFocusRequest] = useState<{
+    violationId: string;
+    requestedAt: number;
+  } | null>(null);
   const screenTransitionOpacity = useRef(new Animated.Value(1)).current;
   const screenTransitionTranslateY = useRef(new Animated.Value(0)).current;
   const content = useMemo(() => SCREEN_CONTENT[screen], [screen]);
@@ -861,6 +997,67 @@ export default function App() {
     });
   };
 
+  const applyDriverIdentity = (driver: DriverRecord | DriverProfileRecord) => {
+    setProfileName(driver.full_name);
+    setProfileDriverCode(driver.driver_id);
+    setProfileContact(driver.contact_number);
+    setProfilePlateNumber(driver.plate_number);
+    setProfileImageUri(driver.avatar_url ?? null);
+    setDriverDbId(driver.id);
+  };
+
+  const applyCachedDriverProfile = (
+    targetDriverId: number,
+    profile: {
+      name?: string;
+      driverCode?: string;
+      contact?: string;
+      plateNumber?: string;
+      imageUri?: string | null;
+      qrId?: number | null;
+      qrToken?: string | null;
+      qrStatus?: DriverQrStatus | null;
+      qrIssuedAt?: string | null;
+      reportPath?: string | null;
+    },
+  ) => {
+    setProfileName(profile.name || 'Juan Dela Cruz');
+    setProfileDriverCode(profile.driverCode || 'D-001');
+    setProfileContact(profile.contact || '09276096932');
+    setProfilePlateNumber(profile.plateNumber || 'DXA-1001');
+    setProfileImageUri(typeof profile.imageUri === 'undefined' ? null : profile.imageUri);
+    applyProfileQrDetails({
+      qr_id: profile.qrId,
+      qr_token: profile.qrToken,
+      qr_status: profile.qrStatus,
+      qr_issued_at: profile.qrIssuedAt,
+      report_path: profile.reportPath,
+    });
+    setDriverDbId(targetDriverId);
+  };
+
+  const readCachedDriverProfile = async (targetDriverId: number) => {
+    const raw = await AsyncStorage.getItem(`${PROFILE_STORAGE_KEY}${targetDriverId}`);
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(raw) as {
+      name?: string;
+      driverCode?: string;
+      contact?: string;
+      plateNumber?: string;
+      imageUri?: string | null;
+      qrId?: number | null;
+      qrToken?: string | null;
+      qrStatus?: DriverQrStatus | null;
+      qrIssuedAt?: string | null;
+      reportPath?: string | null;
+    };
+
+    return parsed.driverCode || parsed.name ? parsed : null;
+  };
+
   const refreshDriverProfileFromBackend = async (
     targetDriverId: number,
     options?: { preserveError?: boolean },
@@ -889,6 +1086,7 @@ export default function App() {
       return;
     }
 
+    applyDriverIdentity(profile);
     applyProfileQrDetails(profile);
     setProfileQrError(null);
     setIsProfileQrLoading(false);
@@ -1409,19 +1607,41 @@ export default function App() {
     }
   }, [driverDbId, isDriverOnline]);
 
-  const pushNotification = ({ category, title, message, icon }: NotificationDraft) => {
-    setNotifications((prev) => [
-      {
-        id: `${category}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        category,
-        title,
-        message,
-        icon,
-        createdAt: new Date().toISOString(),
-        read: false,
-      },
-      ...prev,
-    ].slice(0, 60));
+  const pushNotification = ({ category, title, message, icon, target, dedupeKey }: NotificationDraft) => {
+    const createdAt = new Date().toISOString();
+    const nextNotification: NotificationCenterItem = {
+      id: `${category}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      category,
+      title,
+      message,
+      icon,
+      target,
+      dedupeKey,
+      createdAt,
+      read: false,
+    };
+
+    if (!isRelevantNotification(nextNotification)) {
+      return;
+    }
+
+    const nextDedupeKey = getNotificationDedupeKey(nextNotification);
+    const nowMs = Date.now();
+    setNotifications((prev) => {
+      const recentDuplicate = prev.some((item) => {
+        if (getNotificationDedupeKey(item) !== nextDedupeKey) {
+          return false;
+        }
+
+        const createdAtMs = parseNotificationDateMs(item.createdAt);
+        return createdAtMs !== null && nowMs - createdAtMs <= NOTIFICATION_DUPLICATE_WINDOW_MS;
+      });
+      if (recentDuplicate) {
+        return normalizeNotificationItems(prev, nowMs);
+      }
+
+      return normalizeNotificationItems([nextNotification, ...prev], nowMs);
+    });
   };
 
   const refreshTripHistoryFromBackend = async (targetDriverId: number) => {
@@ -1726,6 +1946,89 @@ export default function App() {
     );
   };
 
+  const resolveNotificationTarget = (notification: NotificationCenterItem): NotificationCenterTarget => {
+    if (notification.target) {
+      return notification.target;
+    }
+
+    if (notification.category === 'account' || notification.category === 'profile') {
+      return { screen: 'profile' };
+    }
+
+    if (notification.category === 'violation' || notification.category === 'appeal') {
+      return { screen: 'violation' };
+    }
+
+    const normalizedTitle = notification.title.toLowerCase();
+    if (
+      notification.category === 'trip' &&
+      (normalizedTitle.includes('started') || normalizedTitle.includes('recovered')) &&
+      activeLocalTripId
+    ) {
+      return { screen: 'tripNavigation' };
+    }
+
+    if (notification.category === 'trip') {
+      return { screen: 'trip' };
+    }
+
+    return { screen: 'home' };
+  };
+
+  const handleOpenNotification = (notification: NotificationCenterItem) => {
+    markNotificationRead(notification.id);
+
+    const target = resolveNotificationTarget(notification);
+    if (target.screen === 'profile') {
+      setScreen('profile');
+      return;
+    }
+
+    if (target.screen === 'violation') {
+      if (target.itemId) {
+        setViolationNotificationFocusRequest({
+          violationId: target.itemId,
+          requestedAt: Date.now(),
+        });
+      }
+      setScreen('violation');
+      return;
+    }
+
+    if (target.screen === 'trip') {
+      if (target.itemId) {
+        setTripNotificationFocusRequest({
+          tripId: target.itemId,
+          requestedAt: Date.now(),
+        });
+      }
+      setScreen('trip');
+      return;
+    }
+
+    if (target.screen === 'tripNavigation') {
+      if (activeLocalTripId) {
+        setForceNewTripNavigationSession(false);
+        setScreen('tripNavigation');
+        return;
+      }
+      setScreen('trip');
+      return;
+    }
+
+    if (target.screen === 'startTrip') {
+      if (activeLocalTripId) {
+        setForceNewTripNavigationSession(false);
+        setScreen('tripNavigation');
+        return;
+      }
+      setScreen(isDriverOnline ? 'startTrip' : 'home');
+      return;
+    }
+
+    setScreen('home');
+  };
+
   const unreadNotificationCount = notifications.reduce(
     (count, item) => count + (item.read ? 0 : 1),
     0,
@@ -1784,6 +2087,100 @@ export default function App() {
       return false;
     }
   };
+
+  useEffect(() => {
+    if (!fontsLoaded) {
+      return;
+    }
+
+    let cancelled = false;
+    const startupStartedAt = Date.now();
+
+    const waitForMinimumStartupDisplay = async () => {
+      const remainingMs = STARTUP_AUTH_MIN_DISPLAY_MS - (Date.now() - startupStartedAt);
+      if (remainingMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, remainingMs));
+      }
+    };
+
+    const navigateAfterStartup = async (nextScreen: 'home' | 'login') => {
+      await waitForMinimumStartupDisplay();
+      if (!cancelled) {
+        setScreen(nextScreen);
+      }
+    };
+
+    const openLogin = async () => {
+      await AsyncStorage.removeItem(DRIVER_SESSION_STORAGE_KEY).catch(() => undefined);
+      await navigateAfterStartup('login');
+    };
+
+    const restoreStoredDriverSession = async () => {
+      setStartupAuthText('Connecting to service...');
+
+      try {
+        const rawSession = await AsyncStorage.getItem(DRIVER_SESSION_STORAGE_KEY);
+        if (!rawSession) {
+          await openLogin();
+          return;
+        }
+
+        const parsedSession = JSON.parse(rawSession) as {
+          driverDbId?: number;
+          driverId?: number;
+        };
+        const sessionDriverId =
+          typeof parsedSession.driverDbId === 'number'
+            ? parsedSession.driverDbId
+            : typeof parsedSession.driverId === 'number'
+              ? parsedSession.driverId
+              : null;
+
+        if (sessionDriverId === null || !Number.isFinite(sessionDriverId)) {
+          await openLogin();
+          return;
+        }
+
+        setStartupAuthText('Authenticating...');
+        const cachedProfile = await readCachedDriverProfile(sessionDriverId).catch(() => null);
+        const { profile, error } = await fetchDriverProfile(sessionDriverId);
+        if (cancelled) {
+          return;
+        }
+
+        if (profile) {
+          applyDriverIdentity(profile);
+          applyProfileQrDetails(profile);
+          setProfileQrError(null);
+        } else if (cachedProfile && error) {
+          applyCachedDriverProfile(sessionDriverId, cachedProfile);
+          setProfileQrError(null);
+        } else {
+          await openLogin();
+          return;
+        }
+
+        setPendingPhoneAccessStatus('granted');
+        const savedPermissionOnboarding = ALWAYS_SHOW_PERMISSION_ONBOARDING
+          ? null
+          : await loadPermissionOnboardingState();
+        if (cancelled) {
+          return;
+        }
+        setPermissionOnboardingState(savedPermissionOnboarding);
+        await refreshLocationAvailability();
+        await navigateAfterStartup('home');
+      } catch {
+        await openLogin();
+      }
+    };
+
+    void restoreStoredDriverSession();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [fontsLoaded]);
 
   const requestLocationAccessFromOnboarding = async () => {
     try {
@@ -2496,6 +2893,8 @@ export default function App() {
         title: 'Trip recovered',
         message: 'Your active trip was restored from this device and tracking can continue.',
         icon: 'refresh-cw',
+        target: { screen: 'tripNavigation' },
+        dedupeKey: `trip-recovered-${activeLocalTripId}`,
       });
     }
 
@@ -2639,21 +3038,11 @@ export default function App() {
           return;
         }
 
-        const normalized = parsed
-          .filter(
-            (item): item is NotificationCenterItem =>
-              typeof item.id === 'string' &&
-              typeof item.title === 'string' &&
-              typeof item.message === 'string' &&
-              typeof item.createdAt === 'string' &&
-              typeof item.icon === 'string' &&
-              typeof item.read === 'boolean' &&
-              (item.category === 'account' ||
-                item.category === 'profile' ||
-                item.category === 'trip' ||
-                item.category === 'violation'),
-          )
-          .slice(0, 60);
+        const normalized = normalizeNotificationItems(
+          parsed
+            .map((item) => normalizeStoredNotificationItem(item))
+            .filter((item): item is NotificationCenterItem => item !== null),
+        );
 
         setNotifications(normalized);
       } catch {
@@ -3034,6 +3423,8 @@ export default function App() {
           ? 'Trip tools are ready. You can start or manage a trip from the route flow.'
           : 'Live trip operations are ready. Your location will keep updating while you stay online.',
         icon: 'radio',
+        target: { screen: options?.openTripScreen ? 'startTrip' : 'home' },
+        dedupeKey: `driver-online-${driverDbId ?? 'local'}`,
       });
       queueTripOpen();
 
@@ -3108,13 +3499,16 @@ export default function App() {
       return;
     }
 
-    setProfileName(driver.full_name);
-    setProfileDriverCode(driver.driver_id);
-    setProfileContact(driver.contact_number);
-    setProfilePlateNumber(driver.plate_number);
-    setProfileImageUri(driver.avatar_url ?? null);
-    setDriverDbId(driver.id);
+    applyDriverIdentity(driver);
     setPendingPhoneAccessStatus('granted');
+    await AsyncStorage.setItem(
+      DRIVER_SESSION_STORAGE_KEY,
+      JSON.stringify({
+        driverDbId: driver.id,
+        driverCode: driver.driver_id,
+        savedAt: new Date().toISOString(),
+      }),
+    ).catch(() => undefined);
 
     const savedPermissionOnboarding = ALWAYS_SHOW_PERMISSION_ONBOARDING
       ? null
@@ -3409,6 +3803,7 @@ export default function App() {
     setPendingPhoneAccessStatus('granted');
     setRouteLocationEnabled(false);
     setRestoredTripTrace(null);
+    void AsyncStorage.removeItem(DRIVER_SESSION_STORAGE_KEY);
     setScreen('login');
   };
 
@@ -3425,6 +3820,8 @@ export default function App() {
       title: 'You are now offline',
       message: 'Trip availability has been paused. Use the route action any time you want to go back online.',
       icon: 'moon',
+      target: { screen: 'home' },
+      dedupeKey: `driver-offline-${driverDbId ?? 'local'}`,
     });
     setActiveLocalTripId(null);
     setRestoredTripTrace(null);
@@ -3508,6 +3905,8 @@ export default function App() {
       title: 'Trip started',
       message: 'Your live trip is now active and route tracking has started.',
       icon: 'map',
+      target: { screen: 'tripNavigation' },
+      dedupeKey: `trip-started-${tripId}`,
     });
     setActiveLocalTripId(localTripId);
     setActiveTripDbId(tripId);
@@ -3570,7 +3969,7 @@ export default function App() {
     void (async () => {
       const tripId =
         activeTripDbId ?? (await activeTripStartPromiseRef.current?.catch(() => null)) ?? null;
-      const { error } = await createViolation({
+      const { violation, error } = await createViolation({
         driverId: driverDbId,
         tripId,
         type: 'GEOFENCE_BOUNDARY',
@@ -3589,6 +3988,8 @@ export default function App() {
           title: 'Violation recorded',
           message: 'A geofence boundary violation was added to your account for this trip.',
           icon: 'alert-triangle',
+          target: { screen: 'violation', itemId: violation?.id ?? null },
+          dedupeKey: violation?.id ? `violation-${violation.id}` : `geofence-violation-${tripId ?? 'active'}`,
         });
       }
     })();
@@ -3728,11 +4129,18 @@ export default function App() {
     const mm = String(today.getMonth() + 1).padStart(2, '0');
     const dd = String(today.getDate()).padStart(2, '0');
     const tripDate = `${yyyy}-${mm}-${dd}`;
+    const completedTripNotificationId = activeTripDbId
+      ? `TRIP-${activeTripDbId}`
+      : activeLocalTripId
+        ? `TRIP-${activeLocalTripId}`
+        : null;
     pushNotification({
       category: 'trip',
       title: 'Trip completed',
       message: `Trip saved with ${distanceKm.toFixed(2)} km travelled and ${fare.toFixed(2)} fare recorded.`,
       icon: 'check-circle',
+      target: { screen: 'trip', itemId: completedTripNotificationId },
+      dedupeKey: `trip-completed-${completedTripNotificationId ?? payload.startedAt ?? 'local'}`,
     });
 
     if (driverDbId === null) {
@@ -4710,6 +5118,7 @@ export default function App() {
     unreadNotificationCount,
     onMarkNotificationRead: markNotificationRead,
     onMarkAllNotificationsRead: markAllNotificationsRead,
+    onOpenNotification: handleOpenNotification,
     profileName,
     profileDriverCode,
     profilePlateNumber,
@@ -4925,6 +5334,7 @@ export default function App() {
             onLogout={handleTrackingLogout}
             onNavigate={handleMainTabNavigate}
             tripHistory={tripHistory}
+            focusTripRequest={tripNotificationFocusRequest}
             offlineQueueStatus={offlineQueueStatus}
             onDeleteTrip={handleDeleteTrip}
             onRefreshTripHistory={handleRefreshTripHistory}
@@ -4944,6 +5354,7 @@ export default function App() {
             onNavigate={handleMainTabNavigate}
             driverDbId={driverDbId}
             violationItems={violationItems}
+            focusViolationRequest={violationNotificationFocusRequest}
             profileName={profileName}
             profileDriverCode={profileDriverCode}
             profilePlateNumber={profilePlateNumber}
@@ -4996,21 +5407,24 @@ export default function App() {
                 !imageUri.startsWith('http://') &&
                 !imageUri.startsWith('https://');
 
-              if (!shouldUploadAvatar) {
-                return;
-              }
+              if (shouldUploadAvatar) {
+                const { publicUrl, error, warning } = await uploadDriverAvatar({
+                  driverId: driverDbId,
+                  localUri: imageUri,
+                });
 
-              const { publicUrl, error, warning } = await uploadDriverAvatar({
-                driverId: driverDbId,
-                localUri: imageUri,
-              });
+                if (publicUrl) {
+                  setProfileImageUri(publicUrl);
+                }
 
-              if (error) {
-                throw new Error(error);
-              }
-
-              if (publicUrl) {
-                setProfileImageUri(publicUrl);
+                if (warning) {
+                  Alert.alert('Avatar Saved Locally', warning);
+                } else if (error) {
+                  Alert.alert(
+                    'Avatar Saved Locally',
+                    `Your profile photo was updated on this device, but it could not sync to the server yet. ${error}`,
+                  );
+                }
               }
 
               if (changedFields.length > 0) {
@@ -5019,11 +5433,9 @@ export default function App() {
                   title: 'Profile updated',
                   message: `Updated ${changedFields.join(', ')} in your account details.`,
                   icon: 'user',
+                  target: { screen: 'profile' },
+                  dedupeKey: `profile-updated-${driverDbId ?? 'local'}-${changedFields.sort().join('-')}`,
                 });
-              }
-
-              if (warning) {
-                Alert.alert('Avatar Saved Locally', warning);
               }
             }}
             styles={styles}
@@ -5039,9 +5451,9 @@ export default function App() {
           >
               {screen === 'getStarted' ? (
                 <GetStartedScreen
-                  onGetStarted={() => setScreen('login')}
                   styles={styles}
                   isDarkMode={isDarkMode}
+                  authText={startupAuthText}
                 />
               ) : (
                 <View
@@ -5053,29 +5465,29 @@ export default function App() {
                     isDarkMode ? { backgroundColor: MAXIM_UI_BG_DARK } : null,
                   ]}
                 >
+                {screen === 'createPassword' ? (
                   <Pressable
-                    onPress={() =>
-                      setScreen(screen === 'login' ? 'getStarted' : 'login')
-                    }
-                  style={[
-                    styles.backButton,
-                    isDarkMode
-                      ? {
-                          backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
-                          borderWidth: 1,
-                          borderColor: MAXIM_UI_BORDER_SOFT_DARK,
-                          shadowOpacity: 0,
-                          elevation: 0,
-                        }
-                      : null,
-                  ]}
-                >
-                  <AppIcon
-                    name="chevron-left"
-                    size={20}
-                    color={isDarkMode ? MAXIM_UI_TEXT_DARK : '#030318'}
-                  />
-                </Pressable>
+                    onPress={() => setScreen('login')}
+                    style={[
+                      styles.backButton,
+                      isDarkMode
+                        ? {
+                            backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
+                            borderWidth: 1,
+                            borderColor: MAXIM_UI_BORDER_SOFT_DARK,
+                            shadowOpacity: 0,
+                            elevation: 0,
+                          }
+                        : null,
+                    ]}
+                  >
+                    <AppIcon
+                      name="chevron-left"
+                      size={20}
+                      color={isDarkMode ? MAXIM_UI_TEXT_DARK : '#030318'}
+                    />
+                  </Pressable>
+                ) : null}
 
                 <Text
                   style={[

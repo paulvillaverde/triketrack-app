@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
+import * as FileSystemLegacy from 'expo-file-system/legacy';
 import QRCode from 'qrcode';
 import { SvgXml } from 'react-native-svg';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -105,6 +106,30 @@ export function ProfileScreen({
   }, [profileName, profileContact, profileImageUri]);
   const isDarkMode = isLowBatteryMapMode;
 
+  const persistPickedProfileImage = async (asset: ImagePicker.ImagePickerAsset) => {
+    const sourceUri = asset.uri;
+    const documentDirectory = FileSystemLegacy.documentDirectory;
+    if (!documentDirectory) {
+      return sourceUri;
+    }
+
+    const extension =
+      asset.fileName?.split('.').pop()?.toLowerCase() ??
+      sourceUri.split('.').pop()?.split('?')[0]?.toLowerCase() ??
+      'jpg';
+    const normalizedExtension = extension === 'jpeg' ? 'jpg' : extension;
+    const avatarDirectory = `${documentDirectory}profile-avatar/`;
+    const destinationUri = `${avatarDirectory}driver-avatar-${Date.now()}.${normalizedExtension}`;
+
+    try {
+      await FileSystemLegacy.makeDirectoryAsync(avatarDirectory, { intermediates: true });
+      await FileSystemLegacy.copyAsync({ from: sourceUri, to: destinationUri });
+      return destinationUri;
+    } catch {
+      return sourceUri;
+    }
+  };
+
   useEffect(() => {
     let active = true;
 
@@ -174,34 +199,38 @@ export function ProfileScreen({
   const pickProfileImage = async () => {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permission.granted) {
+      Alert.alert('Photo access needed', 'Allow photo library access to update your profile photo.');
       return;
     }
 
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ['images'],
-      allowsEditing: false,
+      allowsEditing: true,
+      aspect: [1, 1],
       quality: 0.9,
     });
 
     if (!result.canceled && result.assets.length > 0) {
-      setDraftImageUri(result.assets[0].uri);
+      setDraftImageUri(await persistPickedProfileImage(result.assets[0]));
     }
   };
 
   const changeAvatar = async () => {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permission.granted) {
+      Alert.alert('Photo access needed', 'Allow photo library access to update your profile photo.');
       return;
     }
 
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ['images'],
-      allowsEditing: false,
+      allowsEditing: true,
+      aspect: [1, 1],
       quality: 0.9,
     });
 
     if (!result.canceled && result.assets.length > 0) {
-      const uri = result.assets[0].uri;
+      const uri = await persistPickedProfileImage(result.assets[0]);
       setDraftImageUri(uri);
       try {
         setIsSavingProfile(true);

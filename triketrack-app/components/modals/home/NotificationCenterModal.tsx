@@ -15,12 +15,19 @@ import {
 
 export type NotificationCenterItem = {
   id: string;
-  category: 'account' | 'profile' | 'trip' | 'violation';
+  category: 'account' | 'profile' | 'trip' | 'violation' | 'appeal';
   title: string;
   message: string;
   createdAt: string;
   read: boolean;
   icon: AppIconName;
+  target?: NotificationCenterTarget;
+  dedupeKey?: string;
+};
+
+export type NotificationCenterTarget = {
+  screen: 'home' | 'profile' | 'trip' | 'startTrip' | 'tripNavigation' | 'violation';
+  itemId?: string | null;
 };
 
 type NotificationCenterModalProps = {
@@ -28,7 +35,7 @@ type NotificationCenterModalProps = {
   onRequestClose: () => void;
   notifications: NotificationCenterItem[];
   unreadCount: number;
-  onPressNotification: (notificationId: string) => void;
+  onPressNotification: (notification: NotificationCenterItem) => void;
   onMarkAllRead: () => void;
   isLowBatteryMapMode?: boolean;
 };
@@ -75,62 +82,29 @@ export function NotificationCenterModal({
   const insets = useSafeAreaInsets();
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onRequestClose}>
+    <Modal
+      visible={visible}
+      transparent={false}
+      animationType="slide"
+      presentationStyle="fullScreen"
+      statusBarTranslucent={false}
+      onRequestClose={onRequestClose}
+    >
       <View
         style={[
-          styles.backdrop,
-          isLowBatteryMapMode ? { backgroundColor: 'rgba(10, 14, 20, 0.58)' } : null,
+          styles.screen,
+          {
+            paddingTop: 12 + insets.top,
+            paddingBottom: 18 + insets.bottom,
+          },
+          isLowBatteryMapMode ? { backgroundColor: MAXIM_UI_SURFACE_DARK } : null,
         ]}
       >
-        <View
-          style={[
-            styles.sheet,
-            { paddingBottom: 24 + insets.bottom },
-            isLowBatteryMapMode
-              ? {
-                  backgroundColor: MAXIM_UI_SURFACE_DARK,
-                  borderTopWidth: 1,
-                  borderTopColor: MAXIM_UI_BORDER_DARK,
-                }
-              : null,
-          ]}
-        >
           <View style={styles.header}>
-            <View>
-              <Text
-                style={[
-                  styles.title,
-                  isLowBatteryMapMode ? { color: MAXIM_UI_TEXT_DARK } : null,
-                ]}
-              >
-                Notifications
-              </Text>
-              <Text
-                style={[
-                  styles.subtitle,
-                  isLowBatteryMapMode ? { color: MAXIM_UI_MUTED_DARK } : null,
-                ]}
-              >
-                {unreadCount > 0
-                  ? `${unreadCount} unread update${unreadCount > 1 ? 's' : ''}`
-                  : 'Everything is up to date'}
-              </Text>
-            </View>
-            <View style={styles.headerActions}>
-              {unreadCount > 0 ? (
-                <Pressable
-                  style={[
-                    styles.markAllButton,
-                    isLowBatteryMapMode ? { backgroundColor: MAXIM_UI_GREEN_SOFT_DARK } : null,
-                  ]}
-                  onPress={onMarkAllRead}
-                >
-                  <Text style={styles.markAllButtonText}>Mark all read</Text>
-                </Pressable>
-              ) : null}
+            <View style={styles.headerSide}>
               <Pressable
                 style={[
-                  styles.closeButton,
+                  styles.backButton,
                   isLowBatteryMapMode
                     ? {
                         backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
@@ -141,12 +115,46 @@ export function NotificationCenterModal({
                 onPress={onRequestClose}
               >
                 <AppIcon
-                  name="x"
-                  size={18}
+                  name="chevron-left"
+                  size={20}
                   color={isLowBatteryMapMode ? MAXIM_UI_TEXT_DARK : '#0F172A'}
                 />
               </Pressable>
             </View>
+            <Text
+              style={[
+                styles.title,
+                isLowBatteryMapMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+              ]}
+              numberOfLines={1}
+            >
+              Notifications
+            </Text>
+            <View style={styles.headerSide} />
+          </View>
+
+          <View style={styles.summaryRow}>
+            <Text
+              style={[
+                styles.subtitle,
+                isLowBatteryMapMode ? { color: MAXIM_UI_MUTED_DARK } : null,
+              ]}
+            >
+              {unreadCount > 0
+                ? `${unreadCount} unread update${unreadCount > 1 ? 's' : ''}`
+                : 'Everything is up to date'}
+            </Text>
+            {unreadCount > 0 ? (
+              <Pressable
+                style={[
+                  styles.markAllButton,
+                  isLowBatteryMapMode ? { backgroundColor: MAXIM_UI_GREEN_SOFT_DARK } : null,
+                ]}
+                onPress={onMarkAllRead}
+              >
+                <Text style={styles.markAllButtonText}>Mark all read</Text>
+              </Pressable>
+            ) : null}
           </View>
 
           <FlatList
@@ -170,7 +178,7 @@ export function NotificationCenterModal({
                     ? { backgroundColor: MAXIM_UI_SURFACE_ELEVATED_DARK }
                     : null,
                 ]}
-                onPress={() => onPressNotification(item.id)}
+                onPress={() => onPressNotification(item)}
               >
                 <View
                   style={[
@@ -250,52 +258,51 @@ export function NotificationCenterModal({
               </View>
             }
           />
-        </View>
       </View>
     </Modal>
   );
 }
 
 const styles = StyleSheet.create({
-  backdrop: {
+  screen: {
     flex: 1,
-    backgroundColor: 'rgba(15, 23, 42, 0.28)',
-    justifyContent: 'flex-end',
-  },
-  sheet: {
-    maxHeight: '82%',
-    minHeight: '54%',
-    borderTopLeftRadius: 28,
-    borderTopRightRadius: 28,
     backgroundColor: '#FFFFFF',
-    paddingTop: 18,
     paddingHorizontal: 18,
-    paddingBottom: 24,
   },
   header: {
+    minHeight: 48,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  headerSide: {
+    width: 42,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  title: {
+    flex: 1,
+    textAlign: 'center',
+    fontSize: 20,
+    lineHeight: 24,
+    color: '#0F172A',
+    fontFamily: 'CircularStdMedium500',
+  },
+  summaryRow: {
+    minHeight: 40,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: 12,
     marginBottom: 12,
   },
-  title: {
-    fontSize: 22,
-    lineHeight: 26,
-    color: '#0F172A',
-    fontFamily: 'CircularStdMedium500',
-  },
   subtitle: {
-    marginTop: 4,
+    flex: 1,
     fontSize: 13,
     lineHeight: 18,
     color: '#64748B',
     fontFamily: 'CircularStdMedium500',
-  },
-  headerActions: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
   },
   markAllButton: {
     paddingHorizontal: 12,
@@ -311,7 +318,7 @@ const styles = StyleSheet.create({
     lineHeight: 14,
     fontFamily: 'CircularStdMedium500',
   },
-  closeButton: {
+  backButton: {
     width: 36,
     height: 36,
     borderRadius: 18,
