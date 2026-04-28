@@ -724,7 +724,7 @@ export const OsmMapView = forwardRef<OsmMapViewHandle, OsmMapViewProps>(function
   return (
     <View style={style} pointerEvents={pointerEvents}>
       <MapView
-        ref={(instance) => {
+        ref={(instance: MapViewRef | null) => {
           mapViewRef.current = instance;
         }}
         style={StyleSheet.absoluteFill}
@@ -745,7 +745,7 @@ export const OsmMapView = forwardRef<OsmMapViewHandle, OsmMapViewProps>(function
         }}
       >
         <Camera
-          ref={(instance) => {
+          ref={(instance: CameraRef | null) => {
             cameraRef.current = instance;
           }}
           defaultSettings={{

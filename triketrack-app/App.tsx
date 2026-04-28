@@ -1,6 +1,8 @@
 import { StatusBar } from 'expo-status-bar';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AppState,
+  type AppStateStatus,
   Animated,
   Alert,
   Easing,
@@ -25,7 +27,6 @@ import {
   attachTripRoutesToServerTrip,
   checkTripExists,
   completeTrip,
-  createViolation,
   deleteTrip as deleteTripFromBackend,
   fetchDriverProfile,
   hasSupabaseConfig,
@@ -785,6 +786,45 @@ const mapViolationRecordToItem = (violation: {
   };
 };
 
+type RealtimeViolationPayload = {
+  id?: string;
+  type?: 'GEOFENCE_BOUNDARY' | 'ROUTE_DEVIATION' | 'UNAUTHORIZED_STOP';
+  priority?: 'HIGH' | 'MEDIUM' | 'LOW';
+  title?: string | null;
+  details?: string | null;
+  location_label?: string | null;
+  occurred_at?: string;
+};
+
+const getViolationRealtimeTitle = (violation: RealtimeViolationPayload) => {
+  if (typeof violation.title === 'string' && violation.title.trim().length > 0) {
+    return violation.title.trim();
+  }
+
+  if (violation.type === 'GEOFENCE_BOUNDARY') return 'Geofence Boundary Violation';
+  if (violation.type === 'ROUTE_DEVIATION') return 'Route Deviation Alert';
+  if (violation.type === 'UNAUTHORIZED_STOP') return 'Unauthorized Stop';
+  return 'Violation recorded';
+};
+
+const getViolationRealtimeMessage = (violation: RealtimeViolationPayload) => {
+  const details =
+    typeof violation.details === 'string' && violation.details.trim().length > 0
+      ? violation.details.trim()
+      : null;
+  const location =
+    typeof violation.location_label === 'string' && violation.location_label.trim().length > 0
+      ? violation.location_label.trim()
+      : null;
+
+  if (details && location) {
+    return `${details} Location: ${location}.`;
+  }
+  if (details) return details;
+  if (location) return `Location: ${location}.`;
+  return 'A server-validated route violation has been added to your account.';
+};
+
 const isTemporarilyIgnorableRouteError = (error: string | null | undefined) => {
   const normalizedError = error?.toLowerCase() ?? '';
   return (
@@ -976,6 +1016,11 @@ export default function App() {
   const offlineSyncRetryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const offlineSyncRetryDelayMsRef = useRef(OFFLINE_SYNC_RETRY_BASE_MS);
   const recoveredTripNotificationIdsRef = useRef<Set<string>>(new Set());
+  const notifiedViolationIdsRef = useRef<Set<string>>(new Set());
+  const violationFeedHydratedRef = useRef(false);
+  const workflowRefreshInFlightRef = useRef<Promise<void> | null>(null);
+  const lastWorkflowRefreshAtRef = useRef(0);
+  const appStateRef = useRef<AppStateStatus>(AppState.currentState);
   const getTripHistoryStorageKey = (targetDriverId: number) => `${TRIP_HISTORY_STORAGE_KEY}${targetDriverId}`;
 
   const applyProfileQrDetails = (payload: {
@@ -1592,6 +1637,8 @@ export default function App() {
   useEffect(() => {
     tripRouteRepairAttemptedIdsRef.current = new Set();
     tripRouteRepairInFlightRef.current = false;
+    notifiedViolationIdsRef.current = new Set();
+    violationFeedHydratedRef.current = false;
   }, [driverDbId]);
 
   useEffect(() => {
@@ -1845,12 +1892,41 @@ export default function App() {
     })();
   }, [driverDbId, tripHistory, tripHistoryHydrated]);
 
-  const refreshViolationItems = async (targetDriverId: number) => {
+  const refreshViolationItems = async (
+    targetDriverId: number,
+    options?: { notifyNew?: boolean },
+  ) => {
     const { violations, error } = await listViolations(targetDriverId);
     if (error) {
-      return;
+      return false;
     }
-    setViolationItems(violations.map(mapViolationRecordToItem));
+
+    if (driverDbIdRef.current !== targetDriverId) {
+      return false;
+    }
+
+    const mappedViolations = violations.map(mapViolationRecordToItem);
+    if (!violationFeedHydratedRef.current) {
+      notifiedViolationIdsRef.current = new Set(mappedViolations.map((violation) => violation.id));
+      violationFeedHydratedRef.current = true;
+    } else if (options?.notifyNew !== false) {
+      const unseenViolations = mappedViolations.filter(
+        (violation) => !notifiedViolationIdsRef.current.has(violation.id),
+      );
+
+      for (const violation of [...unseenViolations].reverse()) {
+        notifiedViolationIdsRef.current.add(violation.id);
+        pushNotification({
+          category: 'violation',
+          title: violation.title,
+          message: violation.details !== '--' ? violation.details : getViolationRealtimeMessage(violation),
+          icon: 'alert-triangle',
+        });
+      }
+    }
+
+    setViolationItems(mappedViolations);
+    return true;
   };
 
   const syncDriverPresenceLocation = async (
@@ -2795,6 +2871,62 @@ export default function App() {
     }
   };
 
+  const refreshDriverWorkflowState = async (
+    targetDriverId: number,
+    options?: {
+      includeProfile?: boolean;
+      includeTripHistory?: boolean;
+      includeViolations?: boolean;
+      includeOfflineSync?: boolean;
+      force?: boolean;
+    },
+  ) => {
+    if (driverDbIdRef.current !== targetDriverId) {
+      return;
+    }
+
+    const now = Date.now();
+    if (!options?.force && now - lastWorkflowRefreshAtRef.current < 10_000) {
+      return workflowRefreshInFlightRef.current ?? Promise.resolve();
+    }
+
+    if (workflowRefreshInFlightRef.current) {
+      return workflowRefreshInFlightRef.current;
+    }
+
+    lastWorkflowRefreshAtRef.current = now;
+    const pendingRefresh = (async () => {
+      if (options?.includeOfflineSync) {
+        await refreshTripHistoryAfterNetworkRestore();
+      }
+
+      const followUpTasks: Promise<unknown>[] = [];
+      if (options?.includeProfile) {
+        followUpTasks.push(
+          refreshDriverProfileFromBackend(targetDriverId, { preserveError: true }),
+        );
+      }
+      if (
+        options?.includeTripHistory &&
+        tripHistoryHydratedDriverIdRef.current === targetDriverId
+      ) {
+        followUpTasks.push(refreshTripHistoryFromBackend(targetDriverId));
+      }
+      if (options?.includeViolations) {
+        followUpTasks.push(refreshViolationItems(targetDriverId, { notifyNew: true }));
+      }
+
+      if (followUpTasks.length > 0) {
+        await Promise.allSettled(followUpTasks);
+      }
+    })().finally(() => {
+      workflowRefreshInFlightRef.current = null;
+    });
+
+    workflowRefreshInFlightRef.current = pendingRefresh;
+    return pendingRefresh;
+  };
+
   useEffect(() => {
     void (async () => {
       await initOfflineTripStorage();
@@ -2909,18 +3041,67 @@ export default function App() {
       const nextIsOnline = Boolean(state.isConnected && state.isInternetReachable !== false);
       isNetworkAvailableRef.current = nextIsOnline;
       if (nextIsOnline) {
-        void refreshTripHistoryAfterNetworkRestore();
+        const targetDriverId = driverDbIdRef.current;
+        if (targetDriverId !== null) {
+          void refreshDriverWorkflowState(targetDriverId, {
+            includeProfile: true,
+            includeViolations: true,
+            includeOfflineSync: true,
+            force: true,
+          });
+        } else {
+          void refreshTripHistoryAfterNetworkRestore();
+        }
       }
     });
 
     void NetInfo.fetch().then((state) => {
       isNetworkAvailableRef.current = Boolean(state.isConnected && state.isInternetReachable !== false);
       if (state.isConnected && state.isInternetReachable !== false) {
-        void refreshTripHistoryAfterNetworkRestore();
+        const targetDriverId = driverDbIdRef.current;
+        if (targetDriverId !== null) {
+          void refreshDriverWorkflowState(targetDriverId, {
+            includeProfile: true,
+            includeViolations: true,
+            includeOfflineSync: true,
+            force: true,
+          });
+        } else {
+          void refreshTripHistoryAfterNetworkRestore();
+        }
       }
     });
 
     return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextAppState) => {
+      const previousState = appStateRef.current;
+      appStateRef.current = nextAppState;
+      const resumedToActive =
+        (previousState === 'background' || previousState === 'inactive') &&
+        nextAppState === 'active';
+
+      if (
+        !resumedToActive ||
+        driverDbIdRef.current === null ||
+        !hasSupabaseConfig ||
+        !isNetworkAvailableRef.current
+      ) {
+        return;
+      }
+
+      void refreshDriverWorkflowState(driverDbIdRef.current, {
+        includeProfile: true,
+        includeTripHistory: true,
+        includeViolations: true,
+      });
+    });
+
+    return () => {
+      subscription.remove();
+    };
   }, []);
 
   useEffect(() => {
@@ -3595,7 +3776,24 @@ export default function App() {
           table: 'mobile_violations',
           filter: `driver_id=eq.${driverDbId}`,
         },
-        () => {
+        (payload) => {
+          if (payload.eventType === 'INSERT') {
+            const violation = payload.new as RealtimeViolationPayload | null;
+            const violationId =
+              typeof violation?.id === 'string' && violation.id.trim().length > 0
+                ? violation.id.trim()
+                : null;
+
+            if (violationId && !notifiedViolationIdsRef.current.has(violationId)) {
+              notifiedViolationIdsRef.current.add(violationId);
+              pushNotification({
+                category: 'violation',
+                title: getViolationRealtimeTitle(violation ?? {}),
+                message: getViolationRealtimeMessage(violation ?? {}),
+                icon: 'alert-triangle',
+              });
+            }
+          }
           void refreshViolationItems(driverDbId);
         },
       )
@@ -3966,33 +4164,13 @@ export default function App() {
       );
     }
 
-    void (async () => {
-      const tripId =
-        activeTripDbId ?? (await activeTripStartPromiseRef.current?.catch(() => null)) ?? null;
-      const { violation, error } = await createViolation({
-        driverId: driverDbId,
-        tripId,
-        type: 'GEOFENCE_BOUNDARY',
-        priority: 'HIGH',
-        latitude: location?.latitude,
-        longitude: location?.longitude,
-        locationLabel: 'Obrero geofence',
-        details: 'Driver exited the authorized geofence during an active trip.',
-      });
-      if (!error) {
-        if (driverDbId !== null) {
-          void refreshViolationItems(driverDbId);
-        }
-        pushNotification({
-          category: 'violation',
-          title: 'Violation recorded',
-          message: 'A geofence boundary violation was added to your account for this trip.',
-          icon: 'alert-triangle',
-          target: { screen: 'violation', itemId: violation?.id ?? null },
-          dedupeKey: violation?.id ? `violation-${violation.id}` : `geofence-violation-${tripId ?? 'active'}`,
-        });
-      }
-    })();
+    pushNotification({
+      category: 'violation',
+      title: 'Geofence warning',
+      message:
+        'Your trip point will be validated by the server and synced as an official violation if confirmed.',
+      icon: 'alert-triangle',
+    });
   };
 
   const buildRawTelemetryFromOfflinePoints = (

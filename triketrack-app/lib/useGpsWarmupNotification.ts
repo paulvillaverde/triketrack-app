@@ -1,13 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { Platform } from 'react-native';
-import cancelScheduledNotificationAsync from 'expo-notifications/build/cancelScheduledNotificationAsync';
-import dismissNotificationAsync from 'expo-notifications/build/dismissNotificationAsync';
-import { getPermissionsAsync, requestPermissionsAsync } from 'expo-notifications/build/NotificationPermissions';
-import { AndroidImportance } from 'expo-notifications/build/NotificationChannelManager.types';
-import { IosAuthorizationStatus } from 'expo-notifications/build/NotificationPermissions.types';
-import scheduleNotificationAsync from 'expo-notifications/build/scheduleNotificationAsync';
-import setNotificationChannelAsync from 'expo-notifications/build/setNotificationChannelAsync';
-import { setNotificationHandler } from 'expo-notifications/build/NotificationsHandler';
+import * as Notifications from 'expo-notifications';
 
 const GPS_WARMUP_NOTIFICATION_ID = 'triketrack-gps-warmup';
 const GPS_WARMUP_CHANNEL_ID = 'trip-gps';
@@ -21,7 +14,7 @@ const configureNotificationHandler = () => {
   }
 
   hasConfiguredNotificationHandler = true;
-  setNotificationHandler({
+  Notifications.setNotificationHandler({
     handleNotification: async () => ({
       shouldShowBanner: true,
       shouldShowList: true,
@@ -34,21 +27,22 @@ const configureNotificationHandler = () => {
 const ensureGpsNotificationReady = async () => {
   configureNotificationHandler();
 
-  const existingPermission = await getPermissionsAsync();
+  const existingPermission = await Notifications.getPermissionsAsync();
   const permission =
-    existingPermission.granted || existingPermission.ios?.status === IosAuthorizationStatus.PROVISIONAL
+    existingPermission.granted ||
+    existingPermission.ios?.status === Notifications.IosAuthorizationStatus.PROVISIONAL
       ? existingPermission
-      : await requestPermissionsAsync();
+      : await Notifications.requestPermissionsAsync();
 
-  if (!permission.granted && permission.ios?.status !== IosAuthorizationStatus.PROVISIONAL) {
+  if (!permission.granted && permission.ios?.status !== Notifications.IosAuthorizationStatus.PROVISIONAL) {
     return false;
   }
 
   if (Platform.OS === 'android' && !hasConfiguredAndroidChannel) {
     hasConfiguredAndroidChannel = true;
-    await setNotificationChannelAsync(GPS_WARMUP_CHANNEL_ID, {
+    await Notifications.setNotificationChannelAsync(GPS_WARMUP_CHANNEL_ID, {
       name: 'Trip GPS',
-      importance: AndroidImportance.DEFAULT,
+      importance: Notifications.AndroidImportance.DEFAULT,
       vibrationPattern: [0],
       sound: null,
     });
@@ -63,9 +57,9 @@ const showGpsWarmupNotification = async (body: string) => {
     return false;
   }
 
-  await dismissNotificationAsync(GPS_WARMUP_NOTIFICATION_ID).catch(() => undefined);
-  await cancelScheduledNotificationAsync(GPS_WARMUP_NOTIFICATION_ID).catch(() => undefined);
-  await scheduleNotificationAsync({
+  await Notifications.dismissNotificationAsync(GPS_WARMUP_NOTIFICATION_ID).catch(() => undefined);
+  await Notifications.cancelScheduledNotificationAsync(GPS_WARMUP_NOTIFICATION_ID).catch(() => undefined);
+  await Notifications.scheduleNotificationAsync({
     identifier: GPS_WARMUP_NOTIFICATION_ID,
     content: {
       title: 'Getting stable GPS',
@@ -80,8 +74,8 @@ const showGpsWarmupNotification = async (body: string) => {
 };
 
 const dismissGpsWarmupNotification = async () => {
-  await cancelScheduledNotificationAsync(GPS_WARMUP_NOTIFICATION_ID).catch(() => undefined);
-  await dismissNotificationAsync(GPS_WARMUP_NOTIFICATION_ID).catch(() => undefined);
+  await Notifications.cancelScheduledNotificationAsync(GPS_WARMUP_NOTIFICATION_ID).catch(() => undefined);
+  await Notifications.dismissNotificationAsync(GPS_WARMUP_NOTIFICATION_ID).catch(() => undefined);
 };
 
 export const useGpsWarmupNotification = (active: boolean, body: string) => {

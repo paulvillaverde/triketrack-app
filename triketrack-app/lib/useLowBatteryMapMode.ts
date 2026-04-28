@@ -59,7 +59,7 @@ export const useLowBatteryMapMode = () => {
         return;
       }
 
-      subscription = Battery.addBatteryLevelListener(({ batteryLevel }) => {
+      subscription = Battery.addBatteryLevelListener(({ batteryLevel }: Battery.BatteryLevelEvent) => {
         updateBatteryLevel(batteryLevel);
       });
       appStateSubscription = AppState.addEventListener('change', handleAppStateChange);

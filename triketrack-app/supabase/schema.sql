@@ -1,6 +1,8 @@
 
 -- Run this in Supabase SQL Editor (SQL -> New query).
 -- This is the merged rollup schema for the admin dashboard + mobile app.
+-- Canonical source of truth: /home/rosie/trikettrack/services/backend/db/schema.sql
+-- Keep this file aligned as a mobile setup mirror; do not add production-only schema here first.
 -- For best results, run this on a clean/reset database.
 -- Target project: `irkbdinugnasepjowhzr.supabase.co`
 
@@ -22,6 +24,10 @@ do $$
 begin
   insert into storage.buckets (id, name, public)
   values ('driver-avatars', 'driver-avatars', true)
+  on conflict (id) do nothing;
+
+  insert into storage.buckets (id, name, public)
+  values ('violation-proofs', 'violation-proofs', true)
   on conflict (id) do nothing;
 exception
   when undefined_table then null;
@@ -429,6 +435,253 @@ begin
 end;
 $$;
 
+create or replace function public._geojson_ring_contains_lnglat(
+  p_ring jsonb,
+  p_lng double precision,
+  p_lat double precision
+)
+returns boolean
+language plpgsql
+immutable
+as $$
+declare
+  v_inside boolean := false;
+  v_count integer;
+  v_i integer;
+  v_j integer;
+  v_xi double precision;
+  v_yi double precision;
+  v_xj double precision;
+  v_yj double precision;
+begin
+  if p_ring is null or jsonb_typeof(p_ring) <> 'array' then
+    return false;
+  end if;
+
+  v_count := jsonb_array_length(p_ring);
+  if v_count < 4 then
+    return false;
+  end if;
+
+  v_j := v_count - 1;
+  for v_i in 0..(v_count - 1) loop
+    v_xi := (p_ring -> v_i ->> 0)::double precision;
+    v_yi := (p_ring -> v_i ->> 1)::double precision;
+    v_xj := (p_ring -> v_j ->> 0)::double precision;
+    v_yj := (p_ring -> v_j ->> 1)::double precision;
+
+    if ((v_yi > p_lat) <> (v_yj > p_lat))
+      and (
+        p_lng < ((v_xj - v_xi) * (p_lat - v_yi) / nullif(v_yj - v_yi, 0)) + v_xi
+      )
+    then
+      v_inside := not v_inside;
+    end if;
+
+    v_j := v_i;
+  end loop;
+
+  return v_inside;
+exception
+  when others then
+    return false;
+end;
+$$;
+
+create or replace function public._geojson_polygon_contains_lnglat(
+  p_coordinates jsonb,
+  p_lng double precision,
+  p_lat double precision
+)
+returns boolean
+language plpgsql
+immutable
+as $$
+declare
+  v_ring_count integer;
+  v_i integer;
+begin
+  if p_coordinates is null or jsonb_typeof(p_coordinates) <> 'array' then
+    return null;
+  end if;
+
+  v_ring_count := jsonb_array_length(p_coordinates);
+  if v_ring_count = 0 then
+    return null;
+  end if;
+
+  if not public._geojson_ring_contains_lnglat(p_coordinates -> 0, p_lng, p_lat) then
+    return false;
+  end if;
+
+  if v_ring_count > 1 then
+    for v_i in 1..(v_ring_count - 1) loop
+      if public._geojson_ring_contains_lnglat(p_coordinates -> v_i, p_lng, p_lat) then
+        return false;
+      end if;
+    end loop;
+  end if;
+
+  return true;
+end;
+$$;
+
+create or replace function public.geojson_contains_lnglat(
+  p_geojson jsonb,
+  p_lng double precision,
+  p_lat double precision
+)
+returns boolean
+language plpgsql
+immutable
+as $$
+declare
+  v_type text;
+  v_item jsonb;
+  v_result boolean;
+  v_seen_valid boolean := false;
+begin
+  if p_geojson is null or jsonb_typeof(p_geojson) <> 'object' then
+    return null;
+  end if;
+
+  v_type := p_geojson ->> 'type';
+
+  if v_type = 'Feature' then
+    return public.geojson_contains_lnglat(p_geojson -> 'geometry', p_lng, p_lat);
+  end if;
+
+  if v_type = 'FeatureCollection' then
+    for v_item in
+      select value from jsonb_array_elements(coalesce(p_geojson -> 'features', '[]'::jsonb))
+    loop
+      v_result := public.geojson_contains_lnglat(v_item, p_lng, p_lat);
+      if v_result is true then
+        return true;
+      end if;
+      if v_result is not null then
+        v_seen_valid := true;
+      end if;
+    end loop;
+
+    if v_seen_valid then
+      return false;
+    end if;
+    return null;
+  end if;
+
+  if v_type = 'Polygon' then
+    return public._geojson_polygon_contains_lnglat(p_geojson -> 'coordinates', p_lng, p_lat);
+  end if;
+
+  if v_type = 'MultiPolygon' then
+    for v_item in
+      select value from jsonb_array_elements(coalesce(p_geojson -> 'coordinates', '[]'::jsonb))
+    loop
+      v_result := public._geojson_polygon_contains_lnglat(v_item, p_lng, p_lat);
+      if v_result is true then
+        return true;
+      end if;
+      if v_result is not null then
+        v_seen_valid := true;
+      end if;
+    end loop;
+
+    if v_seen_valid then
+      return false;
+    end if;
+    return null;
+  end if;
+
+  return null;
+end;
+$$;
+
+create or replace function public.create_geofence_violation_from_trip_point()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_context record;
+  v_inside boolean;
+  v_bucket bigint;
+  v_dedupe_key text;
+  v_route_label text;
+  v_location_label text;
+begin
+  if new.trip_id is null then
+    return new;
+  end if;
+
+  select
+    t.trip_id,
+    t.driver_id,
+    t.tricycle_id,
+    r.route_id,
+    r.origin,
+    r.destination,
+    r.geofence_geojson
+  into v_context
+  from public.trips t
+  join public.routes r
+    on r.route_id = t.route_id
+  where t.trip_id = new.trip_id
+    and t.driver_id = new.driver_id
+  limit 1;
+
+  if v_context.trip_id is null or v_context.geofence_geojson is null then
+    return new;
+  end if;
+
+  v_inside := public.geojson_contains_lnglat(v_context.geofence_geojson, new.lng, new.lat);
+  if v_inside is distinct from false then
+    return new;
+  end if;
+
+  v_bucket := floor(extract(epoch from coalesce(new.recorded_at, now())) / 300)::bigint;
+  v_dedupe_key := concat('geofence-boundary:', new.trip_id, ':', new.driver_id, ':', v_bucket);
+  v_route_label := concat_ws(' -> ', v_context.origin, v_context.destination);
+  v_location_label := concat(round(new.lat::numeric, 5)::text, ', ', round(new.lng::numeric, 5)::text);
+
+  insert into public.mobile_violations (
+    driver_id,
+    trip_id,
+    type,
+    status,
+    priority,
+    occurred_at,
+    title,
+    latitude,
+    longitude,
+    location_label,
+    details,
+    dedupe_key
+  )
+  values (
+    new.driver_id,
+    new.trip_id,
+    'GEOFENCE_BOUNDARY',
+    'OPEN',
+    'HIGH',
+    coalesce(new.recorded_at, now()),
+    'Geofence Boundary Violation',
+    new.lat,
+    new.lng,
+    v_location_label,
+    concat(
+      'Backend geofence validation detected a trip point outside the authorized route boundary.',
+      case when v_route_label <> '' then concat(' Route: ', v_route_label, '.') else '' end
+    ),
+    v_dedupe_key
+  )
+  on conflict (dedupe_key) where dedupe_key is not null do nothing;
+
+  return new;
+end;
+$$;
+
 -- ---------- Master tables ----------
 create table if not exists public.barangays (
   barangay_id bigint generated always as identity primary key,
@@ -482,8 +735,10 @@ create table if not exists public.routes (
   origin text not null,
   destination text not null,
   geofence_geojson jsonb,
+  default_fare_amount numeric(10, 2),
   status public.entity_status not null default public.entity_status_from_text('active'),
   created_at timestamptz not null default now(),
+  constraint route_default_fare_check check (default_fare_amount is null or default_fare_amount >= 0),
   unique (toda_id, origin, destination)
 );
 
@@ -594,6 +849,7 @@ end $$;
 create table if not exists public.driver_locations (
   driver_id bigint primary key references public.drivers(driver_id) on delete cascade,
   driver_code text not null,
+  trip_id bigint,
   latitude double precision not null,
   longitude double precision not null,
   speed double precision,
@@ -660,6 +916,22 @@ alter table public.trips add column if not exists matched_point_count integer no
 alter table public.trips add column if not exists offline_segments_count integer not null default 0;
 alter table public.trips add column if not exists sync_status text not null default 'SYNC_PENDING';
 
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'driver_locations_trip_id_fkey'
+      and conrelid = 'public.driver_locations'::regclass
+  ) then
+    alter table public.driver_locations
+      add constraint driver_locations_trip_id_fkey
+      foreign key (trip_id) references public.trips(trip_id) on delete set null;
+  end if;
+exception
+  when undefined_table then null;
+end $$;
+
 create table if not exists public.trip_points (
   point_id bigint generated always as identity primary key,
   trip_id bigint references public.trips(trip_id) on delete cascade,
@@ -679,7 +951,8 @@ create table if not exists public.trip_points (
 -- ---------- Passenger reports ----------
 create table if not exists public.passenger_scans (
   scan_id bigint generated always as identity primary key,
-  trip_id bigint not null references public.trips(trip_id) on delete cascade,
+  trip_id bigint references public.trips(trip_id) on delete set null,
+  driver_id bigint not null references public.drivers(driver_id) on delete cascade,
   qr_id bigint not null references public.qr_codes(qr_id) on delete restrict,
   scanned_at timestamptz not null default now(),
   device_info jsonb,
@@ -689,8 +962,13 @@ create table if not exists public.passenger_scans (
 create table if not exists public.reports (
   report_id bigint generated always as identity primary key,
   scan_id bigint not null references public.passenger_scans(scan_id) on delete cascade,
-  trip_id bigint not null references public.trips(trip_id) on delete cascade,
+  trip_id bigint references public.trips(trip_id) on delete set null,
+  driver_id bigint not null references public.drivers(driver_id) on delete cascade,
+  qr_id bigint not null references public.qr_codes(qr_id) on delete restrict,
   report_type_id bigint not null references public.report_types(report_type_id) on delete restrict,
+  source text not null default 'qr_web_form',
+  passenger_name text,
+  passenger_contact text,
   description text not null,
   reported_at timestamptz not null default now(),
   status public.report_status not null default public.report_status_from_text('submitted'),
@@ -715,6 +993,10 @@ create table if not exists public.violations (
   driver_id bigint references public.drivers(driver_id) on delete set null,
   tricycle_id bigint references public.tricycles(tricycle_id) on delete set null,
   description text,
+  latitude double precision,
+  longitude double precision,
+  location_label text,
+  dedupe_key text,
   detected_at timestamptz not null default now(),
   source public.violation_source not null default public.violation_source_from_text('system'),
   status public.violation_status not null default public.violation_status_from_text('open'),
@@ -760,6 +1042,7 @@ create table if not exists public.mobile_violations (
   longitude double precision,
   location_label text,
   details text,
+  dedupe_key text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -774,6 +1057,8 @@ create table if not exists public.violation_appeals (
   submitted_at timestamptz not null default now(),
   reviewed_at timestamptz,
   decision_notes text,
+  admin_viewed_at timestamptz,
+  admin_viewed_by_admin_id bigint references public.admin_accounts(admin_id) on delete set null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -815,6 +1100,11 @@ drop trigger if exists trg_violation_proofs_updated_at on public.violation_proof
 create trigger trg_violation_proofs_updated_at
 before update on public.violation_proofs
 for each row execute function public.set_updated_at();
+
+drop trigger if exists trg_trip_points_geofence_violation on public.trip_points;
+create trigger trg_trip_points_geofence_violation
+after insert on public.trip_points
+for each row execute function public.create_geofence_violation_from_trip_point();
 
 -- ---------- RPCs for driver app ----------
 drop function if exists public.authenticate_driver(text, text);
@@ -1042,9 +1332,10 @@ declare
   v_tricycle_id bigint;
   v_route_id bigint;
   v_toda_id bigint;
+  v_default_fare numeric(10, 2);
 begin
-  select d.tricycle_id, d.toda_id, r.route_id
-  into v_tricycle_id, v_toda_id, v_route_id
+  select d.tricycle_id, d.toda_id, r.route_id, r.default_fare_amount
+  into v_tricycle_id, v_toda_id, v_route_id, v_default_fare
   from public.drivers d
   left join public.routes r on r.toda_id = d.toda_id and r.status = public.entity_status_from_text('active')
   where d.driver_id = p_driver_id
@@ -1060,12 +1351,12 @@ begin
     values (v_toda_id, 'Test Route', 'Live GPS Tracking', public.entity_status_from_text('active'))
     on conflict (toda_id, origin, destination) do update
       set status = public.entity_status_from_text('active')
-    returning route_id into v_route_id;
+    returning route_id, default_fare_amount into v_route_id, v_default_fare;
   end if;
 
   if v_route_id is null then
-    select r.route_id
-    into v_route_id
+    select r.route_id, r.default_fare_amount
+    into v_route_id, v_default_fare
     from public.routes r
     where r.status = public.entity_status_from_text('active')
     order by r.route_id asc
@@ -1077,7 +1368,7 @@ begin
   end if;
 
   insert into public.trips (driver_id, tricycle_id, route_id, trip_start, trip_status, fare_amount, duration_minutes)
-  values (p_driver_id, v_tricycle_id, v_route_id, now(), public.trip_status_from_text('ongoing'), 0, 0)
+  values (p_driver_id, v_tricycle_id, v_route_id, now(), public.trip_status_from_text('ongoing'), coalesce(v_default_fare, 0), 0)
   returning trip_id into v_trip_id;
 
   if p_start_lat is not null and p_start_lng is not null then
@@ -1223,6 +1514,7 @@ create index if not exists idx_admin_accounts_role on public.admin_accounts (adm
 create index if not exists idx_drivers_toda_id on public.drivers (toda_id);
 create index if not exists idx_drivers_tricycle_id on public.drivers (tricycle_id);
 create index if not exists idx_drivers_qr_id on public.drivers (qr_id);
+create index if not exists idx_driver_locations_trip_id on public.driver_locations (trip_id);
 create index if not exists idx_driver_locations_driver_code on public.driver_locations (driver_code);
 create index if not exists idx_driver_locations_updated_at on public.driver_locations (updated_at desc);
 create index if not exists idx_tricycles_toda_id on public.tricycles (toda_id);
@@ -1239,10 +1531,13 @@ create index if not exists idx_trip_points_trip_id on public.trip_points (trip_i
 create index if not exists idx_trip_points_driver_id on public.trip_points (driver_id);
 create index if not exists idx_trip_points_recorded_at on public.trip_points (recorded_at desc);
 create index if not exists idx_passenger_scans_trip_id on public.passenger_scans (trip_id);
+create index if not exists idx_passenger_scans_driver_id on public.passenger_scans (driver_id);
 create index if not exists idx_passenger_scans_qr_id on public.passenger_scans (qr_id);
 create index if not exists idx_passenger_scans_scanned_at on public.passenger_scans (scanned_at);
 create index if not exists idx_reports_scan_id on public.reports (scan_id);
 create index if not exists idx_reports_trip_id on public.reports (trip_id);
+create index if not exists idx_reports_driver_id on public.reports (driver_id);
+create index if not exists idx_reports_qr_id on public.reports (qr_id);
 create index if not exists idx_reports_report_type_id on public.reports (report_type_id);
 create index if not exists idx_reports_reported_at on public.reports (reported_at);
 create index if not exists idx_reports_status on public.reports (status);
@@ -1254,6 +1549,9 @@ create index if not exists idx_violations_driver_id on public.violations (driver
 create index if not exists idx_violations_tricycle_id on public.violations (tricycle_id);
 create index if not exists idx_violations_status on public.violations (status);
 create index if not exists idx_violations_detected_at on public.violations (detected_at);
+create unique index if not exists uq_violations_dedupe_key
+on public.violations (dedupe_key)
+where dedupe_key is not null;
 create index if not exists idx_trip_route_points_trip on public.trip_route_points (trip_id);
 create index if not exists idx_trip_routes_local_trip_recorded_at on public.trip_routes (local_trip_id, recorded_at);
 create index if not exists idx_trip_routes_driver_recorded_at on public.trip_routes (driver_id, recorded_at desc);
@@ -1262,8 +1560,13 @@ on public.trip_routes (local_trip_id, driver_id, recorded_at, latitude, longitud
 create index if not exists idx_mobile_violations_driver_occurred_at_desc on public.mobile_violations (driver_id, occurred_at desc);
 create index if not exists idx_mobile_violations_status on public.mobile_violations (status);
 create index if not exists idx_mobile_violations_type on public.mobile_violations (type);
+create unique index if not exists uq_mobile_violations_dedupe_key
+on public.mobile_violations (dedupe_key)
+where dedupe_key is not null;
 create index if not exists idx_violation_appeals_driver_submitted_at_desc on public.violation_appeals (driver_id, submitted_at desc);
 create index if not exists idx_violation_appeals_violation on public.violation_appeals (violation_id);
+create index if not exists idx_violation_appeals_admin_viewed_at on public.violation_appeals (admin_viewed_at desc nulls last);
+create index if not exists idx_violation_appeals_admin_viewed_by on public.violation_appeals (admin_viewed_by_admin_id);
 create index if not exists idx_violation_proofs_driver_uploaded_at_desc on public.violation_proofs (driver_id, uploaded_at desc);
 create index if not exists idx_violation_proofs_violation on public.violation_proofs (violation_id);
 create index if not exists idx_admin_notification_reads_admin_read_at_desc
@@ -1736,6 +2039,40 @@ begin
     to anon, authenticated
     using (bucket_id = 'driver-avatars')
     with check (bucket_id = 'driver-avatars');
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'storage'
+      and tablename = 'objects'
+      and policyname = 'public_can_read_violation_proofs'
+  ) then
+    create policy public_can_read_violation_proofs
+    on storage.objects
+    for select
+    to public
+    using (bucket_id = 'violation-proofs');
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'storage'
+      and tablename = 'objects'
+      and policyname = 'public_can_upload_violation_proofs'
+  ) then
+    create policy public_can_upload_violation_proofs
+    on storage.objects
+    for insert
+    to anon, authenticated
+    with check (bucket_id = 'violation-proofs');
   end if;
 end $$;
 
