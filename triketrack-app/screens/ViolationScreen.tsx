@@ -22,6 +22,11 @@ import {
   MAXIM_UI_SURFACE_DARK,
   MAXIM_UI_SURFACE_ELEVATED_DARK,
   MAXIM_UI_TEXT_DARK,
+  MAP_GEOFENCE_FILL_DARK,
+  MAP_GEOFENCE_FILL_LIGHT,
+  MAP_GEOFENCE_STROKE_DARK,
+  MAP_GEOFENCE_STROKE_LIGHT,
+  OBRERO_GEOFENCE,
 } from './homeScreenShared';
 
 type ViolationScreenProps = {
@@ -61,17 +66,6 @@ export type ViolationItem = {
   appeals?: ViolationAppealRecord[];
   proofs?: ViolationProofRecord[];
 };
-
-const OBRERO_GEOFENCE = [
-  { latitude: 7.0832297, longitude: 125.624803 },
-  { latitude: 7.076611, longitude: 125.617071 },
-  { latitude: 7.078821, longitude: 125.6140047 },
-  { latitude: 7.0817, longitude: 125.612905 },
-  { latitude: 7.0835656, longitude: 125.612594 },
-  { latitude: 7.0849408, longitude: 125.611754 },
-  { latitude: 7.0868171, longitude: 125.613004 },
-  { latitude: 7.09187, longitude: 125.6177977 },
-];
 
 const formatViolationType = (type?: ViolationItem['type']) => {
   if (type === 'GEOFENCE_BOUNDARY') return 'Geofence Boundary';
@@ -131,6 +125,14 @@ const formatViolationCardDateParts = (item: Pick<ViolationItem, 'date' | 'occurr
   };
 };
 
+type ViolationFilter = 'ALL' | 'TAKE_ACTION' | 'UNDER_REVIEW' | 'RESOLVED';
+
+const getViolationStatusLabel = (status: ViolationStatus) => {
+  if (status === 'OPEN') return 'Take Action';
+  if (status === 'UNDER_REVIEW') return 'Under Review';
+  return 'Resolved';
+};
+
 export const VIOLATION_ITEMS: ViolationItem[] = [
   {
     id: 'VL-3021',
@@ -188,7 +190,7 @@ export function ViolationScreen({
   const bottomSystemInset = Math.max(insets.bottom || 0, Platform.OS === 'android' ? 48 : 0);
   const [query, setQuery] = useState('');
   const detailMapRef = useRef<OsmMapViewHandle | null>(null);
-  const [filter, setFilter] = useState<'ALL' | 'TAKE_ACTION' | 'RESOLVED'>('ALL');
+  const [filter, setFilter] = useState<ViolationFilter>('ALL');
   const [selectedViolationId, setSelectedViolationId] = useState<string | null>(null);
   const [selectedReason, setSelectedReason] = useState('');
   const [details, setDetails] = useState('');
@@ -208,7 +210,8 @@ export function ViolationScreen({
     () =>
       violationItems.filter((item) => {
         if (filter === 'RESOLVED' && item.status !== 'RESOLVED') return false;
-        if (filter === 'TAKE_ACTION' && item.status === 'RESOLVED') return false;
+        if (filter === 'UNDER_REVIEW' && item.status !== 'UNDER_REVIEW') return false;
+        if (filter === 'TAKE_ACTION' && item.status !== 'OPEN') return false;
         if (!query.trim()) return true;
         const q = query.toLowerCase();
         return (
@@ -284,12 +287,12 @@ export function ViolationScreen({
       {
         id: 'violation-geofence',
         coordinates: OBRERO_GEOFENCE,
-        strokeColor: 'rgba(20,125,100,0.45)',
-        fillColor: 'rgba(20,125,100,0.06)',
+        strokeColor: isLowBatteryMapMode ? MAP_GEOFENCE_STROKE_DARK : MAP_GEOFENCE_STROKE_LIGHT,
+        fillColor: isLowBatteryMapMode ? MAP_GEOFENCE_FILL_DARK : MAP_GEOFENCE_FILL_LIGHT,
         strokeWidth: 1,
       },
     ],
-    [],
+    [isLowBatteryMapMode],
   );
   const activeAppeal = selectedViolation?.appeals?.find(
     (appeal) => appeal.status === 'SUBMITTED' || appeal.status === 'UNDER_REVIEW',
@@ -435,9 +438,10 @@ export function ViolationScreen({
     const osmBackgroundColor = isLowBatteryMapMode ? OSM_MAXIM_DARK_BACKGROUND : OSM_LIGHT_BACKGROUND;
 
     return (
-      <View style={styles.homeScreen}>
-        <View style={styles.homeContentArea}>
+      <View style={[styles.homeScreen, isLowBatteryMapMode ? { backgroundColor: MAXIM_UI_BG_DARK } : null]}>
+        <View style={[styles.homeContentArea, isLowBatteryMapMode ? { backgroundColor: MAXIM_UI_BG_DARK } : null]}>
           <ScrollView
+            style={isLowBatteryMapMode ? { backgroundColor: MAXIM_UI_BG_DARK } : null}
             contentContainerStyle={[
               localStyles.detailScrollContent,
               {
@@ -521,8 +525,14 @@ export function ViolationScreen({
                     {selectedViolation.id}
                   </Text>
                 </View>
-                <View style={[localStyles.detailStatusPill, selectedViolation.status === 'RESOLVED' ? localStyles.detailStatusResolved : null]}>
-                  <Text style={localStyles.detailStatusText}>{selectedViolation.status.replace('_', ' ')}</Text>
+                <View
+                  style={[
+                    localStyles.detailStatusPill,
+                    selectedViolation.status === 'UNDER_REVIEW' ? localStyles.detailStatusReview : null,
+                    selectedViolation.status === 'RESOLVED' ? localStyles.detailStatusResolved : null,
+                  ]}
+                >
+                  <Text style={localStyles.detailStatusText}>{getViolationStatusLabel(selectedViolation.status)}</Text>
                 </View>
               </View>
 
@@ -754,9 +764,10 @@ export function ViolationScreen({
   }
 
   return (
-    <View style={styles.homeScreen}>
-      <View style={styles.homeContentArea}>
+    <View style={[styles.homeScreen, isLowBatteryMapMode ? { backgroundColor: MAXIM_UI_BG_DARK } : null]}>
+      <View style={[styles.homeContentArea, isLowBatteryMapMode ? { backgroundColor: MAXIM_UI_BG_DARK } : null]}>
         <ScrollView
+          style={isLowBatteryMapMode ? { backgroundColor: MAXIM_UI_BG_DARK } : null}
           contentContainerStyle={[
             localStyles.scrollContent,
             {
@@ -853,6 +864,7 @@ export function ViolationScreen({
                   localStyles.filterText,
                   isLowBatteryMapMode ? { color: MAXIM_UI_MUTED_DARK } : null,
                   filter === 'ALL' && localStyles.filterTextActive,
+                  filter === 'ALL' && isLowBatteryMapMode ? localStyles.filterTextActiveDark : null,
                 ]}
               >
                 All
@@ -879,9 +891,37 @@ export function ViolationScreen({
                   localStyles.filterText,
                   isLowBatteryMapMode ? { color: MAXIM_UI_MUTED_DARK } : null,
                   filter === 'TAKE_ACTION' && localStyles.filterTextActive,
+                  filter === 'TAKE_ACTION' && isLowBatteryMapMode ? localStyles.filterTextActiveDark : null,
                 ]}
               >
                 Take Action
+              </Text>
+            </Pressable>
+            <Pressable
+              style={[
+                localStyles.filterPill,
+                isLowBatteryMapMode
+                  ? {
+                      backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
+                      borderColor: MAXIM_UI_BORDER_DARK,
+                    }
+                  : null,
+                filter === 'UNDER_REVIEW' && localStyles.filterPillActive,
+                filter === 'UNDER_REVIEW' && isLowBatteryMapMode
+                  ? { backgroundColor: 'rgba(87,199,168,0.16)', borderColor: 'rgba(87,199,168,0.32)' }
+                  : null,
+              ]}
+              onPress={() => setFilter('UNDER_REVIEW')}
+            >
+              <Text
+                style={[
+                  localStyles.filterText,
+                  isLowBatteryMapMode ? { color: MAXIM_UI_MUTED_DARK } : null,
+                  filter === 'UNDER_REVIEW' && localStyles.filterTextActive,
+                  filter === 'UNDER_REVIEW' && isLowBatteryMapMode ? localStyles.filterTextActiveDark : null,
+                ]}
+              >
+                Under Review
               </Text>
             </Pressable>
             <Pressable
@@ -905,6 +945,7 @@ export function ViolationScreen({
                   localStyles.filterText,
                   isLowBatteryMapMode ? { color: MAXIM_UI_MUTED_DARK } : null,
                   filter === 'RESOLVED' && localStyles.filterTextActive,
+                  filter === 'RESOLVED' && isLowBatteryMapMode ? localStyles.filterTextActiveDark : null,
                 ]}
               >
                 Resolved
@@ -1154,12 +1195,14 @@ function DetailRow({
 
 const localStyles = StyleSheet.create({
   scrollContent: {
+    flexGrow: 1,
     paddingHorizontal: 18,
     paddingTop: 16,
     paddingBottom: 140,
     backgroundColor: '#F4F6FA',
   },
   detailScrollContent: {
+    flexGrow: 1,
     paddingHorizontal: 18,
     paddingTop: 16,
     paddingBottom: 40,
@@ -1231,7 +1274,7 @@ const localStyles = StyleSheet.create({
   filterRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    gap: 6,
     marginBottom: 16,
     flexWrap: 'wrap',
   },
@@ -1248,7 +1291,7 @@ const localStyles = StyleSheet.create({
     borderColor: '#E2E8F0',
     backgroundColor: '#FFFFFF',
     paddingVertical: 6,
-    paddingHorizontal: 12,
+    paddingHorizontal: 9,
   },
   filterPillActive: {
     backgroundColor: '#EFF6FF',
@@ -1262,6 +1305,9 @@ const localStyles = StyleSheet.create({
   },
   filterTextActive: {
     color: '#1D4ED8',
+  },
+  filterTextActiveDark: {
+    color: '#FACC15',
   },
   emptySection: {
     backgroundColor: '#FFFFFF',
@@ -1520,6 +1566,10 @@ const localStyles = StyleSheet.create({
   detailStatusResolved: {
     backgroundColor: '#ECFDF5',
     borderColor: '#BBF7D0',
+  },
+  detailStatusReview: {
+    backgroundColor: '#FEF9C3',
+    borderColor: '#FDE68A',
   },
   detailStatusText: {
     fontSize: 10,

@@ -17,6 +17,7 @@ type HomeScreenProps = {
   onTripComplete: (payload: TripCompletionPayload) => void;
   onTripStart?: (payload: {
     startLocation: { latitude: number; longitude: number } | null;
+    fare: number;
   }) => boolean | Promise<boolean>;
   onGeofenceExit?: (payload: { location: { latitude: number; longitude: number } | null }) => void;
   totalEarnings: number;
@@ -74,7 +75,7 @@ export function HomeScreen({
 
   const handleTripButtonPress = async () => {
     if (!isTripStarted) {
-      const canStartTrip = (await onTripStart?.({ startLocation: null })) ?? true;
+      const canStartTrip = (await onTripStart?.({ startLocation: null, fare: selectedFare })) ?? true;
       if (!canStartTrip) {
         return;
       }

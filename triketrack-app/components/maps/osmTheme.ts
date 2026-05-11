@@ -1,5 +1,7 @@
 const OPEN_FREEMAP_VECTOR_SOURCE_URL = 'https://tiles.openfreemap.org/planet';
 const OPEN_FREEMAP_GLYPHS_URL = 'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf';
+const MAPTILER_API_KEY =
+  process.env.EXPO_PUBLIC_MAPTILER_KEY?.trim() || 'nEWkXndWi3RnRssIeL7K';
 
 const NIGHT_PALETTE = {
   background: '#162235',
@@ -46,7 +48,7 @@ const textSize = (stops: Array<[number, number]>) => [
 ];
 
 export const OSM_VECTOR_LIGHT_STYLE_URL =
-  'https://tiles.openfreemap.org/styles/liberty';
+  `https://api.maptiler.com/maps/streets-v4/style.json?key=${MAPTILER_API_KEY}`;
 
 export const OSM_VECTOR_DARK_STYLE = {
   version: 8,

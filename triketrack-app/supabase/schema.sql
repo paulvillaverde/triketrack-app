@@ -797,12 +797,39 @@ create table if not exists public.drivers (
   updated_at timestamptz not null default now()
 );
 
+create table if not exists public.driver_password_reset_requests (
+  request_id bigint generated always as identity primary key,
+  driver_id bigint not null references public.drivers(driver_id) on delete cascade,
+  driver_code text not null,
+  status text not null default 'pending',
+  requested_at timestamptz not null default now(),
+  approved_at timestamptz,
+  approved_by bigint references public.admin_accounts(admin_id) on delete set null,
+  temporary_password_hash text,
+  temporary_password text,
+  temporary_password_used_at timestamptz,
+  expires_at timestamptz,
+  device_push_token text,
+  device_platform text,
+  push_sent_at timestamptz,
+  push_error text,
+  resolved_at timestamptz,
+  constraint driver_password_reset_requests_status_check
+    check (status in ('pending', 'approved', 'denied', 'completed', 'expired'))
+);
+
 alter table public.drivers add column if not exists contact_no text;
 alter table public.drivers add column if not exists avatar_url text;
 alter table public.drivers add column if not exists password_hash text;
 alter table public.drivers add column if not exists updated_at timestamptz not null default now();
 alter table public.drivers add column if not exists tricycle_id bigint;
 alter table public.drivers add column if not exists qr_id bigint;
+alter table public.driver_password_reset_requests add column if not exists temporary_password text;
+alter table public.driver_password_reset_requests add column if not exists expires_at timestamptz;
+alter table public.driver_password_reset_requests add column if not exists device_push_token text;
+alter table public.driver_password_reset_requests add column if not exists device_platform text;
+alter table public.driver_password_reset_requests add column if not exists push_sent_at timestamptz;
+alter table public.driver_password_reset_requests add column if not exists push_error text;
 
 do $$
 begin
@@ -1086,6 +1113,16 @@ create table if not exists public.admin_notification_reads (
   primary key (admin_id, notification_key)
 );
 
+create table if not exists public.admin_audit_logs (
+  audit_id bigint generated always as identity primary key,
+  admin_id bigint references public.admin_accounts(admin_id) on delete set null,
+  action text not null,
+  entity_type text not null,
+  entity_id text not null,
+  details jsonb,
+  created_at timestamptz not null default now()
+);
+
 drop trigger if exists trg_mobile_violations_updated_at on public.mobile_violations;
 create trigger trg_mobile_violations_updated_at
 before update on public.mobile_violations
@@ -1218,6 +1255,285 @@ begin
     d.avatar_url
   from updated_driver d
   left join public.tricycles t on t.tricycle_id = d.tricycle_id;
+end;
+$$;
+
+drop function if exists public.request_driver_password_reset(text);
+drop function if exists public.request_driver_password_reset(text, text, text);
+create or replace function public.request_driver_password_reset(
+  p_driver_code text,
+  p_device_push_token text default null,
+  p_device_platform text default null
+)
+returns table (
+  request_id bigint,
+  driver_id bigint,
+  driver_code text,
+  status text
+)
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  target_driver_id bigint;
+  target_driver_code text;
+  existing_request_id bigint;
+  existing_request_driver_id bigint;
+  existing_request_driver_code text;
+  existing_request_status text;
+begin
+  select d.driver_id, coalesce(d.driver_code, d.driver_id::text) as driver_code
+    into target_driver_id, target_driver_code
+  from public.drivers d
+  where d.status = public.entity_status_from_text('active')
+    and upper(coalesce(d.driver_code, d.driver_id::text)) = upper(p_driver_code)
+  limit 1;
+
+  if target_driver_id is null then
+    return;
+  end if;
+
+  select r.request_id, r.driver_id, r.driver_code, r.status
+    into existing_request_id, existing_request_driver_id, existing_request_driver_code, existing_request_status
+  from public.driver_password_reset_requests r
+  where r.driver_id = target_driver_id
+    and r.status in ('pending', 'approved')
+    and (r.expires_at is null or r.expires_at >= now())
+  order by r.requested_at desc
+  limit 1;
+
+  if existing_request_id is not null then
+    update public.driver_password_reset_requests
+    set
+      device_push_token = coalesce(nullif(trim(p_device_push_token), ''), device_push_token),
+      device_platform = coalesce(nullif(trim(p_device_platform), ''), device_platform)
+    where request_id = existing_request_id;
+
+    request_id := existing_request_id;
+    driver_id := existing_request_driver_id;
+    driver_code := existing_request_driver_code;
+    status := existing_request_status;
+    return next;
+    return;
+  end if;
+
+  insert into public.driver_password_reset_requests (
+    driver_id,
+    driver_code,
+    device_push_token,
+    device_platform
+  )
+  values (
+    target_driver_id,
+    target_driver_code,
+    nullif(trim(p_device_push_token), ''),
+    nullif(trim(p_device_platform), '')
+  )
+  returning
+    driver_password_reset_requests.request_id,
+    driver_password_reset_requests.driver_id,
+    driver_password_reset_requests.driver_code,
+    driver_password_reset_requests.status
+  into request_id, driver_id, driver_code, status;
+
+  return next;
+end;
+$$;
+
+drop function if exists public.get_driver_password_reset_status(text);
+create or replace function public.get_driver_password_reset_status(p_driver_code text)
+returns table (
+  request_id bigint,
+  driver_id bigint,
+  driver_code text,
+  status text,
+  temporary_password text,
+  requested_at timestamptz,
+  approved_at timestamptz,
+  expires_at timestamptz
+)
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  target_driver_id bigint;
+begin
+  select d.driver_id
+    into target_driver_id
+  from public.drivers d
+  where d.status = public.entity_status_from_text('active')
+    and upper(coalesce(d.driver_code, d.driver_id::text)) = upper(p_driver_code)
+  limit 1;
+
+  if target_driver_id is null then
+    return;
+  end if;
+
+  update public.driver_password_reset_requests r
+  set
+    status = 'expired',
+    temporary_password = null,
+    temporary_password_hash = null,
+    resolved_at = coalesce(r.resolved_at, now())
+  where r.driver_id = target_driver_id
+    and r.status = 'approved'
+    and r.expires_at is not null
+    and r.expires_at < now();
+
+  return query
+  select
+    r.request_id,
+    r.driver_id,
+    r.driver_code,
+    r.status,
+    case
+      when r.status = 'approved'
+        and r.temporary_password_used_at is null
+        and (r.expires_at is null or r.expires_at >= now())
+        then r.temporary_password
+      else null::text
+    end as temporary_password,
+    r.requested_at,
+    r.approved_at,
+    r.expires_at
+  from public.driver_password_reset_requests r
+  where r.driver_id = target_driver_id
+    and r.status in ('pending', 'approved', 'denied', 'expired')
+  order by r.requested_at desc
+  limit 1;
+end;
+$$;
+
+drop function if exists public.complete_driver_password_reset(text, text, text);
+create or replace function public.complete_driver_password_reset(
+  p_driver_code text,
+  p_temporary_password text,
+  p_new_password text
+)
+returns table (
+  id bigint,
+  full_name text,
+  driver_id text,
+  contact_number text,
+  plate_number text,
+  avatar_url text
+)
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  target_driver_id bigint;
+  reset_request_id bigint;
+begin
+  if length(coalesce(p_new_password, '')) < 6 then
+    raise exception 'Password must be at least 6 characters long.';
+  end if;
+
+  select d.driver_id
+    into target_driver_id
+  from public.drivers d
+  where d.status = public.entity_status_from_text('active')
+    and upper(coalesce(d.driver_code, d.driver_id::text)) = upper(p_driver_code)
+  limit 1;
+
+  if target_driver_id is null then
+    return;
+  end if;
+
+  select r.request_id
+    into reset_request_id
+  from public.driver_password_reset_requests r
+  where r.driver_id = target_driver_id
+    and r.status = 'approved'
+    and r.temporary_password_hash is not null
+    and r.temporary_password_used_at is null
+    and (r.expires_at is null or r.expires_at >= now())
+    and r.temporary_password_hash = extensions.crypt(p_temporary_password, r.temporary_password_hash)
+  order by r.approved_at desc nulls last, r.requested_at desc
+  limit 1;
+
+  if reset_request_id is null then
+    raise exception 'Invalid or expired temporary reset password.';
+  end if;
+
+  update public.drivers d
+  set
+    password_hash = extensions.crypt(p_new_password, extensions.gen_salt('bf')),
+    updated_at = now()
+  where d.driver_id = target_driver_id;
+
+  update public.driver_password_reset_requests r
+  set
+    status = 'completed',
+    temporary_password = null,
+    temporary_password_hash = null,
+    temporary_password_used_at = now(),
+    resolved_at = now()
+  where r.request_id = reset_request_id;
+
+  return query
+  select
+    d.driver_id as id,
+    trim(concat_ws(' ', d.first_name, d.last_name)) as full_name,
+    coalesce(d.driver_code, d.driver_id::text) as driver_id,
+    coalesce(d.contact_no, '') as contact_number,
+    coalesce(t.plate_no, '') as plate_number,
+    d.avatar_url
+  from public.drivers d
+  left join public.tricycles t on t.tricycle_id = d.tricycle_id
+  where d.driver_id = target_driver_id;
+end;
+$$;
+
+drop function if exists public.verify_driver_temporary_password(text, text);
+create or replace function public.verify_driver_temporary_password(
+  p_driver_code text,
+  p_temporary_password text
+)
+returns table (
+  request_id bigint,
+  driver_id bigint,
+  driver_code text,
+  status text
+)
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  target_driver_id bigint;
+begin
+  select d.driver_id
+    into target_driver_id
+  from public.drivers d
+  where d.status = public.entity_status_from_text('active')
+    and upper(coalesce(d.driver_code, d.driver_id::text)) = upper(p_driver_code)
+  limit 1;
+
+  if target_driver_id is null then
+    return;
+  end if;
+
+  select r.request_id, r.driver_id, r.driver_code, r.status
+    into request_id, driver_id, driver_code, status
+  from public.driver_password_reset_requests r
+  where r.driver_id = target_driver_id
+    and r.status = 'approved'
+    and r.temporary_password_hash is not null
+    and r.temporary_password_used_at is null
+    and (r.expires_at is null or r.expires_at >= now())
+    and r.temporary_password_hash = extensions.crypt(p_temporary_password, r.temporary_password_hash)
+  order by r.approved_at desc nulls last, r.requested_at desc
+  limit 1;
+
+  if request_id is null then
+    return;
+  end if;
+
+  return next;
 end;
 $$;
 
@@ -1514,6 +1830,13 @@ create index if not exists idx_admin_accounts_role on public.admin_accounts (adm
 create index if not exists idx_drivers_toda_id on public.drivers (toda_id);
 create index if not exists idx_drivers_tricycle_id on public.drivers (tricycle_id);
 create index if not exists idx_drivers_qr_id on public.drivers (qr_id);
+create index if not exists idx_driver_password_reset_requests_driver_requested_at_desc
+  on public.driver_password_reset_requests (driver_id, requested_at desc);
+create index if not exists idx_driver_password_reset_requests_status_requested_at_desc
+  on public.driver_password_reset_requests (status, requested_at desc);
+create unique index if not exists idx_driver_password_reset_requests_one_pending
+  on public.driver_password_reset_requests (driver_id)
+  where status = 'pending';
 create index if not exists idx_driver_locations_trip_id on public.driver_locations (trip_id);
 create index if not exists idx_driver_locations_driver_code on public.driver_locations (driver_code);
 create index if not exists idx_driver_locations_updated_at on public.driver_locations (updated_at desc);
@@ -1571,6 +1894,8 @@ create index if not exists idx_violation_proofs_driver_uploaded_at_desc on publi
 create index if not exists idx_violation_proofs_violation on public.violation_proofs (violation_id);
 create index if not exists idx_admin_notification_reads_admin_read_at_desc
   on public.admin_notification_reads (admin_id, read_at desc);
+create index if not exists idx_admin_audit_logs_admin_created_at
+  on public.admin_audit_logs (admin_id, created_at desc);
 
 do $$
 begin
@@ -1636,6 +1961,7 @@ alter table public.barangays enable row level security;
 alter table public.todas enable row level security;
 alter table public.admin_accounts enable row level security;
 alter table public.drivers enable row level security;
+alter table public.driver_password_reset_requests enable row level security;
 alter table public.driver_locations enable row level security;
 alter table public.tricycles enable row level security;
 alter table public.routes enable row level security;
@@ -1654,6 +1980,24 @@ alter table public.mobile_violations enable row level security;
 alter table public.violation_appeals enable row level security;
 alter table public.violation_proofs enable row level security;
 alter table public.admin_notification_reads enable row level security;
+alter table public.admin_audit_logs enable row level security;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'driver_password_reset_requests'
+      and policyname = 'authenticated_can_read_driver_password_reset_requests'
+  ) then
+    create policy authenticated_can_read_driver_password_reset_requests
+    on public.driver_password_reset_requests
+    for select
+    to anon, authenticated
+    using (true);
+  end if;
+end $$;
 
 do $$
 begin
@@ -2149,6 +2493,10 @@ grant execute on function public.upsert_driver_location(
 
 grant execute on function public.set_driver_location_offline(bigint) to anon, authenticated;
 grant execute on function public.set_driver_avatar(bigint, text) to anon, authenticated;
+grant execute on function public.request_driver_password_reset(text, text, text) to anon, authenticated;
+grant execute on function public.get_driver_password_reset_status(text) to anon, authenticated;
+grant execute on function public.complete_driver_password_reset(text, text, text) to anon, authenticated;
+grant execute on function public.verify_driver_temporary_password(text, text) to anon, authenticated;
 
 do $$
 begin

@@ -10,6 +10,9 @@ type TripRouteMapProps = {
   geofence: LatLng[];
   lockSavedRoute?: boolean;
   isLowBatteryMapMode?: boolean;
+  replayMarkerCoordinate?: LatLng | null;
+  replayMarkerHeadingDeg?: number | null;
+  replayCameraFollowToken?: number;
   style: any;
   getRouteRegion: (routePath: LatLng[]) => {
     latitude: number;

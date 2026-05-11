@@ -11,6 +11,7 @@ export type OfflineTripStatusEventType =
   | 'trip_started'
   | 'movement_confirmed'
   | 'trip_completed'
+  | 'violation_recorded'
   | 'connectivity_offline'
   | 'connectivity_online'
   | 'app_recovered';
@@ -523,59 +524,6 @@ export async function attachServerTripIdToOfflineTrip(localTripId: string, serve
      WHERE local_trip_id = ?`,
     serverTripId,
     localTripId,
-  );
-}
-
-export async function getUnsyncedOfflineTripPoints(limit = 500) {
-  await ensureOfflineTripStorageInitialized();
-  const db = await getDb();
-  return db.getAllAsync<OfflineTripPoint>(
-    `SELECT
-       id,
-       local_trip_id,
-       server_trip_id,
-       driver_id,
-       latitude,
-       longitude,
-       speed,
-       heading,
-       accuracy,
-       altitude,
-       provider,
-       recorded_at,
-       capture_status,
-       sync_state,
-       synced,
-       idempotency_key
-     FROM ${POINTS_TABLE_NAME}
-     WHERE synced = 0
-     ORDER BY recorded_at ASC, id ASC
-     LIMIT ?`,
-    limit,
-  );
-}
-
-export async function getUnsyncedOfflineMatchedTripPoints(limit = 500) {
-  await ensureOfflineTripStorageInitialized();
-  const db = await getDb();
-  return db.getAllAsync<OfflineMatchedTripPoint>(
-    `SELECT
-       id,
-       local_trip_id,
-       server_trip_id,
-       driver_id,
-       latitude,
-       longitude,
-       recorded_at,
-       match_source,
-       sync_state,
-       synced,
-       idempotency_key
-     FROM ${MATCHED_POINTS_TABLE_NAME}
-     WHERE synced = 0
-     ORDER BY recorded_at ASC, id ASC
-     LIMIT ?`,
-    limit,
   );
 }
 

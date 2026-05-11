@@ -25,8 +25,14 @@ const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL;
 const supabaseAnonKey =
   process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY ?? process.env.EXPO_PUBLIC_SUPABASE_KEY;
 const EXPECTED_SUPABASE_HOST = 'irkbdinugnasepjowhzr.supabase.co';
+const ALLOW_OTHER_SUPABASE =
+  (process.env.EXPO_PUBLIC_ALLOW_OTHER_SUPABASE ?? '')
+    .toString()
+    .trim()
+    .toLowerCase() === 'true';
+const DEFAULT_PASSENGER_REPORT_BASE_URL = 'https://triketrack-passenger-side.vercel.app';
 const passengerReportBaseUrl =
-  (process.env.EXPO_PUBLIC_REPORT_BASE_URL ?? 'http://127.0.0.1:5174').trim();
+  (process.env.EXPO_PUBLIC_REPORT_BASE_URL ?? DEFAULT_PASSENGER_REPORT_BASE_URL).trim();
 
 const getSupabaseHost = (url: string | undefined | null) => {
   if (!url) {
@@ -42,7 +48,7 @@ const getSupabaseHost = (url: string | undefined | null) => {
 
 const configuredSupabaseHost = getSupabaseHost(supabaseUrl);
 const isExpectedSupabaseProject =
-  configuredSupabaseHost === null || configuredSupabaseHost === EXPECTED_SUPABASE_HOST;
+  ALLOW_OTHER_SUPABASE || configuredSupabaseHost === null || configuredSupabaseHost === EXPECTED_SUPABASE_HOST;
 
 export const hasSupabaseConfig = Boolean(supabaseUrl && supabaseAnonKey && isExpectedSupabaseProject);
 
@@ -161,6 +167,179 @@ export async function setDriverPassword(driverCode: string, password: string) {
     }
 
     return { driver: null as DriverRecord | null, error: message };
+  }
+
+  return {
+    driver: (rpcAttempt.data as DriverRecord | null) ?? null,
+    error: null as string | null,
+  };
+}
+
+export async function requestDriverPasswordReset(
+  driverCode: string,
+  devicePushToken?: string | null,
+  devicePlatform?: string | null,
+) {
+  if (!supabase) {
+    return {
+      request: null as { request_id: number; driver_id: number; driver_code: string; status: string } | null,
+      error: getSupabaseConfigError() ?? 'Supabase is not configured.',
+    };
+  }
+
+  const rpcAttempt = await supabase
+    .rpc('request_driver_password_reset', {
+      p_driver_code: driverCode,
+      p_device_push_token: devicePushToken ?? null,
+      p_device_platform: devicePlatform ?? null,
+    })
+    .maybeSingle();
+
+  if (rpcAttempt.error) {
+    const message = rpcAttempt.error.message ?? 'Unable to send password reset request.';
+    const isMissingFunction =
+      message.includes('Could not find the function public.request_driver_password_reset') ||
+      message.includes('schema cache');
+
+    if (isMissingFunction) {
+      return {
+        request: null,
+        error:
+          'The database password reset request function is not available yet. Run `triketrack-app/supabase/schema.sql` in Supabase SQL Editor, then try again.',
+      };
+    }
+
+    return { request: null, error: message };
+  }
+
+  return {
+    request:
+      (rpcAttempt.data as {
+        request_id: number;
+        driver_id: number;
+        driver_code: string;
+        status: string;
+      } | null) ?? null,
+    error: null as string | null,
+  };
+}
+
+export type DriverPasswordResetStatusRecord = {
+  request_id: number;
+  driver_id: number;
+  driver_code: string;
+  status: 'pending' | 'approved' | 'denied' | 'completed' | 'expired';
+  temporary_password?: string | null;
+  requested_at?: string | null;
+  approved_at?: string | null;
+  expires_at?: string | null;
+};
+
+export async function getDriverPasswordResetStatus(driverCode: string) {
+  if (!supabase) {
+    return {
+      request: null as DriverPasswordResetStatusRecord | null,
+      error: getSupabaseConfigError() ?? 'Supabase is not configured.',
+    };
+  }
+
+  const rpcAttempt = await supabase
+    .rpc('get_driver_password_reset_status', { p_driver_code: driverCode })
+    .maybeSingle();
+
+  if (rpcAttempt.error) {
+    const message = rpcAttempt.error.message ?? 'Unable to check password reset status.';
+    const isMissingFunction =
+      message.includes('Could not find the function public.get_driver_password_reset_status') ||
+      message.includes('schema cache');
+
+    if (isMissingFunction) {
+      return {
+        request: null,
+        error:
+          'The password reset status function is not available yet. Run `triketrack-app/supabase/schema.sql` in Supabase SQL Editor, then try again.',
+      };
+    }
+
+    return { request: null, error: message };
+  }
+
+  return {
+    request: (rpcAttempt.data as DriverPasswordResetStatusRecord | null) ?? null,
+    error: null as string | null,
+  };
+}
+
+export async function verifyDriverTemporaryPassword(driverCode: string, temporaryPassword: string) {
+  if (!supabase) {
+    return {
+      request: null as DriverPasswordResetStatusRecord | null,
+      error: getSupabaseConfigError() ?? 'Supabase is not configured.',
+    };
+  }
+
+  const rpcAttempt = await supabase
+    .rpc('verify_driver_temporary_password', { p_driver_code: driverCode, p_temporary_password: temporaryPassword })
+    .maybeSingle();
+
+  if (rpcAttempt.error) {
+    const message = rpcAttempt.error.message ?? 'Unable to verify temporary password.';
+    const isMissingFunction =
+      message.includes('Could not find the function public.verify_driver_temporary_password') ||
+      message.includes('schema cache');
+
+    if (isMissingFunction) {
+      return {
+        request: null,
+        error:
+          'The temporary password verification function is not available yet. Run `triketrack-app/supabase/schema.sql` in Supabase SQL Editor, then try again.',
+      };
+    }
+
+    return { request: null, error: message };
+  }
+
+  return {
+    request: (rpcAttempt.data as DriverPasswordResetStatusRecord | null) ?? null,
+    error: null as string | null,
+  };
+}
+
+export async function completeDriverPasswordReset(params: {
+  driverCode: string;
+  temporaryPassword: string;
+  newPassword: string;
+}) {
+  if (!supabase) {
+    return {
+      driver: null as DriverRecord | null,
+      error: getSupabaseConfigError() ?? 'Supabase is not configured.',
+    };
+  }
+
+  const rpcAttempt = await supabase
+    .rpc('complete_driver_password_reset', {
+      p_driver_code: params.driverCode,
+      p_temporary_password: params.temporaryPassword,
+      p_new_password: params.newPassword,
+    })
+    .maybeSingle();
+
+  if (rpcAttempt.error) {
+    const message = rpcAttempt.error.message ?? 'Unable to complete password reset.';
+    const isMissingFunction =
+      message.includes('Could not find the function public.complete_driver_password_reset') ||
+      message.includes('schema cache');
+
+    if (isMissingFunction) {
+      return {
+        driver: null,
+        error:
+          'The password reset completion function is not available yet. Run `triketrack-app/supabase/schema.sql` in Supabase SQL Editor, then try again.',
+      };
+    }
+
+    return { driver: null, error: message };
   }
 
   return {
@@ -450,6 +629,7 @@ export async function completeTrip(params: {
   dashedEndConnector?: TripRoutePoint[] | null;
   offlineSegmentsCount?: number | null;
   endpointSelectionSummary?: Record<string, unknown> | null;
+  violationCount?: number | null;
 }) {
   if (!supabase) {
     return { error: 'Supabase is not configured.' };
@@ -479,6 +659,10 @@ export async function completeTrip(params: {
   const tripMetrics = {
     routeMatchSummary: params.routeMatchSummary ?? null,
     endpointSelection: params.endpointSelectionSummary ?? null,
+    violationCount:
+      typeof params.violationCount === 'number' && Number.isFinite(params.violationCount)
+        ? Math.max(0, Math.round(params.violationCount))
+        : null,
   };
 
   const { error: updateError } = await supabase
@@ -634,14 +818,18 @@ export async function replaceTripRouteFallback(params: {
     inputPointCount: number;
     matchedPointCount: number;
   } | null;
+  rawStartPoint?: TripRoutePoint | null;
+  matchedStartPoint?: TripRoutePoint | null;
   rawEndPoint?: TripRoutePoint | null;
   matchedEndPoint?: TripRoutePoint | null;
   startDisplayName?: string | null;
   startCoordinate?: TripRoutePoint | null;
   endDisplayName?: string | null;
   endCoordinate?: TripRoutePoint | null;
+  dashedStartConnector?: TripRoutePoint[] | null;
   dashedEndConnector?: TripRoutePoint[] | null;
   endpointSelectionSummary?: Record<string, unknown> | null;
+  violationCount?: number | null;
 }) {
   if (!supabase) {
     return { error: 'Supabase is not configured.' };
@@ -696,18 +884,26 @@ export async function replaceTripRouteFallback(params: {
   const tripMetrics = {
     routeMatchSummary: params.routeMatchSummary ?? null,
     endpointSelection: params.endpointSelectionSummary ?? null,
+    violationCount:
+      typeof params.violationCount === 'number' && Number.isFinite(params.violationCount)
+        ? Math.max(0, Math.round(params.violationCount))
+        : null,
   };
 
   const { error: updateError } = await supabase
     .from('trips')
     .update({
+      start_location_raw: params.rawStartPoint ?? null,
+      start_location_matched: params.matchedStartPoint ?? routePoints[0] ?? null,
       start_display_name: params.startDisplayName ?? null,
-      start_coordinate: params.startCoordinate ?? routePoints[0] ?? null,
+      start_coordinate:
+        params.startCoordinate ?? params.matchedStartPoint ?? routePoints[0] ?? null,
       end_location_raw: params.rawEndPoint ?? null,
       end_location_matched: params.matchedEndPoint ?? routePoints[routePoints.length - 1] ?? null,
       end_display_name: params.endDisplayName ?? null,
       end_coordinate:
         params.endCoordinate ?? params.matchedEndPoint ?? routePoints[routePoints.length - 1] ?? null,
+      dashed_start_connector: params.dashedStartConnector ?? null,
       dashed_end_connector: params.dashedEndConnector ?? null,
       route_trace_geojson: routeTraceGeoJson,
       trip_metrics: tripMetrics,

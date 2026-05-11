@@ -28,7 +28,7 @@ export type OsmCamera = {
 export type OsmMarkerSpec = {
   id: string;
   coordinate: OsmCoordinate;
-  kind?: 'avatar' | 'navigation' | 'pin' | 'dot';
+  kind?: 'avatar' | 'navigation' | 'pin' | 'apple-pin' | 'dot' | 'location' | 'tricycle';
   color?: string;
   fillColor?: string;
   borderColor?: string;

@@ -16,6 +16,7 @@ type InputFieldProps = {
   | 'autoCapitalize'
   | 'autoCorrect'
   | 'textContentType'
+  | 'editable'
 >;
 
 export function InputField({ icon, trailingIcon, styles, ...textInputProps }: InputFieldProps) {

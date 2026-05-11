@@ -2,25 +2,24 @@
   "expo": {
     "name": "triketrack-app",
     "slug": "triketrack-app",
+    "owner": "triketrack",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/adaptive-icon.png",
     "userInterfaceStyle": "light",
-    "newArchEnabled": false,
     "splash": {
       "image": "./assets/logo.png",
       "resizeMode": "contain",
-      "backgroundColor": "#F7FBFA"
+      "backgroundColor": "#FFFFFF"
     },
     "ios": {
       "supportsTablet": true
     },
     "android": {
       "adaptiveIcon": {
-        "foregroundImage": "./assets/logo.png",
+        "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#FFFFFF"
       },
-      "edgeToEdgeEnabled": false,
       "predictiveBackGestureEnabled": false,
       "package": "com.anonymous.triketrackapp",
       "permissions": [
@@ -28,10 +27,7 @@
         "android.permission.WRITE_CONTACTS",
         "android.permission.ACCESS_COARSE_LOCATION",
         "android.permission.ACCESS_FINE_LOCATION",
-        "android.permission.READ_CONTACTS",
-        "android.permission.WRITE_CONTACTS",
-        "android.permission.ACCESS_COARSE_LOCATION",
-        "android.permission.ACCESS_FINE_LOCATION"
+        "android.permission.POST_NOTIFICATIONS"
       ]
     },
     "web": {
@@ -48,13 +44,14 @@
         "expo-build-properties",
         {
           "android": {
-            "compileSdkVersion": 35,
+            "compileSdkVersion": 36,
             "targetSdkVersion": 35,
-            "buildToolsVersion": "35.0.0"
+            "buildToolsVersion": "36.0.0"
           }
         }
       ],
       "expo-sqlite",
+      "expo-notifications",
       [
         "expo-contacts",
         {
@@ -67,7 +64,7 @@
           "locationWhenInUsePermission": "Allow TrikeTrack to access your location so trip tracking stays accurate and follows the real road."
         }
       ],
-      "@maplibre/maplibre-react-native"
+      "expo-font"
     ],
     "extra": {
       "eas": {

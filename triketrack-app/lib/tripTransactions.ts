@@ -13,6 +13,13 @@ export type TripTelemetryPoint = RawTripTelemetryPoint & {
 
 export type TripSyncStatus = 'SYNC_PENDING' | 'SYNCED';
 
+export type TripOfflineSyncStatus =
+  | 'ongoing'
+  | 'completed_offline'
+  | 'syncing'
+  | 'synced'
+  | 'failed';
+
 export type TripTrackingState =
   | 'IDLE'
   | 'TRIP_STARTING'
@@ -20,8 +27,11 @@ export type TripTrackingState =
   | 'ON_ROAD'
   | 'TRIP_ENDING'
   | 'COMPLETED'
+  | 'COMPLETED_OFFLINE'
   | 'SYNC_PENDING'
-  | 'SYNCED';
+  | 'SYNCING'
+  | 'SYNCED'
+  | 'FAILED';
 
 export type TripGpsQualitySummary = {
   averageAccuracyMeters: number | null;
@@ -137,6 +147,7 @@ export type TripHistoryItem = {
   rawGpsPointCount: number;
   matchedPointCount: number;
   syncStatus: TripSyncStatus;
+  offlineSyncStatus: TripOfflineSyncStatus | null;
   tripState: TripTrackingState;
   driverName: string | null;
   driverCode: string | null;
@@ -153,6 +164,7 @@ export type TripCompletionPayload = {
   fare: number;
   distanceKm: number;
   durationSeconds: number;
+  violations?: string;
   routePath: TripCoordinate[];
   endLocation: TripCoordinate | null;
   rawTelemetry?: TripTelemetryPoint[];
@@ -224,6 +236,64 @@ const roundMetric = (value: number, precision = 2) => {
   }
   const factor = 10 ** precision;
   return Math.round(value * factor) / factor;
+};
+
+const normalizeOfflineSyncStatus = (
+  value: unknown,
+): TripOfflineSyncStatus | null => {
+  if (
+    value === 'ongoing' ||
+    value === 'completed_offline' ||
+    value === 'syncing' ||
+    value === 'synced' ||
+    value === 'failed'
+  ) {
+    return value;
+  }
+
+  return null;
+};
+
+const deriveOfflineSyncStatus = ({
+  explicitStatus,
+  syncStatus,
+  tripState,
+  tripStatus,
+  rawGpsPointCount,
+  rawTelemetryCount,
+  offlineSegmentsCount,
+}: {
+  explicitStatus?: TripOfflineSyncStatus | null;
+  syncStatus?: TripSyncStatus;
+  tripState?: TripTrackingState;
+  tripStatus?: TripHistoryItem['status'];
+  rawGpsPointCount: number;
+  rawTelemetryCount: number;
+  offlineSegmentsCount: number;
+}): TripOfflineSyncStatus | null => {
+  if (explicitStatus) {
+    return explicitStatus;
+  }
+  if (syncStatus === 'SYNCED' || tripState === 'SYNCED') {
+    return 'synced';
+  }
+  if (tripState === 'SYNCING') {
+    return 'syncing';
+  }
+  if (tripState === 'FAILED') {
+    return 'failed';
+  }
+  if (tripStatus === 'ONGOING' || tripState === 'ON_ROAD') {
+    return 'ongoing';
+  }
+  if (
+    syncStatus === 'SYNC_PENDING' &&
+    (offlineSegmentsCount > 0 || rawGpsPointCount > 0 || rawTelemetryCount > 0)
+  ) {
+    return 'completed_offline';
+  }
+
+  return null;
 };
 
 export const normalizeTripCoordinateArray = (value: unknown): TripCoordinate[] =>
@@ -466,16 +536,37 @@ export const mergeTripHistoryItem = (
     return next;
   }
 
+  const mergedSyncStatus =
+    current.syncStatus === 'SYNCED' || next.syncStatus === 'SYNCED'
+      ? 'SYNCED'
+      : next.syncStatus ?? current.syncStatus;
+  const mergedOfflineSyncStatus =
+    mergedSyncStatus === 'SYNCED' ||
+    current.offlineSyncStatus === 'synced' ||
+    next.offlineSyncStatus === 'synced'
+      ? 'synced'
+      : next.offlineSyncStatus === 'syncing' || current.offlineSyncStatus === 'syncing'
+        ? 'syncing'
+        : next.offlineSyncStatus ?? current.offlineSyncStatus;
+  const mergedTripState =
+    current.tripState === 'SYNCED' || next.tripState === 'SYNCED' || mergedSyncStatus === 'SYNCED'
+      ? 'SYNCED'
+      : next.tripState ?? current.tripState;
+
+  const currentHasAuthoritativeRoute =
+    typeof current.routeMatchSummary?.provider === 'string' &&
+    current.routeMatchSummary.provider !== 'local-directional' &&
+    (current.routePath.length > 1 || Boolean(current.routeTraceGeoJson));
   const shouldPreferAuthoritativeNextRoute =
-    next.syncStatus === 'SYNCED' &&
     typeof next.routeMatchSummary?.provider === 'string' &&
     next.routeMatchSummary.provider !== 'local-directional' &&
     (next.routePath.length > 1 || Boolean(next.routeTraceGeoJson));
   const shouldPreferCurrentRoute =
-    !shouldPreferAuthoritativeNextRoute &&
-    current.rawTelemetry.length > 1 &&
-    current.routePath.length > 1 &&
-    next.rawTelemetry.length === 0;
+    (currentHasAuthoritativeRoute && !shouldPreferAuthoritativeNextRoute) ||
+    (!shouldPreferAuthoritativeNextRoute &&
+      current.rawTelemetry.length > 1 &&
+      current.routePath.length > 1 &&
+      next.rawTelemetry.length === 0);
   const mergedRoutePath = shouldPreferCurrentRoute
     ? current.routePath
     : shouldPreferAuthoritativeNextRoute
@@ -539,14 +630,9 @@ export const mergeTripHistoryItem = (
     rawGpsPointCount: next.rawGpsPointCount > 0 ? next.rawGpsPointCount : current.rawGpsPointCount,
     matchedPointCount:
       next.matchedPointCount > 0 ? next.matchedPointCount : current.matchedPointCount,
-    syncStatus:
-      current.syncStatus === 'SYNCED' || next.syncStatus === 'SYNCED'
-        ? 'SYNCED'
-        : next.syncStatus ?? current.syncStatus,
-    tripState:
-      current.tripState === 'SYNCED' || next.tripState === 'SYNCED'
-        ? 'SYNCED'
-        : next.tripState ?? current.tripState,
+    syncStatus: mergedSyncStatus,
+    offlineSyncStatus: mergedOfflineSyncStatus,
+    tripState: mergedTripState,
     driverName: next.driverName ?? current.driverName,
     driverCode: next.driverCode ?? current.driverCode,
     vehiclePlateNumber: next.vehiclePlateNumber ?? current.vehiclePlateNumber,
@@ -572,13 +658,7 @@ export const normalizeTripHistoryItem = (
     if (geoJsonRoute.length > 1) {
       return geoJsonRoute;
     }
-    const telemetryRoute = dedupeSequentialTripCoordinates(
-      rawTelemetry.map((point) => ({
-        latitude: point.latitude,
-        longitude: point.longitude,
-      })),
-    );
-    return telemetryRoute;
+    return [];
   })();
   const distanceKm =
     typeof item.totalDistanceMatchedMeters === 'number' && item.totalDistanceMatchedMeters > 0
@@ -590,7 +670,6 @@ export const normalizeTripHistoryItem = (
       ? item.fareAmount
       : Number(String(item.fare ?? '').replace(/[^\d.-]/g, ''));
   const fareAmount = Number.isFinite(parsedFareAmount) ? roundMetric(parsedFareAmount, 2) : 0;
-  const normalizedDashedEndConnector = normalizeTripCoordinateArray(item.dashedEndConnector);
   const resolvedMatchedEndPoint = isValidCoordinate(item.endLocationMatched)
     ? item.endLocationMatched
     : routePath.at(-1) ?? null;
@@ -603,12 +682,20 @@ export const normalizeTripHistoryItem = (
   const resolvedEndCoordinate = isValidCoordinate(item.endCoordinate)
     ? item.endCoordinate
     : resolvedMatchedEndPoint ?? routePath.at(-1) ?? resolvedRawEndPoint;
-  const resolvedRoadEndPoint = routePath.at(-1) ?? resolvedMatchedEndPoint;
-  const shouldBuildDefaultEndConnector =
-    normalizedDashedEndConnector.length === 0 &&
-    resolvedRoadEndPoint &&
-    resolvedMatchedEndPoint &&
-    distanceBetweenMeters(resolvedRoadEndPoint, resolvedMatchedEndPoint) >= 3;
+  const rawGpsPointCount = Number(item.rawGpsPointCount ?? rawTelemetry.length);
+  const offlineSegmentsCount = Number(item.offlineSegmentsCount ?? 0);
+  const syncStatus = item.syncStatus ?? 'SYNC_PENDING';
+  const tripState = item.tripState ?? (syncStatus === 'SYNCED' ? 'SYNCED' : 'COMPLETED');
+  const tripStatus = item.status ?? 'COMPLETED';
+  const offlineSyncStatus = deriveOfflineSyncStatus({
+    explicitStatus: normalizeOfflineSyncStatus(item.offlineSyncStatus),
+    syncStatus,
+    tripState,
+    tripStatus,
+    rawGpsPointCount,
+    rawTelemetryCount: rawTelemetry.length,
+    offlineSegmentsCount,
+  });
 
   return {
     id: String(item.id ?? ''),
@@ -618,7 +705,7 @@ export const normalizeTripHistoryItem = (
     fare: formatTripReceiptFare(fareAmount),
     fareAmount,
     violations: item.violations ?? '0',
-    status: item.status ?? 'COMPLETED',
+    status: tripStatus,
     compliance: typeof item.compliance === 'number' ? item.compliance : 100,
     routePath,
     rawStartPoint: isValidCoordinate(item.rawStartPoint) ? item.rawStartPoint : null,
@@ -637,18 +724,7 @@ export const normalizeTripHistoryItem = (
     startCoordinate: resolvedStartCoordinate,
     endCoordinate: resolvedEndCoordinate,
     dashedStartConnector: normalizeTripCoordinateArray(item.dashedStartConnector),
-    dashedEndConnector:
-      normalizedDashedEndConnector.length > 0
-        ? normalizedDashedEndConnector
-        : shouldBuildDefaultEndConnector
-          ? buildTripConnector({
-              from: resolvedRoadEndPoint,
-              to: resolvedMatchedEndPoint,
-            })
-          : buildTripConnector({
-              from: resolvedRoadEndPoint ?? resolvedMatchedEndPoint,
-              to: resolvedRawEndPoint,
-            }),
+    dashedEndConnector: normalizeTripCoordinateArray(item.dashedEndConnector),
     startedAt: typeof item.startedAt === 'string' ? item.startedAt : null,
     endedAt: typeof item.endedAt === 'string' ? item.endedAt : null,
     durationSeconds,
@@ -660,7 +736,7 @@ export const normalizeTripHistoryItem = (
     averageSpeedKph: Number(item.averageSpeedKph ?? 0),
     maxSpeedKph: Number(item.maxSpeedKph ?? deriveMaxSpeedKph(rawTelemetry)),
     idleDurationSeconds: Number(item.idleDurationSeconds ?? deriveIdleDurationSeconds(rawTelemetry)),
-    offlineSegmentsCount: Number(item.offlineSegmentsCount ?? 0),
+    offlineSegmentsCount,
     gpsQualitySummary: item.gpsQualitySummary ?? buildGpsQualitySummary(rawTelemetry),
     routeMatchSummary:
       item.routeMatchSummary && typeof item.routeMatchSummary === 'object'
@@ -670,10 +746,11 @@ export const normalizeTripHistoryItem = (
       item.routeTraceGeoJson && typeof item.routeTraceGeoJson === 'object'
         ? (item.routeTraceGeoJson as TripRouteGeoJson)
         : buildRouteTraceGeoJson(routePath),
-    rawGpsPointCount: Number(item.rawGpsPointCount ?? rawTelemetry.length),
+    rawGpsPointCount,
     matchedPointCount: Number(item.matchedPointCount ?? routePath.length),
-    syncStatus: item.syncStatus ?? 'SYNC_PENDING',
-    tripState: item.tripState ?? (item.syncStatus === 'SYNCED' ? 'SYNCED' : 'COMPLETED'),
+    syncStatus,
+    offlineSyncStatus,
+    tripState,
     driverName: item.driverName ?? null,
     driverCode: item.driverCode ?? null,
     vehiclePlateNumber: item.vehiclePlateNumber ?? null,
@@ -721,6 +798,7 @@ export const buildTripHistoryItem = ({
   routeTraceGeoJson = null,
   rawGpsPointCount = null,
   matchedPointCount = null,
+  offlineSyncStatus = null,
   startDisplayName = null,
   endDisplayName = null,
   startCoordinate = null,
@@ -763,6 +841,7 @@ export const buildTripHistoryItem = ({
   routeTraceGeoJson?: TripRouteGeoJson | null;
   rawGpsPointCount?: number | null;
   matchedPointCount?: number | null;
+  offlineSyncStatus?: TripOfflineSyncStatus | null;
   startDisplayName?: string | null;
   endDisplayName?: string | null;
   startCoordinate?: TripCoordinate | null;
@@ -773,7 +852,6 @@ export const buildTripHistoryItem = ({
 }): TripHistoryItem => {
   const normalizedRoutePath = normalizeTripCoordinateArray(matchedRoutePath);
   const normalizedRawTelemetry = normalizeTripTelemetryArray(rawTelemetry);
-  const normalizedDashedEndConnector = normalizeTripCoordinateArray(dashedEndConnector);
   const rawPath = normalizedRawTelemetry.map((point) => ({
     latitude: point.latitude,
     longitude: point.longitude,
@@ -806,12 +884,20 @@ export const buildTripHistoryItem = ({
     startCoordinate ?? resolvedMatchedStartPoint ?? normalizedRoutePath[0] ?? rawStartPoint;
   const resolvedEndCoordinate =
     endCoordinate ?? resolvedMatchedEndPoint ?? normalizedRoutePath.at(-1) ?? rawEndPoint;
-  const resolvedRoadEndPoint = normalizedRoutePath.at(-1) ?? resolvedMatchedEndPoint;
-  const shouldBuildMatchedEndConnector =
-    normalizedDashedEndConnector.length === 0 &&
-    resolvedRoadEndPoint &&
-    resolvedMatchedEndPoint &&
-    distanceBetweenMeters(resolvedRoadEndPoint, resolvedMatchedEndPoint) >= 3;
+  const resolvedRawGpsPointCount =
+    typeof rawGpsPointCount === 'number' && Number.isFinite(rawGpsPointCount)
+      ? Math.max(0, Math.round(rawGpsPointCount))
+      : normalizedRawTelemetry.length;
+  const resolvedOfflineSegmentsCount = Math.max(0, Math.round(offlineSegmentsCount));
+  const resolvedOfflineSyncStatus = deriveOfflineSyncStatus({
+    explicitStatus: offlineSyncStatus,
+    syncStatus,
+    tripState,
+    tripStatus: status,
+    rawGpsPointCount: resolvedRawGpsPointCount,
+    rawTelemetryCount: normalizedRawTelemetry.length,
+    offlineSegmentsCount: resolvedOfflineSegmentsCount,
+  });
 
   return {
     id,
@@ -841,26 +927,8 @@ export const buildTripHistoryItem = ({
     ),
     startCoordinate: resolvedStartCoordinate,
     endCoordinate: resolvedEndCoordinate,
-    dashedStartConnector:
-      normalizeTripCoordinateArray(dashedStartConnector).length > 0
-        ? normalizeTripCoordinateArray(dashedStartConnector)
-        : buildTripConnector({
-            from: rawStartPoint,
-            to: resolvedMatchedStartPoint,
-            minDistanceMeters: 6,
-          }),
-    dashedEndConnector:
-      normalizedDashedEndConnector.length > 0
-        ? normalizedDashedEndConnector
-        : shouldBuildMatchedEndConnector
-          ? buildTripConnector({
-              from: resolvedRoadEndPoint,
-              to: resolvedMatchedEndPoint,
-            })
-        : buildTripConnector({
-            from: resolvedRoadEndPoint ?? resolvedMatchedEndPoint,
-            to: rawEndPoint,
-          }),
+    dashedStartConnector: normalizeTripCoordinateArray(dashedStartConnector),
+    dashedEndConnector: normalizeTripCoordinateArray(dashedEndConnector),
     startedAt: startedAt ?? normalizedRawTelemetry[0]?.recordedAt ?? null,
     endedAt: endedAt ?? normalizedRawTelemetry.at(-1)?.recordedAt ?? null,
     durationSeconds,
@@ -869,16 +937,14 @@ export const buildTripHistoryItem = ({
     averageSpeedKph: roundMetric(resolvedAverageSpeedKph, 1),
     maxSpeedKph: roundMetric(resolvedMaxSpeedKph, 1),
     idleDurationSeconds: Math.max(0, Math.round(resolvedIdleDurationSeconds)),
-    offlineSegmentsCount: Math.max(0, Math.round(offlineSegmentsCount)),
+    offlineSegmentsCount: resolvedOfflineSegmentsCount,
     gpsQualitySummary: resolvedGpsQualitySummary,
     routeMatchSummary,
     routeTraceGeoJson: routeTraceGeoJson ?? buildRouteTraceGeoJson(normalizedRoutePath),
-    rawGpsPointCount:
-      typeof rawGpsPointCount === 'number' && Number.isFinite(rawGpsPointCount)
-        ? Math.max(0, Math.round(rawGpsPointCount))
-        : normalizedRawTelemetry.length,
+    rawGpsPointCount: resolvedRawGpsPointCount,
     matchedPointCount: matchedPointCount ?? normalizedRoutePath.length,
     syncStatus,
+    offlineSyncStatus: resolvedOfflineSyncStatus,
     tripState,
     driverName,
     driverCode,
@@ -895,29 +961,56 @@ export const buildTripHistoryItem = ({
 export const resolveTripHistoryRoutePath = (
   item: Pick<
     TripHistoryItem,
-    'routePath' | 'routeTraceGeoJson' | 'rawTelemetry' | 'routeMatchSummary' | 'syncStatus'
+    'routePath' | 'routeTraceGeoJson' | 'rawTelemetry' | 'routeMatchSummary' | 'syncStatus' | 'status'
   >,
 ) => {
-  const authoritativeGeoJsonRoute = normalizeGeoJsonRoutePath(item.routeTraceGeoJson);
-  const shouldPreferAuthoritativeGeoJson =
-    item.syncStatus === 'SYNCED' &&
-    typeof item.routeMatchSummary?.provider === 'string' &&
-    item.routeMatchSummary.provider !== 'local-directional' &&
-    authoritativeGeoJsonRoute.length > 1;
-  if (shouldPreferAuthoritativeGeoJson) {
-    return authoritativeGeoJsonRoute;
-  }
   const directRoute = dedupeSequentialTripCoordinates(item.routePath);
-  if (directRoute.length > 1) {
-    return directRoute;
-  }
-  if (authoritativeGeoJsonRoute.length > 1) {
-    return authoritativeGeoJsonRoute;
-  }
-  return dedupeSequentialTripCoordinates(
+  const geoJsonRoute = normalizeGeoJsonRoutePath(item.routeTraceGeoJson);
+  const rawTelemetryRoute = dedupeSequentialTripCoordinates(
     item.rawTelemetry.map((point) => ({
       latitude: point.latitude,
       longitude: point.longitude,
     })),
   );
+  const directRouteMatchesRawTelemetry =
+    directRoute.length > 1 &&
+    directRoute.length === rawTelemetryRoute.length &&
+    directRoute.every((point, index) => {
+      const rawPoint = rawTelemetryRoute[index];
+      return (
+        rawPoint &&
+        Math.abs(point.latitude - rawPoint.latitude) < 0.000001 &&
+        Math.abs(point.longitude - rawPoint.longitude) < 0.000001
+      );
+    });
+  const routeProvider = item.routeMatchSummary?.provider;
+  const hasSavedOsrmMatch = routeProvider === 'osrm-match';
+  const hasSavedProcessedRoute =
+    typeof routeProvider === 'string' && routeProvider !== 'local-directional';
+
+  if (hasSavedOsrmMatch) {
+    if (geoJsonRoute.length > 1) {
+      return geoJsonRoute;
+    }
+    if (directRoute.length > 1) {
+      return directRoute;
+    }
+  }
+
+  if (hasSavedProcessedRoute) {
+    if (geoJsonRoute.length > 1) {
+      return geoJsonRoute;
+    }
+    if (directRoute.length > 1) {
+      return directRoute;
+    }
+  }
+
+  if (directRoute.length > 1) {
+    return directRouteMatchesRawTelemetry ? [] : directRoute;
+  }
+  if (geoJsonRoute.length > 1) {
+    return geoJsonRoute;
+  }
+  return [];
 };

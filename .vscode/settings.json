@@ -1,6 +1,7 @@
 {
+  "json.schemaDownload.enable": false,
   "mssql.intelliSense.enableErrorChecking": false,
   "mssql.autoDisableNonTSqlLanguageService": true,
   "java.compile.nullAnalysis.mode": "automatic",
-  "java.configuration.updateBuildConfiguration": "interactive"
+  "java.configuration.updateBuildConfiguration": "automatic"
 }

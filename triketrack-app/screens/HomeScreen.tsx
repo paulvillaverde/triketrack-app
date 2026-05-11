@@ -24,7 +24,6 @@ import {
 import { AppIcon, Avatar } from '../components/ui';
 import { getMotionDurationMs, shortestAngleDelta } from '../lib/mapTracking';
 import {
-  buildRoadAlignedTripPathDetailed,
   dedupeSequentialPoints,
   polylineDistanceKm,
   smoothDisplayedRoutePath,
@@ -39,7 +38,6 @@ import {
 import {
   formatTripReceiptDistance,
   formatTripReceiptFare,
-  pickPreferredRouteMatchSummary,
   type TripCompletionPayload,
   type TripGpsQualitySummary,
 } from '../lib/tripTransactions';
@@ -82,7 +80,10 @@ import {
   isPointInsidePolygon,
   isValidCoordinate,
   LOW_BATTERY_MAP_ACCENT,
-  LOW_BATTERY_MAP_ACCENT_SOFT,
+  MAP_GEOFENCE_FILL_DARK,
+  MAP_GEOFENCE_FILL_LIGHT,
+  MAP_GEOFENCE_STROKE_DARK,
+  MAP_GEOFENCE_STROKE_LIGHT,
   MAXIM_UI_BORDER_DARK,
   MAXIM_UI_CHROME_DARK,
   MAXIM_UI_MUTED_DARK,
@@ -120,6 +121,15 @@ const LOCAL_CENTERLINE_PROJECTION_MAX_DISTANCE_KM = 0.03;
 
 type HomeStatsFilter = 'TODAY' | 'YESTERDAY' | 'LAST_WEEK' | 'LAST_30_DAYS';
 
+const getDurationSecondsBetween = (startedAt: string | null, endedAt: string) => {
+  const startedAtMs = new Date(startedAt ?? '').getTime();
+  const endedAtMs = new Date(endedAt).getTime();
+  if (!Number.isFinite(startedAtMs) || !Number.isFinite(endedAtMs) || endedAtMs <= startedAtMs) {
+    return 0;
+  }
+  return Math.max(0, Math.round((endedAtMs - startedAtMs) / 1000));
+};
+
 type HomeScreenProps = {
   onLogout?: () => void;
   onNavigate?: (tab: BottomTab) => void;
@@ -128,7 +138,7 @@ type HomeScreenProps = {
   onGoOnline: () => void;
   onGoOffline: () => void;
   onBackToHome: () => void;
-  onRequestTripNavigation?: () => void;
+  onRequestTripNavigation?: (payload?: { fare: number }) => void;
   onExitTripNavigation?: () => void;
   locationEnabled: boolean;
   tripOpenPending?: boolean;
@@ -141,6 +151,7 @@ type HomeScreenProps = {
   onTripComplete: (payload: TripCompletionPayload) => void;
   onTripStart?: (payload: {
     startLocation: { latitude: number; longitude: number } | null;
+    fare: number;
   }) => boolean | Promise<boolean>;
   onTripPointRecord?: (payload: {
     latitude: number;
@@ -355,8 +366,8 @@ export function HomeScreen({
   const isLowGpsAccuracy =
     displayAccuracyMeters !== null && displayAccuracyMeters > ACTIVE_CAMERA_ACCURACY_METERS;
 
-  const geofenceStrokeColor = isDarkMap ? LOW_BATTERY_MAP_ACCENT : '#5A67D8';
-  const geofenceFillColor = isDarkMap ? LOW_BATTERY_MAP_ACCENT_SOFT : 'rgba(90,103,216,0.04)';
+  const geofenceStrokeColor = isDarkMap ? MAP_GEOFENCE_STROKE_DARK : MAP_GEOFENCE_STROKE_LIGHT;
+  const geofenceFillColor = isDarkMap ? MAP_GEOFENCE_FILL_DARK : MAP_GEOFENCE_FILL_LIGHT;
   const tripRouteCasingColor = isDarkMap ? MAXIM_ROUTE_CASING_DARK : MAXIM_ROUTE_CASING_LIGHT;
   const tripRouteCoreColor = isDarkMap ? MAXIM_ROUTE_CORE_DARK : MAXIM_ROUTE_CORE_LIGHT;
   const startConnectorColor = isDarkMap ? LOW_BATTERY_MAP_ACCENT : 'rgba(107,114,128,0.78)';
@@ -1773,6 +1784,7 @@ export function HomeScreen({
     const canStartTrip =
       (await onTripStart?.({
         startLocation: startLocation ? { latitude: startLocation.latitude, longitude: startLocation.longitude } : null,
+        fare: selectedFare,
       })) ?? true;
 
     if (!canStartTrip) {
@@ -1885,19 +1897,118 @@ export function HomeScreen({
 
     await drainBufferedRoadPoints();
 
-    const completedRoutePath =
-      travelPathRef.current.length > 0
-        ? travelPathRef.current
-        : routePointsRef.current.length > 0
-          ? dedupeSequentialPoints(routePointsRef.current)
-          : [];
     const completedRawTelemetry = acceptedTelemetryRef.current;
-    const completedRawTelemetryPath = dedupeSequentialPoints(
-      completedRawTelemetry.map((point) => ({
-        latitude: point.latitude,
-        longitude: point.longitude,
-      })),
-    );
+    const completedStartedAt = tripStartedAtRef.current;
+    const completedEndedAt = new Date().toISOString();
+
+    if (!isNetworkAvailable) {
+      const timestampDurationSeconds = getDurationSecondsBetween(
+        completedStartedAt,
+        completedEndedAt,
+      );
+      const completedDurationSeconds = Math.max(elapsedSeconds, timestampDurationSeconds);
+      const completedRawStartPoint =
+        rawStartPointRef.current ??
+        (completedRawTelemetry[0]
+          ? {
+              latitude: completedRawTelemetry[0].latitude,
+              longitude: completedRawTelemetry[0].longitude,
+            }
+          : null);
+      const completedRawEndPoint =
+        completedRawTelemetry.at(-1)
+          ? {
+              latitude: completedRawTelemetry.at(-1)!.latitude,
+              longitude: completedRawTelemetry.at(-1)!.longitude,
+            }
+          : latestActualCoordsRef.current;
+      const restoredActualPoint = latestActualCoordsRef.current;
+      const averageSpeed =
+        completedDurationSeconds > 0
+          ? Math.max(0, distanceKm) / (completedDurationSeconds / 3600)
+          : speedKmh;
+
+      setIsTripStarted(false);
+      setCompletedTripPreviewPath([]);
+      setTripSummary({
+        tripNumberText: activeTripNumber,
+        durationText: `${Math.floor(completedDurationSeconds / 60)}:${String(
+          completedDurationSeconds % 60,
+        ).padStart(2, '0')}`,
+        distanceText: formatTripReceiptDistance(Math.max(0, distanceKm) * 1000),
+        speedText: `${Math.max(0, averageSpeed).toFixed(1)} km/h`,
+        statusText: 'Trip saved offline. Sync it from Unsynced Trips when you are online.',
+        pickupText: null,
+        destinationText: null,
+        fareText: formatTripReceiptFare(selectedFare),
+        isBusy: false,
+      });
+      setLastTrackPoint(null);
+      lastTrackPointRef.current = null;
+      lastRawTrackPointRef.current = null;
+      rawStartPointRef.current = null;
+      pendingRawPointsRef.current = [];
+      roadMatchCarryoverRef.current = [];
+      setRoutePoints([]);
+      setTravelPath([]);
+      setStartConnectorPoints([]);
+      setRouteRenderState('PRE_ROAD');
+      setFirstSnappedRoadPoint(null);
+      routePointsRef.current = [];
+      travelPathRef.current = [];
+      routeRenderStateRef.current = 'PRE_ROAD';
+      firstSnappedRoadPointRef.current = null;
+      snappedCoordsRef.current = coords;
+      roadSnapQueueRef.current = Promise.resolve();
+      setElapsedSeconds(0);
+      setDistanceKm(0);
+      setSpeedKmh(0);
+      setHeadingDeg(0);
+      headingAnimValue.current = 0;
+      headingAnim.setValue(0);
+      lastTrackTimestampMsRef.current = null;
+      acceptedTelemetryRef.current = [];
+      tripStartedAtRef.current = null;
+      if (restoredActualPoint) {
+        setCoords(restoredActualPoint);
+        snappedCoordsRef.current = restoredActualPoint;
+      }
+      if (mapRef.current) {
+        mapRef.current.animateCamera(
+          {
+            center: restoredActualPoint ?? coords ?? fallbackCenter,
+            zoom: NORMAL_CAMERA.zoom,
+            pitch: NORMAL_CAMERA.pitch,
+            heading: NORMAL_CAMERA.heading,
+          },
+          { duration: 700 },
+        );
+      }
+
+      onTripComplete({
+        fare: selectedFare,
+        distanceKm: Math.max(0, distanceKm),
+        durationSeconds: completedDurationSeconds,
+        routePath: [],
+        endLocation: completedRawEndPoint,
+        rawTelemetry: completedRawTelemetry,
+        startedAt: completedStartedAt,
+        endedAt: completedEndedAt,
+        rawStartPoint: completedRawStartPoint,
+        rawEndPoint: completedRawEndPoint,
+        matchedStartPoint: null,
+        matchedEndPoint: null,
+        dashedStartConnector: [],
+        dashedEndConnector: [],
+        tripState: 'SYNC_PENDING',
+        matchedPointCount: 0,
+        offlineSegmentsCount: 1,
+        averageSpeedKph: Math.max(0, averageSpeed),
+        routeMatchSummary: null,
+      });
+      return;
+    }
+
     const reconstruction = await reconstructCompletedTripPath(completedRawTelemetry);
     console.info('[TripReconstruction] Home completed trip reconstruction.', {
       status: reconstruction.status,
@@ -1908,45 +2019,19 @@ export function HomeScreen({
       reconstructedPoints: reconstruction.reconstructedPath.length,
       rejectedOutliers: reconstruction.rejectedOutlierCount,
     });
-    const reconstructionCandidatePath =
-      reconstruction.reconstructedPath.length > 1
-        ? reconstruction.reconstructedPath
-        : reconstruction.preprocessedPath.length > 1
-          ? reconstruction.preprocessedPath
-          : completedRoutePath.length > 1
-            ? completedRoutePath
-            : completedRawTelemetryPath;
-    const reconstructionFallbackPath =
-      reconstruction.preprocessedPath.length > 1
-        ? reconstruction.preprocessedPath
-        : completedRoutePath.length > 1
-          ? completedRoutePath
-          : completedRawTelemetryPath;
-    const roadAlignmentResult = await buildRoadAlignedTripPathDetailed({
-      candidatePath: reconstructionCandidatePath,
-      fallbackPath: reconstructionFallbackPath,
-      preserveDetailedGeometry:
-        typeof reconstruction.routeMatchMetadata?.provider === 'string' &&
-        reconstruction.routeMatchMetadata.provider !== 'local-directional',
-      trustCandidateGeometry:
-        reconstructionCandidatePath.length > 1 &&
-        ((typeof reconstruction.routeMatchMetadata?.provider === 'string' &&
-          reconstruction.routeMatchMetadata.provider !== 'local-directional') ||
-          reconstruction.preprocessedPath.length > 1 ||
-          reconstruction.rawAcceptedPath.length > 1),
-    });
-    const roadAlignedCompletedRoutePath =
-      roadAlignmentResult.path ?? reconstructionFallbackPath;
+    const roadAlignedCompletedRoutePath = reconstruction.reconstructedPath;
     const completedDistanceKm =
       distanceKm > 0 ? distanceKm : polylineDistanceKm(roadAlignedCompletedRoutePath);
     const restoredActualPoint = latestActualCoordsRef.current;
-    const completedDurationSeconds = elapsedSeconds;
+    const timestampDurationSeconds = getDurationSecondsBetween(
+      completedStartedAt,
+      completedEndedAt,
+    );
+    const completedDurationSeconds = Math.max(elapsedSeconds, timestampDurationSeconds);
     const averageSpeed =
       completedDurationSeconds > 0
         ? completedDistanceKm / (completedDurationSeconds / 3600)
         : speedKmh;
-    const completedStartedAt = tripStartedAtRef.current;
-    const completedEndedAt = new Date().toISOString();
     const completedRawStartPoint = rawStartPointRef.current;
     const completedStartEndpointSelection = await selectTripStartEndpointFromBuildings({
       roadPath: roadAlignedCompletedRoutePath,
@@ -2115,10 +2200,8 @@ export function HomeScreen({
       maxSpeedKph,
       idleDurationSeconds: Math.round(idleDurationSeconds),
       gpsQualitySummary,
-      routeMatchSummary: pickPreferredRouteMatchSummary(
-        roadAlignmentResult.metadata ?? null,
-        reconstruction.routeMatchMetadata ?? null,
-      ),
+      routeMatchSummary:
+        roadAlignedCompletedRoutePath.length > 2 ? reconstruction.routeMatchMetadata ?? null : null,
     });
 
     if (openTripHistory) {
@@ -2133,7 +2216,7 @@ export function HomeScreen({
           Alert.alert('Location required', 'Allow location access before starting a trip.');
           return;
         }
-        onRequestTripNavigation?.();
+        onRequestTripNavigation?.({ fare: selectedFare });
         return;
       }
       await beginTripSession(coords);
@@ -2143,7 +2226,7 @@ export function HomeScreen({
     await finishTripSession();
   };
 
-  const distanceSummaryKm = totalDistanceKm.toFixed(2);
+  const distanceSummaryKm = totalDistanceKm.toFixed(3);
   const alertScale = alertPulse.interpolate({
     inputRange: [0, 1],
     outputRange: [1, 1.04],

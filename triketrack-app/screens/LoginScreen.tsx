@@ -4,16 +4,18 @@ import { AnimatedButton, AppIcon, InputField } from '../components/ui';
 import { MAXIM_UI_SUBTLE_DARK, MAXIM_UI_TEXT_DARK } from './homeScreenShared';
 
 type LoginScreenProps = {
-  onCreatePassword: () => void;
+  onForgotPassword: () => void;
   onLogin: (driverCode: string, password: string) => void;
+  passwordPlaceholder?: string;
   isAuthenticating?: boolean;
   styles: Record<string, any>;
   isDarkMode?: boolean;
 };
 
 export function LoginScreen({
-  onCreatePassword,
+  onForgotPassword,
   onLogin,
+  passwordPlaceholder = 'Password',
   isAuthenticating = false,
   styles,
   isDarkMode = false,
@@ -36,7 +38,7 @@ export function LoginScreen({
       />
       <InputField
         icon={<AppIcon name="lock" size={16} color={isDarkMode ? MAXIM_UI_TEXT_DARK : '#111827'} />}
-        placeholder="Password"
+        placeholder={passwordPlaceholder}
         placeholderTextColor={isDarkMode ? MAXIM_UI_SUBTLE_DARK : undefined}
         secureTextEntry={passwordHidden}
         value={password}
@@ -54,8 +56,8 @@ export function LoginScreen({
       />
 
       <View style={styles.forgotPasswordRow}>
-        <Pressable onPress={onCreatePassword}>
-          <Text style={styles.smallLinkDark}>Don't have password?</Text>
+        <Pressable onPress={onForgotPassword}>
+          <Text style={styles.smallLinkDark}>Forgot password?</Text>
         </Pressable>
       </View>
 

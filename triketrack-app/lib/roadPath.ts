@@ -44,7 +44,7 @@ const OPENROUTESERVICE_PROFILE = 'driving-car';
 const OPENROUTESERVICE_DIRECTIONS_MAX_POINTS = 50;
 const TRACE_MATCH_MAX_POINT_OFFSET_KM = 0.055;
 const TRACE_MATCH_AVG_POINT_OFFSET_KM = 0.028;
-const TRACE_MATCH_MIN_DISTANCE_RATIO = 0.72;
+const TRACE_MATCH_MIN_DISTANCE_RATIO = 0.92;
 
 export const dedupeSequentialPoints = <T extends LatLngPoint>(points: T[]) => {
   if (points.length <= 1) {
@@ -823,8 +823,12 @@ const buildOsrmRadiuses = (points: RoadPathTelemetryPointInput[]) =>
 
 export const fetchOsrmMatchedRoadPathDetailed = async (
   points: RoadPathTelemetryPointInput[],
+  options: { forceRemote?: boolean } = {},
 ): Promise<RoadPathMatchResult> => {
-  if (!REMOTE_ROAD_SNAPPING_ENABLED || !OSRM_API_BASE_URL) {
+  if (
+    (!REMOTE_ROAD_SNAPPING_ENABLED && !options.forceRemote) ||
+    !OSRM_API_BASE_URL
+  ) {
     return { path: null, metadata: null };
   }
 

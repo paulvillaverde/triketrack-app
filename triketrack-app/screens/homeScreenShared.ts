@@ -2,14 +2,17 @@ import type { LatLngPoint } from '../lib/roadPath';
 import * as Location from 'expo-location';
 
 export const OBRERO_GEOFENCE: Array<{ latitude: number; longitude: number }> = [
-  { latitude: 7.0832297, longitude: 125.624803 },
-  { latitude: 7.076611, longitude: 125.617071 },
-  { latitude: 7.078821, longitude: 125.6140047 },
-  { latitude: 7.0817, longitude: 125.612905 },
-  { latitude: 7.0835656, longitude: 125.612594 },
-  { latitude: 7.0849408, longitude: 125.611754 },
-  { latitude: 7.0868171, longitude: 125.613004 },
-  { latitude: 7.09187, longitude: 125.6177977 },
+  { latitude: 7.083261, longitude: 125.624543},
+  { latitude: 7.091131, longitude: 125.618100},
+  { latitude: 7.095079, longitude: 125.615429},
+  { latitude: 7.092281, longitude: 125.610868},
+  { latitude: 7.091124, longitude: 125.610166},
+  { latitude: 7.087334, longitude: 125.610410},
+  { latitude: 7.087394, longitude: 125.610409},
+  { latitude: 7.083822, longitude: 125.612407},
+  { latitude: 7.076802, longitude: 125.613528},
+  { latitude: 7.076895, longitude: 125.617366},
+  { latitude: 7.077373, longitude: 125.617366},
 ];
 
 export const NORMAL_CAMERA = {
@@ -207,11 +210,16 @@ export const LOW_BATTERY_MAP_ACCENT = '#F4D24E';
 export const LOW_BATTERY_MAP_ACCENT_SOFT = 'rgba(244,210,78,0.16)';
 export const LOW_BATTERY_MAP_ACCENT_CASING = 'rgba(20,26,35,0.72)';
 
-// Maxim-like matched route styling: brighter blue core with a soft pale casing.
+export const MAP_GEOFENCE_STROKE_LIGHT = '#58C7A7';
+export const MAP_GEOFENCE_FILL_LIGHT = 'rgba(88,199,167,0.05)';
+export const MAP_GEOFENCE_STROKE_DARK = '#2F8CFF';
+export const MAP_GEOFENCE_FILL_DARK = 'rgba(47,140,255,0.14)';
+
+// Maxim-like matched route styling: blue in light mode, neon green in night mode.
 export const MAXIM_ROUTE_CORE_LIGHT = '#2F8CFF';
 export const MAXIM_ROUTE_CASING_LIGHT = 'rgba(255,255,255,0.96)';
-export const MAXIM_ROUTE_CORE_DARK = '#F4D24E';
-export const MAXIM_ROUTE_CASING_DARK = 'rgba(255,245,176,0.28)';
+export const MAXIM_ROUTE_CORE_DARK = '#39FF14';
+export const MAXIM_ROUTE_CASING_DARK = 'rgba(57,255,20,0.26)';
 export const MAXIM_ROUTE_WIDTH_CASING_NAV = 8;
 export const MAXIM_ROUTE_WIDTH_CORE_NAV = 5;
 export const MAXIM_ROUTE_WIDTH_CASING_DETAIL = 7;

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Alert, Pressable, Text, View } from 'react-native';
 import { AnimatedButton, AppIcon, InputField } from '../components/ui';
 import { MAXIM_UI_SUBTLE_DARK, MAXIM_UI_TEXT_DARK } from './homeScreenShared';
@@ -6,6 +6,8 @@ import { MAXIM_UI_SUBTLE_DARK, MAXIM_UI_TEXT_DARK } from './homeScreenShared';
 type CreatePasswordScreenProps = {
   onBackToLogin: () => void;
   onSubmit: (driverCode: string, password: string) => Promise<void> | void;
+  initialDriverCode?: string;
+  lockDriverCode?: boolean;
   isSubmitting?: boolean;
   styles: Record<string, any>;
   isDarkMode?: boolean;
@@ -14,15 +16,21 @@ type CreatePasswordScreenProps = {
 export function CreatePasswordScreen({
   onBackToLogin,
   onSubmit,
+  initialDriverCode = '',
+  lockDriverCode = false,
   isSubmitting = false,
   styles,
   isDarkMode = false,
 }: CreatePasswordScreenProps) {
-  const [driverCode, setDriverCode] = useState('');
+  const [driverCode, setDriverCode] = useState(initialDriverCode);
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [passwordHidden, setPasswordHidden] = useState(true);
   const [confirmPasswordHidden, setConfirmPasswordHidden] = useState(true);
+
+  useEffect(() => {
+    setDriverCode(initialDriverCode);
+  }, [initialDriverCode]);
 
   const handleSubmit = () => {
     if (!driverCode.trim() || !password || !confirmPassword) {
@@ -51,6 +59,7 @@ export function CreatePasswordScreen({
         placeholderTextColor={isDarkMode ? MAXIM_UI_SUBTLE_DARK : undefined}
         value={driverCode}
         onChangeText={setDriverCode}
+        editable={!lockDriverCode}
         autoCapitalize="characters"
         autoCorrect={false}
         styles={styles}

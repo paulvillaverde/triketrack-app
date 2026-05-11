@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Animated,
   Dimensions,
@@ -13,7 +13,10 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { TripRouteMap } from '../components/maps/TripRouteMap';
 import { AppIcon, Avatar } from '../components/ui';
-import { resolveTripHistoryRoutePath, type TripHistoryItem } from '../lib/tripTransactions';
+import {
+  resolveTripHistoryRoutePath,
+  type TripHistoryItem,
+} from '../lib/tripTransactions';
 import {
   MAXIM_UI_BG_DARK,
   MAXIM_UI_BORDER_DARK,
@@ -44,6 +47,8 @@ type CompletedTripDetailScreenProps = {
   profilePlateNumber: string;
   profileImageUri: string | null;
   onBack: () => void;
+  onRoadMatchOfflineTrip?: (trip: TripHistoryItem) => void | Promise<void>;
+  onSyncOfflineTrip?: (trip: TripHistoryItem) => void | Promise<void>;
   isLowBatteryMapMode?: boolean;
 };
 
@@ -51,6 +56,7 @@ const getDaysAgo = (tripDate: string) => {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const date = new Date(`${tripDate}T00:00:00`);
+  date.setHours(0, 0, 0, 0);
   const diffMs = today.getTime() - date.getTime();
   return Math.floor(diffMs / (1000 * 60 * 60 * 24));
 };
@@ -98,18 +104,38 @@ const getPickupLabel = (trip: TripHistoryItem) =>
 const getDestinationLabel = (trip: TripHistoryItem) =>
   trip.endDisplayName?.trim() || 'Unknown destination';
 
+const hasDetailedMatchedRoute = (trip: TripHistoryItem) =>
+  trip.routePath.length > 2 &&
+  typeof trip.routeMatchSummary?.provider === 'string' &&
+  trip.routeMatchSummary.provider !== 'local-directional';
+
+const hasSavedMapMatchedRoute = (trip: TripHistoryItem) =>
+  trip.routePath.length > 2 && trip.routeMatchSummary?.provider === 'osrm-match';
+
 const getRouteSourceLabel = (trip: TripHistoryItem) => {
+  if (
+    trip.syncStatus !== 'SYNCED' &&
+    (trip.offlineSyncStatus === 'completed_offline' ||
+      trip.offlineSyncStatus === 'syncing' ||
+      trip.offlineSyncStatus === 'failed')
+  ) {
+    if (hasSavedMapMatchedRoute(trip)) {
+      return 'Road Match';
+    }
+    return trip.rawTelemetry.length > 0 ? 'Raw GPS' : 'Awaiting Sync';
+  }
+
   switch (trip.routeMatchSummary?.provider) {
     case 'osrm-match':
-      return 'OSRM match';
+      return hasDetailedMatchedRoute(trip) ? 'Road Match' : 'Matching Pending';
     case 'osrm-route':
-      return 'OSRM route';
+      return hasDetailedMatchedRoute(trip) ? 'Road Match' : 'Matching Pending';
     case 'ors-directions':
-      return 'ORS route';
+      return hasDetailedMatchedRoute(trip) ? 'Road Match' : 'Matching Pending';
     case 'local-directional':
-      return 'Local route';
+      return 'Matching Pending';
     default:
-      return trip.rawTelemetry.length > 0 ? 'Raw GPS' : 'No match';
+      return trip.rawTelemetry.length > 0 ? 'Matching Pending' : 'No route';
   }
 };
 
@@ -146,6 +172,109 @@ const getRouteRegion = (routePath: Array<{ latitude: number; longitude: number }
   };
 };
 
+type TripReplaySpeed = 1 | 2 | 4;
+type LatLng = { latitude: number; longitude: number };
+
+const TRIP_REPLAY_MIN_DURATION_MS = 14000;
+const TRIP_REPLAY_MAX_DURATION_MS = 90000;
+const TRIP_REPLAY_MS_PER_POINT = 850;
+const TRIP_REPLAY_CAMERA_PROGRESS_STEP = 0.012;
+
+const isFiniteLatLng = (point: LatLng | null | undefined): point is LatLng =>
+  Boolean(
+    point &&
+      Number.isFinite(point.latitude) &&
+      Number.isFinite(point.longitude),
+  );
+
+const dedupeSequentialLatLng = (points: LatLng[]) =>
+  points.filter((point, index) => {
+    if (index === 0) {
+      return true;
+    }
+    const previous = points[index - 1];
+    return (
+      Math.abs(previous.latitude - point.latitude) >= 0.000001 ||
+      Math.abs(previous.longitude - point.longitude) >= 0.000001
+    );
+  });
+
+const distanceMetersBetween = (from: LatLng, to: LatLng) =>
+  Math.hypot(
+    (to.latitude - from.latitude) * 111320,
+    (to.longitude - from.longitude) * 111320 * Math.cos((from.latitude * Math.PI) / 180),
+  );
+
+const headingDegreesBetween = (from: LatLng, to: LatLng) => {
+  const fromLatitude = (from.latitude * Math.PI) / 180;
+  const toLatitude = (to.latitude * Math.PI) / 180;
+  const deltaLongitude = ((to.longitude - from.longitude) * Math.PI) / 180;
+  const y = Math.sin(deltaLongitude) * Math.cos(toLatitude);
+  const x =
+    Math.cos(fromLatitude) * Math.sin(toLatitude) -
+    Math.sin(fromLatitude) * Math.cos(toLatitude) * Math.cos(deltaLongitude);
+  return (Math.atan2(y, x) * 180) / Math.PI;
+};
+
+const getReplayPointAtProgress = (path: LatLng[], progress: number) => {
+  const clampedProgress = Math.max(0, Math.min(1, progress));
+  if (path.length === 0) {
+    return null;
+  }
+  if (path.length === 1 || clampedProgress <= 0) {
+    return path[0];
+  }
+  if (clampedProgress >= 1) {
+    return path[path.length - 1];
+  }
+
+  const segmentDistances = path.slice(1).map((point, index) => distanceMetersBetween(path[index], point));
+  const totalDistance = segmentDistances.reduce((sum, value) => sum + value, 0);
+  if (totalDistance <= 0) {
+    const index = Math.min(path.length - 1, Math.round(clampedProgress * (path.length - 1)));
+    return path[index];
+  }
+
+  const targetDistance = totalDistance * clampedProgress;
+  let traveledDistance = 0;
+  for (let index = 1; index < path.length; index += 1) {
+    const segmentDistance = segmentDistances[index - 1] ?? 0;
+    if (traveledDistance + segmentDistance >= targetDistance) {
+      const segmentProgress =
+        segmentDistance <= 0 ? 0 : (targetDistance - traveledDistance) / segmentDistance;
+      const previous = path[index - 1];
+      const current = path[index];
+      return {
+        latitude: previous.latitude + (current.latitude - previous.latitude) * segmentProgress,
+        longitude: previous.longitude + (current.longitude - previous.longitude) * segmentProgress,
+      };
+    }
+    traveledDistance += segmentDistance;
+  }
+
+  return path[path.length - 1];
+};
+
+const getReplayHeadingAtProgress = (path: LatLng[], progress: number) => {
+  if (path.length < 2) {
+    return null;
+  }
+
+  const before = getReplayPointAtProgress(path, Math.max(0, progress - 0.002));
+  const after = getReplayPointAtProgress(path, Math.min(1, progress + 0.002));
+  if (!before || !after || distanceMetersBetween(before, after) < 0.4) {
+    return null;
+  }
+
+  return headingDegreesBetween(before, after);
+};
+
+const getReplayDurationMs = (path: LatLng[]) =>
+  Math.max(
+    TRIP_REPLAY_MIN_DURATION_MS,
+    Math.min(TRIP_REPLAY_MAX_DURATION_MS, Math.max(path.length - 1, 1) * TRIP_REPLAY_MS_PER_POINT),
+  );
+
 export function CompletedTripDetailScreen({
   selectedTrip,
   profileName,
@@ -153,6 +282,8 @@ export function CompletedTripDetailScreen({
   profilePlateNumber,
   profileImageUri,
   onBack,
+  onRoadMatchOfflineTrip,
+  onSyncOfflineTrip,
   isLowBatteryMapMode = false,
 }: CompletedTripDetailScreenProps) {
   const insets = useSafeAreaInsets();
@@ -171,6 +302,213 @@ export function CompletedTripDetailScreen({
   const selectedTripRoutePath = useMemo(
     () => resolveTripHistoryRoutePath(selectedTrip),
     [selectedTrip],
+  );
+  const rawGpsRoutePath = useMemo(
+    () =>
+      dedupeSequentialLatLng(
+        selectedTrip.rawTelemetry
+          .map((point) => ({
+            latitude: point.latitude,
+            longitude: point.longitude,
+          }))
+          .filter(isFiniteLatLng),
+      ),
+    [selectedTrip.rawTelemetry],
+  );
+  const replayPath = useMemo(() => {
+    const matchedPath = dedupeSequentialLatLng(selectedTripRoutePath.filter(isFiniteLatLng));
+    const routeProvider = selectedTrip.routeMatchSummary?.provider;
+    const hasSavedMatchedGeometry =
+      matchedPath.length > 1 &&
+      typeof routeProvider === 'string' &&
+      routeProvider !== 'local-directional';
+
+    if (hasSavedMatchedGeometry) {
+      return matchedPath;
+    }
+
+    return [];
+  }, [selectedTrip.routeMatchSummary?.provider, selectedTripRoutePath]);
+  const hasReplayPath = selectedTrip.status === 'COMPLETED' && replayPath.length > 1;
+  const replayDurationMs = useMemo(() => getReplayDurationMs(replayPath), [replayPath]);
+  const [isReplayPanelVisible, setIsReplayPanelVisible] = useState(false);
+  const [isReplayPlaying, setIsReplayPlaying] = useState(false);
+  const [replaySpeed, setReplaySpeed] = useState<TripReplaySpeed>(1);
+  const [replayProgress, setReplayProgress] = useState(0);
+  const [replayCameraFollowToken, setReplayCameraFollowToken] = useState(0);
+  const replayProgressRef = useRef(0);
+  const replaySpeedRef = useRef<TripReplaySpeed>(1);
+  const replayFrameRef = useRef<number | null>(null);
+  const replayLastFrameAtRef = useRef<number | null>(null);
+  const replayLastCameraProgressRef = useRef(0);
+  const replayWasPlayingBeforeScrubRef = useRef(false);
+  const replaySliderTrackRef = useRef<View | null>(null);
+  const replaySliderTrackXRef = useRef(0);
+  const replaySliderTrackWidthRef = useRef(1);
+  const [dateLabelNow, setDateLabelNow] = useState(() => new Date());
+  const replayMarkerCoordinate = useMemo(
+    () => (isReplayPanelVisible ? getReplayPointAtProgress(replayPath, replayProgress) : null),
+    [isReplayPanelVisible, replayPath, replayProgress],
+  );
+  const replayMarkerHeadingDeg = useMemo(
+    () => (isReplayPanelVisible ? getReplayHeadingAtProgress(replayPath, replayProgress) : null),
+    [isReplayPanelVisible, replayPath, replayProgress],
+  );
+  const isReplayFullScreen = isReplayPanelVisible && isReplayPlaying;
+
+  useEffect(() => {
+    replayProgressRef.current = replayProgress;
+  }, [replayProgress]);
+
+  useEffect(() => {
+    replaySpeedRef.current = replaySpeed;
+  }, [replaySpeed]);
+
+  useEffect(() => {
+    const timer = setInterval(() => setDateLabelNow(new Date()), 60_000);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    setIsReplayPanelVisible(false);
+    setIsReplayPlaying(false);
+    setReplayProgress(0);
+    replayProgressRef.current = 0;
+    replayLastFrameAtRef.current = null;
+    replayLastCameraProgressRef.current = 0;
+    if (replayFrameRef.current !== null) {
+      cancelAnimationFrame(replayFrameRef.current);
+      replayFrameRef.current = null;
+    }
+  }, [selectedTrip.id]);
+
+  useEffect(() => {
+    if (!isReplayPlaying || !hasReplayPath) {
+      if (replayFrameRef.current !== null) {
+        cancelAnimationFrame(replayFrameRef.current);
+        replayFrameRef.current = null;
+      }
+      replayLastFrameAtRef.current = null;
+      return;
+    }
+
+    const step = (timestamp: number) => {
+      const lastFrameAt = replayLastFrameAtRef.current ?? timestamp;
+      replayLastFrameAtRef.current = timestamp;
+      const elapsedMs = Math.max(0, timestamp - lastFrameAt);
+      const nextProgress = Math.min(
+        1,
+        replayProgressRef.current + (elapsedMs * replaySpeedRef.current) / replayDurationMs,
+      );
+
+      replayProgressRef.current = nextProgress;
+      setReplayProgress(nextProgress);
+
+      if (
+        Math.abs(nextProgress - replayLastCameraProgressRef.current) >= TRIP_REPLAY_CAMERA_PROGRESS_STEP ||
+        nextProgress === 0 ||
+        nextProgress === 1
+      ) {
+        replayLastCameraProgressRef.current = nextProgress;
+        setReplayCameraFollowToken((token) => token + 1);
+      }
+
+      if (nextProgress >= 1) {
+        setIsReplayPlaying(false);
+        replayLastFrameAtRef.current = null;
+        replayFrameRef.current = null;
+        return;
+      }
+
+      replayFrameRef.current = requestAnimationFrame(step);
+    };
+
+    replayFrameRef.current = requestAnimationFrame(step);
+
+    return () => {
+      if (replayFrameRef.current !== null) {
+        cancelAnimationFrame(replayFrameRef.current);
+        replayFrameRef.current = null;
+      }
+    };
+  }, [hasReplayPath, isReplayPlaying, replayDurationMs]);
+
+  const seekReplayTo = useCallback((progress: number) => {
+    const nextProgress = Math.max(0, Math.min(1, progress));
+    replayProgressRef.current = nextProgress;
+    replayLastCameraProgressRef.current = nextProgress;
+    setReplayProgress(nextProgress);
+    setReplayCameraFollowToken((token) => token + 1);
+  }, []);
+
+  const playReplay = useCallback(() => {
+    if (!hasReplayPath) {
+      return;
+    }
+    setIsReplayPanelVisible(true);
+    if (replayProgressRef.current >= 1) {
+      seekReplayTo(0);
+    }
+    setIsReplayPlaying(true);
+  }, [hasReplayPath, seekReplayTo]);
+
+  const pauseReplay = useCallback(() => {
+    setIsReplayPlaying(false);
+  }, []);
+
+  const exitReplay = useCallback(() => {
+    setIsReplayPlaying(false);
+    setIsReplayPanelVisible(false);
+  }, []);
+
+  const restartReplay = useCallback(() => {
+    if (!hasReplayPath) {
+      return;
+    }
+    setIsReplayPanelVisible(true);
+    seekReplayTo(0);
+    setIsReplayPlaying(true);
+  }, [hasReplayPath, seekReplayTo]);
+
+  const updateReplayProgressFromScreenX = useCallback(
+    (screenX: number) => {
+      const nextProgress =
+        (screenX - replaySliderTrackXRef.current) /
+        Math.max(replaySliderTrackWidthRef.current, 1);
+      seekReplayTo(nextProgress);
+    },
+    [seekReplayTo],
+  );
+
+  const replaySliderPanResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => hasReplayPath,
+        onMoveShouldSetPanResponder: () => hasReplayPath,
+        onPanResponderGrant: (event) => {
+          replayWasPlayingBeforeScrubRef.current = isReplayPlaying;
+          setIsReplayPlaying(false);
+          replaySliderTrackRef.current?.measureInWindow((x, _y, width) => {
+            replaySliderTrackXRef.current = x;
+            replaySliderTrackWidthRef.current = Math.max(width, 1);
+            updateReplayProgressFromScreenX(event.nativeEvent.pageX);
+          });
+        },
+        onPanResponderMove: (_event, gestureState) => {
+          updateReplayProgressFromScreenX(gestureState.moveX);
+        },
+        onPanResponderRelease: () => {
+          if (replayWasPlayingBeforeScrubRef.current && replayProgressRef.current < 1) {
+            setIsReplayPlaying(true);
+          }
+        },
+        onPanResponderTerminate: () => {
+          if (replayWasPlayingBeforeScrubRef.current && replayProgressRef.current < 1) {
+            setIsReplayPlaying(true);
+          }
+        },
+      }),
+    [hasReplayPath, isReplayPlaying, updateReplayProgressFromScreenX],
   );
   useEffect(() => {
     const listener = detailSheetTranslateY.addListener(({ value }) => {
@@ -227,35 +565,125 @@ export function CompletedTripDetailScreen({
     [detailSheetCollapsedOffset, detailSheetTranslateY],
   );
 
-  const hasSavedRoute = selectedTripRoutePath.length > 0 || selectedTrip.rawStartPoint || selectedTrip.endLocationRaw;
+  const isUnsyncedOfflineTrip =
+    selectedTrip.syncStatus !== 'SYNCED' &&
+    (selectedTrip.syncStatus === 'SYNC_PENDING' ||
+      selectedTrip.offlineSyncStatus === 'completed_offline' ||
+      selectedTrip.offlineSyncStatus === 'failed' ||
+      selectedTrip.offlineSyncStatus === 'syncing');
+  const hasMapMatchedRoute = hasSavedMapMatchedRoute(selectedTrip);
+  const hasDisplayableSavedRoute = selectedTripRoutePath.length > 1;
+  const hasRawPreviewRoute = isUnsyncedOfflineTrip && !hasMapMatchedRoute && selectedTripRoutePath.length > 2;
+  const shouldShowRawGpsRoute =
+    isUnsyncedOfflineTrip && !hasMapMatchedRoute && (rawGpsRoutePath.length > 1 || hasRawPreviewRoute);
+  const displayRoutePath =
+    shouldShowRawGpsRoute && rawGpsRoutePath.length > 1 ? rawGpsRoutePath : selectedTripRoutePath;
+  const savedRouteProvider = selectedTrip.routeMatchSummary?.provider;
+  const shouldLockSavedRoute =
+    shouldShowRawGpsRoute ||
+    (selectedTripRoutePath.length > 2 &&
+      typeof savedRouteProvider === 'string' &&
+      savedRouteProvider !== 'local-directional');
   const vehiclePlateNumber = selectedTrip.vehiclePlateNumber ?? profilePlateNumber;
   const isDarkMode = isLowBatteryMapMode;
+  const rawGpsCount = Math.max(
+    Number.isFinite(selectedTrip.rawGpsPointCount) ? selectedTrip.rawGpsPointCount : 0,
+    selectedTrip.rawTelemetry.length,
+  );
+  const canSyncOfflineTrip =
+    isUnsyncedOfflineTrip && hasMapMatchedRoute;
+  const canRoadMatchOfflineTrip =
+    isUnsyncedOfflineTrip &&
+    !hasMapMatchedRoute &&
+    (rawGpsCount > 1 || selectedTripRoutePath.length > 2);
+  const isSyncingOfflineTrip = selectedTrip.offlineSyncStatus === 'syncing';
+  const [isRoadMatchingOfflineTrip, setIsRoadMatchingOfflineTrip] = useState(false);
+  const actionButtonLabel = isSyncingOfflineTrip
+    ? 'Syncing...'
+    : isRoadMatchingOfflineTrip
+      ? 'Matching...'
+      : canRoadMatchOfflineTrip
+        ? 'Map Match'
+        : 'Sync';
+  const detailStatusLabel =
+    selectedTrip.syncStatus === 'SYNCED'
+      ? 'Completed Trip'
+      : hasMapMatchedRoute
+        ? 'Map Matched Route'
+        : 'Raw GPS Preview';
+  const detailTitle =
+    selectedTrip.syncStatus === 'SYNCED'
+      ? `Trip #${getTripNumber(selectedTrip.id)}`
+      : hasMapMatchedRoute
+        ? 'Ready to sync'
+        : 'Ready to convert';
+  const statusPillLabel =
+    selectedTrip.syncStatus === 'SYNCED'
+      ? 'Completed'
+      : selectedTrip.offlineSyncStatus === 'syncing'
+        ? 'Syncing'
+        : selectedTrip.offlineSyncStatus === 'failed'
+          ? 'Unsynced'
+          : selectedTrip.offlineSegmentsCount > 0
+            ? 'Offline'
+            : 'Unsynced';
+  const isActionButtonDisabled =
+    isSyncingOfflineTrip ||
+    isRoadMatchingOfflineTrip ||
+    (canRoadMatchOfflineTrip ? !onRoadMatchOfflineTrip : !onSyncOfflineTrip);
+  const getLocalDateKey = (value: Date) => {
+    const yyyy = value.getFullYear();
+    const mm = String(value.getMonth() + 1).padStart(2, '0');
+    const dd = String(value.getDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
+  };
+  const selectedTripDateKey = (() => {
+    const timestamp = selectedTrip.startedAt ?? selectedTrip.endedAt;
+    if (timestamp) {
+      const parsed = new Date(timestamp);
+      if (Number.isFinite(parsed.getTime())) {
+        return getLocalDateKey(parsed);
+      }
+    }
+    return selectedTrip.tripDate;
+  })();
+  const selectedTripDaysAgo = (() => {
+    const today = new Date(dateLabelNow);
+    today.setHours(0, 0, 0, 0);
+    const date = new Date(`${selectedTripDateKey}T00:00:00`);
+    date.setHours(0, 0, 0, 0);
+    return Math.floor((today.getTime() - date.getTime()) / (1000 * 60 * 60 * 24));
+  })();
+  const selectedTripDateLabel =
+    selectedTripDaysAgo === 0
+      ? 'Today'
+      : selectedTripDaysAgo === 1
+        ? 'Yesterday'
+        : formatNumericDate(selectedTripDateKey);
 
   return (
     <View style={[localStyles.detailScreen, isDarkMode ? { backgroundColor: MAXIM_UI_BG_DARK } : null]}>
-      {hasSavedRoute ? (
+      {hasDisplayableSavedRoute || shouldShowRawGpsRoute ? (
         <View style={localStyles.detailMapContainer}>
           <TripRouteMap
-            routePath={selectedTripRoutePath}
-            rawStartPoint={selectedTrip.startLocationRaw ?? selectedTrip.rawStartPoint ?? null}
+            routePath={displayRoutePath}
+            rawStartPoint={shouldLockSavedRoute ? null : selectedTrip.startLocationRaw ?? selectedTrip.rawStartPoint ?? null}
             matchedStartPoint={selectedTrip.startLocationMatched}
-            dashedStartConnector={selectedTrip.dashedStartConnector}
-            rawEndPoint={selectedTrip.endLocationRaw}
+            dashedStartConnector={shouldLockSavedRoute ? [] : selectedTrip.dashedStartConnector}
+            rawEndPoint={shouldLockSavedRoute ? null : selectedTrip.endLocationRaw}
             endPoint={selectedTrip.endLocationMatched}
-            dashedEndConnector={selectedTrip.dashedEndConnector}
-            rawTelemetry={selectedTrip.rawTelemetry}
+            dashedEndConnector={shouldLockSavedRoute ? [] : selectedTrip.dashedEndConnector}
+            rawTelemetry={shouldLockSavedRoute ? [] : selectedTrip.rawTelemetry}
             geofence={OBRERO_GEOFENCE}
-            lockSavedRoute={
-              selectedTrip.syncStatus === 'SYNCED' &&
-              selectedTripRoutePath.length > 1 &&
-              selectedTrip.routeMatchSummary?.provider !== null &&
-              typeof selectedTrip.routeMatchSummary?.provider === 'string' &&
-              selectedTrip.routeMatchSummary.provider !== 'local-directional'
-            }
+            lockSavedRoute={shouldLockSavedRoute}
             isLowBatteryMapMode={isLowBatteryMapMode}
+            replayMarkerCoordinate={replayMarkerCoordinate}
+            replayMarkerHeadingDeg={replayMarkerHeadingDeg}
+            replayCameraFollowToken={replayCameraFollowToken}
             style={localStyles.tripMap}
             getRouteRegion={getRouteRegion}
           />
+          {!isReplayFullScreen ? (
           <View
             style={[
               localStyles.mapReceiptOverlay,
@@ -325,6 +753,7 @@ export function CompletedTripDetailScreen({
               </View>
             </View>
           </View>
+          ) : null}
         </View>
       ) : (
         <View
@@ -346,6 +775,7 @@ export function CompletedTripDetailScreen({
         </View>
       )}
 
+      {!isReplayFullScreen ? (
       <Pressable
         style={[
           localStyles.detailBackFloating,
@@ -363,7 +793,142 @@ export function CompletedTripDetailScreen({
       >
         <AppIcon name="chevron-left" size={20} color={isDarkMode ? MAXIM_UI_TEXT_DARK : '#0F172A'} />
       </Pressable>
+      ) : null}
 
+      {isReplayFullScreen ? (
+        <View
+          style={[
+            localStyles.replayFullscreenControls,
+            isDarkMode
+              ? {
+                  backgroundColor: MAXIM_UI_SURFACE_ELEVATED_DARK,
+                  borderColor: MAXIM_UI_BORDER_DARK,
+                  shadowOpacity: 0,
+                  elevation: 0,
+                }
+              : null,
+            { bottom: Math.max(bottomSystemInset + 12, 28) },
+          ]}
+        >
+          <View style={localStyles.replayTopRow}>
+            <Pressable
+              style={[localStyles.replayMainButton, localStyles.replayMainButtonActive]}
+              onPress={pauseReplay}
+            >
+              <AppIcon name="pause" size={15} color="#FFFFFF" active />
+              <Text style={localStyles.replayMainButtonText}>Pause</Text>
+            </Pressable>
+            <Pressable
+              style={[
+                localStyles.replaySecondaryButton,
+                isDarkMode
+                  ? {
+                      backgroundColor: MAXIM_UI_SURFACE_DARK,
+                      borderColor: MAXIM_UI_BORDER_DARK,
+                    }
+                  : null,
+              ]}
+              onPress={restartReplay}
+            >
+              <AppIcon name="refresh-cw" size={14} color={isDarkMode ? MAXIM_UI_TEXT_DARK : '#0F172A'} />
+              <Text
+                style={[
+                  localStyles.replaySecondaryButtonText,
+                  isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                ]}
+              >
+                Restart
+              </Text>
+            </Pressable>
+            <Pressable
+              style={[
+                localStyles.replaySecondaryButton,
+                isDarkMode
+                  ? {
+                      backgroundColor: MAXIM_UI_SURFACE_DARK,
+                      borderColor: MAXIM_UI_BORDER_DARK,
+                    }
+                  : null,
+              ]}
+              onPress={exitReplay}
+            >
+              <AppIcon name="x" size={14} color={isDarkMode ? MAXIM_UI_TEXT_DARK : '#0F172A'} />
+              <Text
+                style={[
+                  localStyles.replaySecondaryButtonText,
+                  isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                ]}
+              >
+                Exit
+              </Text>
+            </Pressable>
+          </View>
+          <View style={localStyles.replaySpeedRow}>
+            {([1, 2, 4] as TripReplaySpeed[]).map((speed) => {
+              const isSelected = replaySpeed === speed;
+              return (
+                <Pressable
+                  key={speed}
+                  style={[
+                    localStyles.replaySpeedButton,
+                    isDarkMode
+                      ? {
+                          backgroundColor: MAXIM_UI_SURFACE_DARK,
+                          borderColor: MAXIM_UI_BORDER_DARK,
+                        }
+                      : null,
+                    isSelected ? localStyles.replaySpeedButtonSelected : null,
+                  ]}
+                  onPress={() => setReplaySpeed(speed)}
+                >
+                  <Text
+                    style={[
+                      localStyles.replaySpeedButtonText,
+                      isDarkMode ? { color: MAXIM_UI_MUTED_DARK } : null,
+                      isSelected ? localStyles.replaySpeedButtonTextSelected : null,
+                    ]}
+                  >
+                    {speed}x
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+          <View style={localStyles.replayProgressRow}>
+            <Text style={[localStyles.replayProgressText, isDarkMode ? { color: MAXIM_UI_MUTED_DARK } : null]}>
+              {Math.round(replayProgress * 100)}%
+            </Text>
+            <View
+              ref={(ref: View | null) => {
+                replaySliderTrackRef.current = ref;
+              }}
+              style={[
+                localStyles.replaySliderTrack,
+                isDarkMode ? { backgroundColor: MAXIM_UI_BORDER_DARK } : null,
+              ]}
+              onLayout={(event) => {
+                replaySliderTrackWidthRef.current = Math.max(event.nativeEvent.layout.width, 1);
+              }}
+              {...replaySliderPanResponder.panHandlers}
+            >
+              <View
+                style={[
+                  localStyles.replaySliderFill,
+                  { width: `${Math.max(0, Math.min(100, replayProgress * 100))}%` },
+                ]}
+              />
+              <View
+                style={[
+                  localStyles.replaySliderThumb,
+                  { left: `${Math.max(0, Math.min(100, replayProgress * 100))}%` },
+                ]}
+              />
+            </View>
+          </View>
+        </View>
+      ) : null}
+
+      {!isReplayFullScreen ? (
       <Animated.View
         style={[
           localStyles.detailBottomSafeArea,
@@ -372,7 +937,9 @@ export function CompletedTripDetailScreen({
           { transform: [{ translateY: detailSheetTranslateY }] },
         ]}
       />
+      ) : null}
 
+      {!isReplayFullScreen ? (
       <Animated.View
         style={[
           localStyles.detailBottomSheet,
@@ -407,7 +974,7 @@ export function CompletedTripDetailScreen({
           <View style={localStyles.rideSummaryCard}>
             <View style={localStyles.rideSummaryTripRow}>
               <View style={localStyles.rideTripCopy}>
-                <Text style={localStyles.detailEyebrow}>Completed Trip</Text>
+                <Text style={localStyles.detailEyebrow}>{detailStatusLabel}</Text>
                 <Text
                   style={[
                     localStyles.detailSheetSub,
@@ -415,7 +982,7 @@ export function CompletedTripDetailScreen({
                   ]}
                   numberOfLines={1}
                 >
-                  Trip #{getTripNumber(selectedTrip.id)}
+                  {detailTitle}
                 </Text>
               </View>
               <View
@@ -503,7 +1070,7 @@ export function CompletedTripDetailScreen({
 
             <View style={localStyles.rideStatusRow}>
               <View style={localStyles.statusPill}>
-                <Text style={localStyles.statusPillText}>Completed</Text>
+                <Text style={localStyles.statusPillText}>{statusPillLabel}</Text>
               </View>
               <Text
                 style={[
@@ -512,13 +1079,137 @@ export function CompletedTripDetailScreen({
                 ]}
                 numberOfLines={1}
               >
-                {formatTripDateForCard(selectedTrip.tripDate)}
+                {selectedTripDateLabel}
               </Text>
             </View>
 
+            {hasReplayPath ? (
+              <View
+                style={[
+                  localStyles.replayCard,
+                  isDarkMode
+                    ? {
+                        backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
+                        borderColor: MAXIM_UI_BORDER_SOFT_DARK,
+                      }
+                    : null,
+                ]}
+              >
+                <View style={localStyles.replayTopRow}>
+                  <Pressable
+                    style={[
+                      localStyles.replayMainButton,
+                      isReplayPlaying ? localStyles.replayMainButtonActive : null,
+                    ]}
+                    onPress={isReplayPanelVisible && isReplayPlaying ? pauseReplay : playReplay}
+                  >
+                    <AppIcon
+                      name={isReplayPanelVisible && isReplayPlaying ? 'pause' : 'play'}
+                      size={15}
+                      color="#FFFFFF"
+                      active
+                    />
+                    <Text style={localStyles.replayMainButtonText}>
+                      {isReplayPanelVisible ? (isReplayPlaying ? 'Pause' : 'Play') : 'Replay'}
+                    </Text>
+                  </Pressable>
+                  {isReplayPanelVisible ? (
+                    <Pressable
+                      style={[
+                        localStyles.replaySecondaryButton,
+                        isDarkMode
+                          ? {
+                              backgroundColor: MAXIM_UI_SURFACE_DARK,
+                              borderColor: MAXIM_UI_BORDER_DARK,
+                            }
+                          : null,
+                      ]}
+                      onPress={restartReplay}
+                    >
+                      <AppIcon name="refresh-cw" size={14} color={isDarkMode ? MAXIM_UI_TEXT_DARK : '#0F172A'} />
+                      <Text
+                        style={[
+                          localStyles.replaySecondaryButtonText,
+                          isDarkMode ? { color: MAXIM_UI_TEXT_DARK } : null,
+                        ]}
+                      >
+                        Restart
+                      </Text>
+                    </Pressable>
+                  ) : null}
+                </View>
+
+                {isReplayPanelVisible ? (
+                  <>
+                    <View style={localStyles.replaySpeedRow}>
+                      {([1, 2, 4] as TripReplaySpeed[]).map((speed) => {
+                        const isSelected = replaySpeed === speed;
+                        return (
+                          <Pressable
+                            key={speed}
+                            style={[
+                              localStyles.replaySpeedButton,
+                              isDarkMode
+                                ? {
+                                    backgroundColor: MAXIM_UI_SURFACE_DARK,
+                                    borderColor: MAXIM_UI_BORDER_DARK,
+                                  }
+                                : null,
+                              isSelected ? localStyles.replaySpeedButtonSelected : null,
+                            ]}
+                            onPress={() => setReplaySpeed(speed)}
+                          >
+                            <Text
+                              style={[
+                                localStyles.replaySpeedButtonText,
+                                isDarkMode ? { color: MAXIM_UI_MUTED_DARK } : null,
+                                isSelected ? localStyles.replaySpeedButtonTextSelected : null,
+                              ]}
+                            >
+                              {speed}x
+                            </Text>
+                          </Pressable>
+                        );
+                      })}
+                    </View>
+                    <View style={localStyles.replayProgressRow}>
+                      <Text style={[localStyles.replayProgressText, isDarkMode ? { color: MAXIM_UI_MUTED_DARK } : null]}>
+                        {Math.round(replayProgress * 100)}%
+                      </Text>
+                      <View
+                        ref={(ref: View | null) => {
+                          replaySliderTrackRef.current = ref;
+                        }}
+                        style={[
+                          localStyles.replaySliderTrack,
+                          isDarkMode ? { backgroundColor: MAXIM_UI_BORDER_DARK } : null,
+                        ]}
+                        onLayout={(event) => {
+                          replaySliderTrackWidthRef.current = Math.max(event.nativeEvent.layout.width, 1);
+                        }}
+                        {...replaySliderPanResponder.panHandlers}
+                      >
+                        <View
+                          style={[
+                            localStyles.replaySliderFill,
+                            { width: `${Math.max(0, Math.min(100, replayProgress * 100))}%` },
+                          ]}
+                        />
+                        <View
+                          style={[
+                            localStyles.replaySliderThumb,
+                            { left: `${Math.max(0, Math.min(100, replayProgress * 100))}%` },
+                          ]}
+                        />
+                      </View>
+                    </View>
+                  </>
+                ) : null}
+              </View>
+            ) : null}
+
             <View style={localStyles.rideMetricGrid}>
               <SummaryMetric label="Fare" value={selectedTrip.fare} isDarkMode={isDarkMode} />
-              <SummaryMetric label="Payment" value={selectedTrip.fare} isDarkMode={isDarkMode} />
               <SummaryMetric label="Duration" value={selectedTrip.duration} isDarkMode={isDarkMode} />
               <SummaryMetric label="Distance" value={selectedTrip.distance} isDarkMode={isDarkMode} />
               <SummaryMetric label="Started" value={formatTripDateTime(selectedTrip.startedAt)} isDarkMode={isDarkMode} />
@@ -526,7 +1217,36 @@ export function CompletedTripDetailScreen({
               <SummaryMetric label="Violations" value={selectedTrip.violations} isDarkMode={isDarkMode} />
               <SummaryMetric label="Compliance" value={`${selectedTrip.compliance}%`} isDarkMode={isDarkMode} />
               <SummaryMetric label="Route" value={getRouteSourceLabel(selectedTrip)} isDarkMode={isDarkMode} />
+              <SummaryMetric
+                label="GPS Points"
+                value={`${rawGpsCount}`}
+                isDarkMode={isDarkMode}
+              />
             </View>
+            {canRoadMatchOfflineTrip || canSyncOfflineTrip || isSyncingOfflineTrip || isRoadMatchingOfflineTrip ? (
+              <Pressable
+                style={[
+                  localStyles.syncFinalizeButton,
+                  isActionButtonDisabled ? localStyles.syncFinalizeButtonDisabled : null,
+                ]}
+                onPress={async () => {
+                  if (canRoadMatchOfflineTrip) {
+                    setIsRoadMatchingOfflineTrip(true);
+                    try {
+                      await onRoadMatchOfflineTrip?.(selectedTrip);
+                    } finally {
+                      setIsRoadMatchingOfflineTrip(false);
+                    }
+                    return;
+                  }
+                  await onSyncOfflineTrip?.(selectedTrip);
+                }}
+                disabled={isActionButtonDisabled}
+              >
+                <AppIcon name="refresh-cw" size={15} color="#FFFFFF" />
+                <Text style={localStyles.syncFinalizeButtonText}>{actionButtonLabel}</Text>
+              </Pressable>
+            ) : null}
           </View>
 
           <View style={localStyles.feedbackCard}>
@@ -562,6 +1282,7 @@ export function CompletedTripDetailScreen({
 
         </ScrollView>
       </Animated.View>
+      ) : null}
     </View>
   );
 }
@@ -867,6 +1588,149 @@ const localStyles = StyleSheet.create({
     color: '#047857',
     fontFamily: 'CircularStdMedium500',
   },
+  replayCard: {
+    marginBottom: 14,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    gap: 10,
+  },
+  replayFullscreenControls: {
+    position: 'absolute',
+    left: 14,
+    right: 14,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    backgroundColor: 'rgba(255,255,255,0.96)',
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    gap: 10,
+    shadowColor: '#0F172A',
+    shadowOpacity: 0.14,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 9,
+    zIndex: 20,
+  },
+  replayTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  replayMainButton: {
+    minHeight: 38,
+    borderRadius: 10,
+    backgroundColor: '#1A73E8',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 7,
+    paddingHorizontal: 13,
+    paddingVertical: 8,
+  },
+  replayMainButtonActive: {
+    backgroundColor: '#0F5EC7',
+  },
+  replayMainButtonText: {
+    fontSize: 12,
+    lineHeight: 15,
+    color: '#FFFFFF',
+    fontFamily: 'CircularStdMedium500',
+  },
+  replaySecondaryButton: {
+    minHeight: 38,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    backgroundColor: '#F8FAFC',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 7,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  replaySecondaryButtonText: {
+    fontSize: 12,
+    lineHeight: 15,
+    color: '#0F172A',
+    fontFamily: 'CircularStdMedium500',
+  },
+  replaySpeedRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+  },
+  replaySpeedButton: {
+    minWidth: 42,
+    minHeight: 30,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    backgroundColor: '#F8FAFC',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 8,
+  },
+  replaySpeedButtonSelected: {
+    borderColor: '#BAE6FD',
+    backgroundColor: '#E0F2FE',
+  },
+  replaySpeedButtonText: {
+    fontSize: 11,
+    lineHeight: 14,
+    color: '#475569',
+    fontFamily: 'CircularStdMedium500',
+  },
+  replaySpeedButtonTextSelected: {
+    color: '#0369A1',
+  },
+  replayProgressRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 9,
+  },
+  replayProgressText: {
+    width: 36,
+    fontSize: 11,
+    lineHeight: 14,
+    color: '#64748B',
+    fontFamily: 'CircularStdMedium500',
+  },
+  replaySliderTrack: {
+    flex: 1,
+    height: 26,
+    borderRadius: 999,
+    backgroundColor: '#E2E8F0',
+    justifyContent: 'center',
+    overflow: 'visible',
+  },
+  replaySliderFill: {
+    position: 'absolute',
+    left: 0,
+    height: 6,
+    borderRadius: 999,
+    backgroundColor: '#1A73E8',
+  },
+  replaySliderThumb: {
+    position: 'absolute',
+    width: 18,
+    height: 18,
+    marginLeft: -9,
+    borderRadius: 9,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 3,
+    borderColor: '#1A73E8',
+    shadowColor: '#0F172A',
+    shadowOpacity: 0.16,
+    shadowRadius: 5,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 4,
+  },
   rideStatusMeta: {
     flex: 1,
     minWidth: 0,
@@ -897,6 +1761,27 @@ const localStyles = StyleSheet.create({
     fontSize: 14,
     lineHeight: 18,
     color: '#0F172A',
+    fontFamily: 'CircularStdMedium500',
+  },
+  syncFinalizeButton: {
+    marginTop: 16,
+    minHeight: 44,
+    borderRadius: 12,
+    backgroundColor: '#147D64',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+    gap: 8,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  syncFinalizeButtonDisabled: {
+    backgroundColor: '#94A3B8',
+  },
+  syncFinalizeButtonText: {
+    fontSize: 13,
+    lineHeight: 16,
+    color: '#FFFFFF',
     fontFamily: 'CircularStdMedium500',
   },
   feedbackCard: {

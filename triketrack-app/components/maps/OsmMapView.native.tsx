@@ -15,10 +15,13 @@ import {
   useImperativeHandle,
   useMemo,
   useRef,
+  useState,
   type PropsWithChildren,
   type ReactNode,
 } from 'react';
 import {
+  Animated,
+  Easing,
   NativeModules,
   StyleSheet,
   Text,
@@ -27,6 +30,7 @@ import {
   type ViewProps,
 } from 'react-native';
 import { Avatar } from '../ui';
+import { AppleMapPinMarker } from './AppleMapPinMarker';
 import {
   OSM_LIGHT_BACKGROUND,
   OSM_VECTOR_DARK_STYLE,
@@ -61,7 +65,7 @@ export type OsmCamera = {
 export type OsmMarkerSpec = {
   id: string;
   coordinate: OsmCoordinate;
-  kind?: 'avatar' | 'navigation' | 'pin' | 'dot';
+  kind?: 'avatar' | 'navigation' | 'pin' | 'apple-pin' | 'dot' | 'location' | 'tricycle';
   color?: string;
   fillColor?: string;
   borderColor?: string;
@@ -263,7 +267,7 @@ const approximateCirclePolygon = (
 };
 
 const markerAnchorForKind = (kind?: OsmMarkerSpec['kind']) => {
-  if (kind === 'pin') {
+  if (kind === 'pin' || kind === 'apple-pin') {
     return { x: 0.5, y: 1 };
   }
 
@@ -308,6 +312,21 @@ function MarkerContent({ marker }: { marker: OsmMarkerSpec }) {
   const label = (marker.label ?? '').slice(0, 2).toUpperCase();
   const initials = (marker.initials ?? marker.label ?? 'D').slice(0, 2).toUpperCase();
 
+  if (marker.kind === 'location') {
+    return <LocationMarker size={size} color={color} />;
+  }
+
+  if (marker.kind === 'apple-pin') {
+    return (
+      <AppleMapPinMarker
+        color={color}
+        iconName="radio"
+        iconColor="#FFFFFF"
+        size={size >= 46 ? 'lg' : size <= 34 ? 'sm' : 'md'}
+      />
+    );
+  }
+
   if (marker.kind === 'navigation') {
     return (
       <MarkerShell size={size} rotationDeg={marker.rotationDeg}>
@@ -332,6 +351,81 @@ function MarkerContent({ marker }: { marker: OsmMarkerSpec }) {
               },
             ]}
           />
+        </View>
+      </MarkerShell>
+    );
+  }
+
+  if (marker.kind === 'tricycle') {
+    const wheelSize = Math.max(5, Math.round(size * 0.15));
+    const bodyWidth = Math.max(22, Math.round(size * 0.58));
+    const bodyHeight = Math.max(11, Math.round(size * 0.25));
+    return (
+      <MarkerShell size={size} rotationDeg={marker.rotationDeg}>
+        <View
+          style={[
+            styles.tricycleMarker,
+            {
+              width: size,
+              height: size,
+            },
+          ]}
+        >
+          <View
+            style={[
+              styles.tricycleCanopy,
+              {
+                width: Math.round(size * 0.34),
+                height: Math.round(size * 0.18),
+                borderRadius: Math.round(size * 0.09),
+                backgroundColor: color,
+              },
+            ]}
+          />
+          <View
+            style={[
+              styles.tricycleBody,
+              {
+                width: bodyWidth,
+                height: bodyHeight,
+                borderRadius: Math.round(bodyHeight / 2),
+                backgroundColor: color,
+              },
+            ]}
+          />
+          <View style={styles.tricycleWheelRow}>
+            <View
+              style={[
+                styles.tricycleWheel,
+                {
+                  width: wheelSize,
+                  height: wheelSize,
+                  borderRadius: wheelSize / 2,
+                },
+              ]}
+            />
+            <View
+              style={[
+                styles.tricycleWheel,
+                {
+                  width: wheelSize,
+                  height: wheelSize,
+                  borderRadius: wheelSize / 2,
+                },
+              ]}
+            />
+            <View
+              style={[
+                styles.tricycleWheel,
+                {
+                  width: wheelSize,
+                  height: wheelSize,
+                  borderRadius: wheelSize / 2,
+                },
+              ]}
+            />
+          </View>
+          <View style={styles.tricycleDirectionNose} />
         </View>
       </MarkerShell>
     );
@@ -422,6 +516,76 @@ function MarkerContent({ marker }: { marker: OsmMarkerSpec }) {
             borderRadius: size / 2,
             backgroundColor: color,
             borderColor: fillColor,
+          },
+        ]}
+      />
+    </MarkerShell>
+  );
+}
+
+function LocationMarker({
+  size,
+  color,
+}: {
+  size: number;
+  color: string;
+}) {
+  const pulse = useRef(new Animated.Value(0)).current;
+  const [animationKey, setAnimationKey] = useState(0);
+
+  useEffect(() => {
+    const animation = Animated.loop(
+      Animated.timing(pulse, {
+        toValue: 1,
+        duration: 1800,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+    );
+    animation.start();
+    return () => {
+      animation.stop();
+    };
+  }, [animationKey, pulse]);
+
+  useEffect(() => {
+    pulse.setValue(0);
+    setAnimationKey((current) => current + 1);
+  }, [color, pulse, size]);
+
+  const pulseScale = pulse.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0.72, 2.05],
+  });
+  const pulseOpacity = pulse.interpolate({
+    inputRange: [0, 0.72, 1],
+    outputRange: [0.34, 0.14, 0],
+  });
+  const dotSize = Math.max(18, Math.round(size * 0.48));
+
+  return (
+    <MarkerShell size={size}>
+      <Animated.View
+        style={[
+          styles.locationMarkerPulse,
+          {
+            width: dotSize,
+            height: dotSize,
+            borderRadius: dotSize / 2,
+            backgroundColor: color,
+            opacity: pulseOpacity,
+            transform: [{ scale: pulseScale }],
+          },
+        ]}
+      />
+      <View
+        style={[
+          styles.locationMarkerDot,
+          {
+            width: dotSize,
+            height: dotSize,
+            borderRadius: dotSize / 2,
+            backgroundColor: color,
           },
         ]}
       />
@@ -816,6 +980,61 @@ const styles = StyleSheet.create({
     borderRightColor: 'transparent',
     borderBottomColor: '#FFFFFF',
     transform: [{ translateY: -1 }],
+  },
+  tricycleMarker: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#0F172A',
+    shadowOpacity: 0.2,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 8,
+  },
+  tricycleCanopy: {
+    position: 'absolute',
+    top: '24%',
+    borderWidth: 2,
+    borderColor: '#FFFFFF',
+  },
+  tricycleBody: {
+    borderWidth: 2,
+    borderColor: '#FFFFFF',
+  },
+  tricycleWheelRow: {
+    width: '62%',
+    marginTop: 2,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  tricycleWheel: {
+    backgroundColor: '#0F172A',
+    borderWidth: 1,
+    borderColor: '#FFFFFF',
+  },
+  tricycleDirectionNose: {
+    position: 'absolute',
+    top: 3,
+    width: 0,
+    height: 0,
+    borderLeftWidth: 5,
+    borderRightWidth: 5,
+    borderBottomWidth: 8,
+    borderLeftColor: 'transparent',
+    borderRightColor: 'transparent',
+    borderBottomColor: '#FFFFFF',
+  },
+  locationMarkerPulse: {
+    position: 'absolute',
+  },
+  locationMarkerDot: {
+    borderWidth: 4,
+    borderColor: '#FFFFFF',
+    shadowColor: '#0F172A',
+    shadowOpacity: 0.24,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 8,
   },
   pinMarkerBody: {
     alignItems: 'center',

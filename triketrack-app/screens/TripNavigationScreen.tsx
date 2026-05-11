@@ -16,7 +16,6 @@ import { AppIcon } from '../components/ui';
 import { TripSummaryModal } from '../components/modals';
 import { getMotionDurationMs, shortestAngleDelta } from '../lib/mapTracking';
 import {
-  buildRoadAlignedTripPathDetailed,
   dedupeSequentialPoints,
   polylineDistanceKm,
   smoothDisplayedRoutePath,
@@ -31,7 +30,6 @@ import {
 import {
   formatTripReceiptDistance,
   formatTripReceiptFare,
-  pickPreferredRouteMatchSummary,
   type TripGpsQualitySummary,
 } from '../lib/tripTransactions';
 import { resolveTripDisplayLocationLabels } from '../lib/tripLocationLabels';
@@ -69,7 +67,10 @@ import {
   isValidCoordinate,
   getAdaptiveGpsMotionThresholdKm,
   LOW_BATTERY_MAP_ACCENT,
-  LOW_BATTERY_MAP_ACCENT_SOFT,
+  MAP_GEOFENCE_FILL_DARK,
+  MAP_GEOFENCE_FILL_LIGHT,
+  MAP_GEOFENCE_STROKE_DARK,
+  MAP_GEOFENCE_STROKE_LIGHT,
   MAXIM_ROUTE_CASING_DARK,
   MAXIM_ROUTE_CASING_LIGHT,
   MAXIM_ROUTE_CORE_DARK,
@@ -126,6 +127,7 @@ type TripNavigationScreenProps = Omit<ComponentProps<typeof HomeScreen>, 'isTrip
   restoredTripTrace?: RestoredTripTraceState | null;
   forceNewTripSession?: boolean;
   initialTripLocation?: (LatLngPoint & { timestampMs?: number | null }) | null;
+  tripFare?: number;
 };
 
 type SummaryState = {
@@ -149,10 +151,13 @@ const IDLE_CAMERA_PITCH = 0;
 const IDLE_CAMERA_HEADING = 0;
 const NAV_CAMERA_ZOOM = 18.4;
 const NAV_CAMERA_PITCH = 0;
-const NAV_CAMERA_ANIMATION_MS = 520;
-const NAV_CAMERA_TRANSITION_MS = 760;
-const GEOFENCE_STROKE = 'rgba(14, 165, 233, 0.58)';
-const GEOFENCE_FILL = 'rgba(14, 165, 233, 0.045)';
+const NAV_CAMERA_ANIMATION_MS = 1100;
+const NAV_CAMERA_TRANSITION_MS = 1400;
+const NAV_MARKER_ANIMATION_MIN_MS = 1500;
+const NAV_MARKER_ANIMATION_MAX_MS = 4600;
+const NAV_CAMERA_FOLLOW_MIN_INTERVAL_MS = 1600;
+const NAV_CAMERA_FOLLOW_MIN_DISTANCE_KM = 0.006;
+const NAV_VISIBLE_LOCATION_MAX_JUMP_KM = 0.07;
 const TRACE_START_MIN_DISPLACEMENT_KM = 0.003;
 const TRACE_START_MIN_STEP_KM = 0.0012;
 const TRACE_START_MIN_SPEED_KMH = 1.2;
@@ -165,6 +170,15 @@ const NAV_FORCE_ROUTE_REFRESH_MIN_DISTANCE_KM = 0.012;
 const NAV_ROUTE_INTERPOLATION_STEP_KM = 0.008;
 const LOCAL_CENTERLINE_PROJECTION_MAX_DISTANCE_KM = 0.03;
 const TRIP_START_LOCK_TIMEOUT_MS = 6000;
+
+const getDurationSecondsBetween = (startedAt: string | null, endedAt: string) => {
+  const startedAtMs = new Date(startedAt ?? '').getTime();
+  const endedAtMs = new Date(endedAt).getTime();
+  if (!Number.isFinite(startedAtMs) || !Number.isFinite(endedAtMs) || endedAtMs <= startedAtMs) {
+    return 0;
+  }
+  return Math.max(0, Math.round((endedAtMs - startedAtMs) / 1000));
+};
 
 export function TripNavigationScreen({
   onBackToHome,
@@ -182,6 +196,7 @@ export function TripNavigationScreen({
   restoredTripTrace,
   forceNewTripSession = false,
   initialTripLocation = null,
+  tripFare = 10,
   activeTripNumber = null,
 }: TripNavigationScreenProps) {
   const insets = useSafeAreaInsets();
@@ -227,6 +242,7 @@ export function TripNavigationScreen({
 
   const markerInitializedRef = useRef(false);
   const lastAnimatedMarkerPointRef = useRef<LatLngPoint | null>(null);
+  const markerAnimationFrameRef = useRef<number | null>(null);
   const hasCenteredRef = useRef(false);
   const hasStartedSessionRef = useRef(false);
   const hasFocusedTripStartCameraRef = useRef(false);
@@ -252,6 +268,8 @@ export function TripNavigationScreen({
   const latestActualCoordsRef = useRef<LatLngPoint | null>(initialTripPoint);
   const lastGeocodeAtRef = useRef(0);
   const lastGeocodedPointRef = useRef<LatLngPoint | null>(null);
+  const lastCameraFollowPointRef = useRef<LatLngPoint | null>(initialTripPoint);
+  const lastCameraFollowAtRef = useRef(0);
   const hasShownExitAlertRef = useRef(false);
   const tripStartAnchorRef = useRef<LatLngPoint | null>(null);
   const tripStartLockOpenedAtRef = useRef<number | null>(null);
@@ -332,8 +350,8 @@ export function TripNavigationScreen({
   const liveDisplayPath = interpolateNavigationPath(renderedTrace.solidOnRoadPath);
   const shouldShowStartConnector = !isTripStarted && renderedTrace.dashedConnector.length === 2;
   const visibleTraceHasRoute = liveDisplayPath.length > 1;
-  const geofenceStrokeColor = isDarkMap ? LOW_BATTERY_MAP_ACCENT : GEOFENCE_STROKE;
-  const geofenceFillColor = isDarkMap ? LOW_BATTERY_MAP_ACCENT_SOFT : GEOFENCE_FILL;
+  const geofenceStrokeColor = isDarkMap ? MAP_GEOFENCE_STROKE_DARK : MAP_GEOFENCE_STROKE_LIGHT;
+  const geofenceFillColor = isDarkMap ? MAP_GEOFENCE_FILL_DARK : MAP_GEOFENCE_FILL_LIGHT;
   const routeCoreColor = isDarkMap ? MAXIM_ROUTE_CORE_DARK : MAXIM_ROUTE_CORE_LIGHT;
   const routeCasingColor = isDarkMap ? MAXIM_ROUTE_CASING_DARK : MAXIM_ROUTE_CASING_LIGHT;
   const startConnectorColor = isDarkMap ? LOW_BATTERY_MAP_ACCENT : 'rgba(107, 114, 128, 0.78)';
@@ -415,7 +433,7 @@ export function TripNavigationScreen({
     const resumePoint =
       restoredMatchedPath[restoredMatchedPath.length - 1] ?? restoredTripTrace.rawStartPoint ?? null;
     if (resumePoint) {
-      updateMarkerPosition(resumePoint);
+      updateMarkerPosition(resumePoint, true);
       followCamera(resumePoint, true);
       lastRawTrackPointRef.current = resumePoint;
     }
@@ -458,18 +476,7 @@ export function TripNavigationScreen({
 
     if (!hasFocusedTripStartCameraRef.current) {
       transitionCameraToNavigationMode(coords);
-      return;
     }
-
-    mapRef.current.animateCamera(
-      {
-        center: coords,
-        zoom: NAV_CAMERA_ZOOM,
-        heading: IDLE_CAMERA_HEADING,
-        pitch: NAV_CAMERA_PITCH,
-      },
-      { duration: NAV_CAMERA_ANIMATION_MS },
-    );
   }, [headingDeg, isTripStarted]);
 
   useEffect(() => {
@@ -497,12 +504,6 @@ export function TripNavigationScreen({
       lastAnimatedMarkerPointRef.current = null;
       return;
     }
-
-    const animationDuration = getMotionDurationMs({
-      from: lastAnimatedMarkerPointRef.current,
-      to: coords,
-      speedMetersPerSecond: speedKmh > 0 ? speedKmh / 3.6 : null,
-    });
 
     if (!markerInitializedRef.current) {
       markerInitializedRef.current = true;
@@ -669,6 +670,10 @@ export function TripNavigationScreen({
     return () => {
       locationWatchRef.current?.stop();
       locationWatchRef.current = null;
+      if (markerAnimationFrameRef.current !== null) {
+        cancelAnimationFrame(markerAnimationFrameRef.current);
+        markerAnimationFrameRef.current = null;
+      }
     };
   }, []);
 
@@ -755,10 +760,64 @@ export function TripNavigationScreen({
     return displayPath;
   };
 
-  const updateMarkerPosition = (point: LatLngPoint) => {
+  const updateMarkerPosition = (point: LatLngPoint, immediate = false) => {
     latestActualCoordsRef.current = point;
-    lastDisplayPointRef.current = point;
-    setCoords(point);
+    const fromPoint = lastAnimatedMarkerPointRef.current ?? lastDisplayPointRef.current ?? coords;
+
+    if (markerAnimationFrameRef.current !== null) {
+      cancelAnimationFrame(markerAnimationFrameRef.current);
+      markerAnimationFrameRef.current = null;
+    }
+
+    if (!fromPoint || immediate) {
+      lastDisplayPointRef.current = point;
+      lastAnimatedMarkerPointRef.current = point;
+      setCoords(point);
+      return;
+    }
+
+    const movementKm = distanceBetweenKm(fromPoint, point);
+    if (movementKm > NAV_VISIBLE_LOCATION_MAX_JUMP_KM) {
+      return;
+    }
+
+    const motionDuration = getMotionDurationMs({
+      from: fromPoint,
+      to: point,
+      speedMetersPerSecond: speedKmh > 0 ? Math.max((speedKmh / 3.6) * 0.55, 1.7) : 1.7,
+      minDurationMs: NAV_MARKER_ANIMATION_MIN_MS,
+      maxDurationMs: NAV_MARKER_ANIMATION_MAX_MS,
+    });
+    const duration = Math.max(
+      NAV_MARKER_ANIMATION_MIN_MS,
+      Math.min(NAV_MARKER_ANIMATION_MAX_MS, motionDuration),
+    );
+    const startedAt = Date.now();
+    const ease = Easing.out(Easing.cubic);
+
+    const step = () => {
+      const progress = Math.min(1, (Date.now() - startedAt) / duration);
+      const easedProgress = ease(progress);
+      const nextPoint = {
+        latitude: fromPoint.latitude + (point.latitude - fromPoint.latitude) * easedProgress,
+        longitude: fromPoint.longitude + (point.longitude - fromPoint.longitude) * easedProgress,
+      };
+      lastDisplayPointRef.current = nextPoint;
+      lastAnimatedMarkerPointRef.current = nextPoint;
+      setCoords(nextPoint);
+
+      if (progress < 1) {
+        markerAnimationFrameRef.current = requestAnimationFrame(step);
+        return;
+      }
+
+      markerAnimationFrameRef.current = null;
+      lastDisplayPointRef.current = point;
+      lastAnimatedMarkerPointRef.current = point;
+      setCoords(point);
+    };
+
+    markerAnimationFrameRef.current = requestAnimationFrame(step);
   };
 
   const getStabilizedPoint = ({
@@ -864,7 +923,7 @@ export function TripNavigationScreen({
   };
 
   const seedVisibleLocation = (point: LatLngPoint, accuracy?: number | null) => {
-    updateMarkerPosition(point);
+    updateMarkerPosition(point, true);
     setDisplayAccuracyMeters(typeof accuracy === 'number' ? accuracy : null);
 
     if (mapRef.current && !hasCenteredRef.current) {
@@ -886,6 +945,21 @@ export function TripNavigationScreen({
       return;
     }
 
+    const now = Date.now();
+    const previousCameraPoint = lastCameraFollowPointRef.current;
+    const movedKm = previousCameraPoint ? distanceBetweenKm(previousCameraPoint, point) : Infinity;
+    if (
+      !immediate &&
+      previousCameraPoint &&
+      now - lastCameraFollowAtRef.current < NAV_CAMERA_FOLLOW_MIN_INTERVAL_MS &&
+      movedKm < NAV_CAMERA_FOLLOW_MIN_DISTANCE_KM
+    ) {
+      return;
+    }
+
+    lastCameraFollowPointRef.current = point;
+    lastCameraFollowAtRef.current = now;
+
     mapRef.current.animateCamera(
       {
         center: point,
@@ -893,7 +967,7 @@ export function TripNavigationScreen({
         heading: IDLE_CAMERA_HEADING,
         pitch: isTripStartedRef.current ? NAV_CAMERA_PITCH : IDLE_CAMERA_PITCH,
       },
-      { duration: immediate ? 0 : NAV_CAMERA_ANIMATION_MS },
+      { duration: immediate ? 0 : Math.max(NAV_CAMERA_ANIMATION_MS, 1800) },
     );
     hasCenteredRef.current = true;
   };
@@ -976,7 +1050,15 @@ export function TripNavigationScreen({
     if (previousAccepted) {
       const gapKm = distanceBetweenKm(previousAccepted.point, samplePoint);
       const elapsedSec = Math.max((timestampMs - previousAccepted.timestampMs) / 1000, 0);
+      const impliedSpeedKmh = elapsedSec > 0 ? gapKm / (elapsedSec / 3600) : Infinity;
       if (gapKm > MAX_LOCATION_JUMP_KM && elapsedSec <= 3) {
+        setDisplayAccuracyMeters(typeof accuracy === 'number' ? accuracy : null);
+        return;
+      }
+      if (
+        gapKm > MAX_POINT_GAP_KM ||
+        (gapKm > MAX_LOCATION_JUMP_KM * 0.8 && impliedSpeedKmh > MAX_ACCEPTED_SPEED_KMH)
+      ) {
         setDisplayAccuracyMeters(typeof accuracy === 'number' ? accuracy : null);
         return;
       }
@@ -1491,7 +1573,7 @@ export function TripNavigationScreen({
 
   const beginTripSession = async (startLocation: LatLngPoint | null) => {
     const startedAt = new Date().toISOString();
-    const canStartTrip = (await onTripStart?.({ startLocation })) ?? true;
+    const canStartTrip = (await onTripStart?.({ startLocation, fare: tripFare })) ?? true;
     if (!canStartTrip) {
       return false;
     }
@@ -1556,7 +1638,7 @@ export function TripNavigationScreen({
     }
 
     if (startLocation) {
-      updateMarkerPosition(startLocation);
+      updateMarkerPosition(startLocation, true);
       transitionCameraToNavigationMode(startLocation);
     }
 
@@ -1578,7 +1660,7 @@ export function TripNavigationScreen({
         : 'Saving the trip locally and waiting to sync the route...',
       pickupText: null,
       destinationText: null,
-      fareText: formatTripReceiptFare(10),
+      fareText: formatTripReceiptFare(tripFare),
       isBusy: true,
     });
 
@@ -1594,26 +1676,82 @@ export function TripNavigationScreen({
 
     await drainBufferedRoadPoints();
 
-    const finalPath =
-      travelPathRef.current.length > 0
-        ? travelPathRef.current
-        : smoothDisplayedRoutePath(
-            dedupeSequentialPoints([
-              ...routePointsRef.current,
-              ...pendingRawPointsRef.current.map((point) => ({
-                latitude: point.latitude,
-                longitude: point.longitude,
-              })),
-            ]),
-          );
     const finalTelemetry = acceptedTelemetryRef.current;
-    const finalTelemetryPath = dedupeSequentialPoints(
-      finalTelemetry.map((point) => ({
-        latitude: point.latitude,
-        longitude: point.longitude,
-      })),
-    );
-    const reconstruction = await reconstructCompletedTripPath(finalTelemetry);
+    const completedStartedAt = tripStartedAtRef.current;
+    const completedEndedAt = new Date().toISOString();
+
+    if (!isNetworkAvailable) {
+      const timestampDurationSeconds = getDurationSecondsBetween(
+        completedStartedAt,
+        completedEndedAt,
+      );
+      const durationSeconds = Math.max(elapsedSeconds, timestampDurationSeconds);
+      const completedRawStartPoint =
+        rawStartPointRef.current ??
+        (finalTelemetry[0]
+          ? {
+              latitude: finalTelemetry[0].latitude,
+              longitude: finalTelemetry[0].longitude,
+            }
+          : null);
+      const completedRawEndPoint =
+        finalTelemetry.at(-1)
+          ? {
+              latitude: finalTelemetry.at(-1)!.latitude,
+              longitude: finalTelemetry.at(-1)!.longitude,
+            }
+          : latestActualCoordsRef.current;
+      const averageSpeed =
+        durationSeconds > 0 ? Math.max(0, distanceKm) / (durationSeconds / 3600) : speedKmh;
+
+      setIsTripStarted(false);
+      transitionCameraToIdleMode(completedRawEndPoint ?? latestActualCoordsRef.current);
+      setCompletedTripPreviewPath([]);
+      setTripSummary({
+        tripNumberText: activeTripNumber,
+        durationText: `${Math.floor(durationSeconds / 60)}:${String(durationSeconds % 60).padStart(2, '0')}`,
+        distanceText: formatTripReceiptDistance(Math.max(0, distanceKm) * 1000),
+        speedText: `${Math.max(0, averageSpeed).toFixed(1)} km/h`,
+        statusText: 'Trip saved offline. Sync it from Unsynced Trips when you are online.',
+        pickupText: null,
+        destinationText: null,
+        fareText: formatTripReceiptFare(tripFare),
+        isBusy: false,
+      });
+
+      onTripComplete({
+        fare: tripFare,
+        distanceKm: Math.max(0, distanceKm),
+        durationSeconds,
+        routePath: [],
+        endLocation: completedRawEndPoint,
+        rawTelemetry: finalTelemetry,
+        startedAt: completedStartedAt,
+        endedAt: completedEndedAt,
+        rawStartPoint: completedRawStartPoint,
+        rawEndPoint: completedRawEndPoint,
+        matchedStartPoint: null,
+        matchedEndPoint: null,
+        dashedStartConnector: [],
+        dashedEndConnector: [],
+        tripState: 'SYNC_PENDING',
+        matchedPointCount: 0,
+        offlineSegmentsCount: 1,
+        averageSpeedKph: Math.max(0, averageSpeed),
+        routeMatchSummary: null,
+      });
+      lastMatchedRoadProjectionRef.current = null;
+      lastForcedRouteRefreshAtRef.current = 0;
+      liveRouteMatchGenerationRef.current += 1;
+      roadMatchInFlightRef.current = false;
+      tripStartedAtRef.current = null;
+      return;
+    }
+
+    const reconstruction = await reconstructCompletedTripPath(finalTelemetry, {
+      forceOsrmMatch: true,
+      useFullRawTrajectory: true,
+    });
     console.info('[TripReconstruction] Navigation completed trip reconstruction.', {
       status: reconstruction.status,
       provider: reconstruction.matchedProvider,
@@ -1623,41 +1761,25 @@ export function TripNavigationScreen({
       reconstructedPoints: reconstruction.reconstructedPath.length,
       rejectedOutliers: reconstruction.rejectedOutlierCount,
     });
-    const reconstructionCandidatePath =
-      reconstruction.reconstructedPath.length > 1
-        ? reconstruction.reconstructedPath
-        : reconstruction.preprocessedPath.length > 1
-          ? reconstruction.preprocessedPath
-          : finalPath.length > 1
-            ? finalPath
-            : finalTelemetryPath;
-    const reconstructionFallbackPath =
-      reconstruction.preprocessedPath.length > 1
-        ? reconstruction.preprocessedPath
-        : finalPath.length > 1
-          ? finalPath
-          : finalTelemetryPath;
-    const roadAlignmentResult = await buildRoadAlignedTripPathDetailed({
-      candidatePath: reconstructionCandidatePath,
-      fallbackPath: reconstructionFallbackPath,
-      preserveDetailedGeometry:
-        typeof reconstruction.routeMatchMetadata?.provider === 'string' &&
-        reconstruction.routeMatchMetadata.provider !== 'local-directional',
-      trustCandidateGeometry:
-        reconstructionCandidatePath.length > 1 &&
-        ((typeof reconstruction.routeMatchMetadata?.provider === 'string' &&
-          reconstruction.routeMatchMetadata.provider !== 'local-directional') ||
-          reconstruction.preprocessedPath.length > 1 ||
-          reconstruction.rawAcceptedPath.length > 1),
-    });
-    const roadAlignedFinalPath = roadAlignmentResult.path ?? reconstructionFallbackPath;
+    const roadAlignedFinalPath = reconstruction.reconstructedPath;
+    const osrmMatchedDistanceKm =
+      reconstruction.routeMatchMetadata?.provider === 'osrm-match' &&
+      typeof reconstruction.routeMatchMetadata.distanceMeters === 'number' &&
+      Number.isFinite(reconstruction.routeMatchMetadata.distanceMeters) &&
+      reconstruction.routeMatchMetadata.distanceMeters > 0
+        ? reconstruction.routeMatchMetadata.distanceMeters / 1000
+        : 0;
     const completedDistanceKm =
-      distanceKm > 0 ? distanceKm : polylineDistanceKm(roadAlignedFinalPath);
-    const durationSeconds = elapsedSeconds;
+      osrmMatchedDistanceKm > 0
+        ? osrmMatchedDistanceKm
+        : Math.max(distanceKm, polylineDistanceKm(roadAlignedFinalPath));
+    const timestampDurationSeconds = getDurationSecondsBetween(
+      completedStartedAt,
+      completedEndedAt,
+    );
+    const durationSeconds = Math.max(elapsedSeconds, timestampDurationSeconds);
     const averageSpeed =
       durationSeconds > 0 ? completedDistanceKm / (durationSeconds / 3600) : speedKmh;
-    const completedStartedAt = tripStartedAtRef.current;
-    const completedEndedAt = new Date().toISOString();
     const completedRawStartPoint = rawStartPointRef.current;
     const completedStartEndpointSelection = await selectTripStartEndpointFromBuildings({
       roadPath: roadAlignedFinalPath,
@@ -1709,7 +1831,7 @@ export function TripNavigationScreen({
           : 'Trip saved and waiting for route points',
       pickupText: completedLocationLabels.startDisplayName,
       destinationText: completedLocationLabels.endDisplayName,
-      fareText: formatTripReceiptFare(10),
+      fareText: formatTripReceiptFare(tripFare),
       isBusy: false,
     });
     const maxSpeedKph = finalTelemetry.reduce((maxSpeed, point) => {
@@ -1758,7 +1880,7 @@ export function TripNavigationScreen({
         : null;
 
     onTripComplete({
-      fare: 10,
+      fare: tripFare,
       distanceKm: completedDistanceKm,
       durationSeconds,
       routePath: roadAlignedFinalPath,
@@ -1785,10 +1907,8 @@ export function TripNavigationScreen({
       maxSpeedKph,
       idleDurationSeconds: Math.round(idleDurationSeconds),
       gpsQualitySummary,
-      routeMatchSummary: pickPreferredRouteMatchSummary(
-        roadAlignmentResult.metadata ?? null,
-        reconstruction.routeMatchMetadata ?? null,
-      ),
+      routeMatchSummary:
+        roadAlignedFinalPath.length > 2 ? reconstruction.routeMatchMetadata ?? null : null,
     });
     lastMatchedRoadProjectionRef.current = null;
     lastForcedRouteRefreshAtRef.current = 0;
@@ -1799,23 +1919,19 @@ export function TripNavigationScreen({
 
   const guidanceTitle = roadLabel || 'Trip started';
   const guidanceMessage = !hasConfirmedMovement
-    ? 'Waiting for confirmed movement'
+    ? 'Getting ready'
     : routeRenderState === 'PRE_ROAD'
-      ? 'Finding the first road match'
+      ? 'Finding your location'
     : isLowGpsAccuracy
-      ? 'GPS signal weak'
-      : visibleTraceHasRoute
-        ? 'Live route updating'
-        : 'Tracking live route';
+      ? 'Improving location'
+      : 'Trip in progress';
   const movementState = !hasConfirmedMovement
     ? 'Waiting'
-    : routeRenderState === 'PRE_ROAD'
-      ? 'Matching road'
-      : speedKmh >= 4
+    : speedKmh >= 4
       ? 'Moving'
       : 'Tracking';
-  const nextInstructionDistance = routeRenderState === 'ON_ROAD' && visibleTraceHasRoute ? '40 m' : '20 m';
-  const laneHint = routeRenderState === 'ON_ROAD' && visibleTraceHasRoute ? '↑' : '←  ↑  ↑  ↑';
+  const nextInstructionDistance = speedKmh >= 4 ? '40 m' : '20 m';
+  const laneHint = '↑';
   const tripNavigationPolygons = [
     {
       id: 'trip-nav-geofence-fill',
@@ -1843,22 +1959,6 @@ export function TripNavigationScreen({
           },
         ]
       : []),
-    ...(liveDisplayPath.length > 1
-      ? [
-          {
-            id: 'trip-nav-route-casing',
-            coordinates: liveDisplayPath,
-            strokeColor: routeCasingColor,
-            strokeWidth: MAXIM_ROUTE_WIDTH_CASING_NAV,
-          },
-          {
-            id: 'trip-nav-route-core',
-            coordinates: liveDisplayPath,
-            strokeColor: routeCoreColor,
-            strokeWidth: MAXIM_ROUTE_WIDTH_CORE_NAV,
-          },
-        ]
-      : []),
   ];
   const tripNavigationMarkers =
     coords
@@ -1866,10 +1966,9 @@ export function TripNavigationScreen({
           {
             id: 'trip-nav-driver',
             coordinate: coords,
-            kind: 'navigation' as const,
-            color: '#0F172A',
-            rotationDeg: headingDeg,
-            size: 38,
+            kind: 'location' as const,
+            color: '#1A73E8',
+            size: 54,
           },
         ]
       : [];
@@ -1890,8 +1989,8 @@ export function TripNavigationScreen({
         backgroundColor={osmBackgroundColor}
         pitchEnabled={false}
         rotateEnabled={false}
-        polygons={tripNavigationPolygons}
-        polylines={tripNavigationPolylines}
+        polygons={isTripStarted ? [] : tripNavigationPolygons}
+        polylines={isTripStarted ? [] : tripNavigationPolylines}
         markers={tripNavigationMarkers}
       />
 
@@ -1970,7 +2069,6 @@ export function TripNavigationScreen({
         fareText={tripSummary?.fareText}
         busy={tripSummary?.isBusy ?? false}
         onClose={() => {
-          hasStartedSessionRef.current = false;
           tripStartLockOpenedAtRef.current = null;
           setIsInitializingTripStart(false);
           setTripSummary(null);

@@ -8,7 +8,6 @@ import {
   smoothDisplayedRoutePath,
   type LatLngPoint,
 } from './roadPath';
-import { buildRoadCenterlinePath, projectPointToRoadPath } from './tripTrace';
 
 export type RawTripTelemetryPoint = {
   latitude: number;
@@ -57,6 +56,8 @@ type ReconstructionConfig = {
   maxSpikeTurnAngleDeg: number;
   maxSpikeOffsetKm: number;
   maxSpikeSegmentKm: number;
+  forceOsrmMatch: boolean;
+  useFullRawTrajectory: boolean;
 };
 
 const DEFAULT_CONFIG: ReconstructionConfig = {
@@ -73,6 +74,8 @@ const DEFAULT_CONFIG: ReconstructionConfig = {
   maxSpikeTurnAngleDeg: 145,
   maxSpikeOffsetKm: 0.008,
   maxSpikeSegmentKm: 0.08,
+  forceOsrmMatch: false,
+  useFullRawTrajectory: false,
 };
 
 // Providers are intentionally abstracted so we can swap or reorder road-matching
@@ -112,6 +115,35 @@ const MATCHING_SERVICES: RouteMatchingService[] = [
     ...LOCAL_DIRECTIONAL_MATCHING_SERVICE,
   },
 ];
+
+const getMatchingServices = (forceOsrmMatch: boolean): RouteMatchingService[] => {
+  if (!forceOsrmMatch) {
+    return MATCHING_SERVICES;
+  }
+
+  return [
+    {
+      name: 'osrm-match',
+      matchPath: (points) => fetchOsrmMatchedRoadPathDetailed(points, { forceRemote: true }),
+    },
+    {
+      ...LOCAL_DIRECTIONAL_MATCHING_SERVICE,
+    },
+  ];
+};
+
+const getRemoteMatchingServices = (forceOsrmMatch: boolean): RouteMatchingService[] => {
+  if (!forceOsrmMatch) {
+    return REMOTE_MATCHING_SERVICES;
+  }
+
+  return [
+    {
+      name: 'osrm-match',
+      matchPath: (points) => fetchOsrmMatchedRoadPathDetailed(points, { forceRemote: true }),
+    },
+  ];
+};
 
 const toRad = (value: number) => (value * Math.PI) / 180;
 
@@ -425,8 +457,89 @@ const buildChunks = (points: LatLngPoint[], chunkSize: number, overlap: number) 
   return chunks;
 };
 
-const mergeMatchedChunks = (chunks: LatLngPoint[][]) =>
-  dedupeSequentialPoints(chunks.flatMap((chunk) => chunk));
+const mergeMatchedChunks = (chunks: LatLngPoint[][]) => {
+  const merged: LatLngPoint[] = [];
+
+  for (const chunk of chunks) {
+    const cleanChunk = dedupeSequentialPoints(chunk);
+    if (cleanChunk.length === 0) {
+      continue;
+    }
+
+    if (merged.length === 0) {
+      merged.push(...cleanChunk);
+      continue;
+    }
+
+    const previousEnd = merged[merged.length - 1];
+    let bestIndex = 0;
+    let bestDistanceKm = Number.POSITIVE_INFINITY;
+    for (let index = 0; index < cleanChunk.length; index += 1) {
+      const distanceKm = distanceBetweenKm(previousEnd, cleanChunk[index]);
+      if (distanceKm < bestDistanceKm) {
+        bestDistanceKm = distanceKm;
+        bestIndex = index;
+      }
+    }
+
+    merged.push(...cleanChunk.slice(bestDistanceKm <= 0.04 ? bestIndex + 1 : 0));
+  }
+
+  return dedupeSequentialPoints(merged);
+};
+
+const matchTelemetryChunkWithRetries = async (
+  chunk: RawTripTelemetryPoint[],
+  config: ReconstructionConfig,
+): Promise<{
+  path: LatLngPoint[] | null;
+  metadata: RoadPathMatchMetadata | null;
+}> => {
+  if (chunk.length < 2) {
+    return { path: null, metadata: null };
+  }
+
+  const matched = await fetchOsrmMatchedRoadPathDetailed(
+    chunk.map((point) => ({
+      latitude: point.latitude,
+      longitude: point.longitude,
+      accuracy: point.accuracy ?? null,
+      heading: point.heading ?? null,
+      speed: point.speed ?? null,
+      recordedAt: point.recordedAt,
+    })),
+    { forceRemote: config.forceOsrmMatch },
+  );
+  if (matched.path && matched.path.length >= 2) {
+    return matched;
+  }
+
+  if (chunk.length <= 8) {
+    return { path: null, metadata: null };
+  }
+
+  const overlap = Math.min(3, Math.max(1, Math.floor(chunk.length / 8)));
+  const middle = Math.floor(chunk.length / 2);
+  const left = chunk.slice(0, Math.min(chunk.length, middle + overlap));
+  const right = chunk.slice(Math.max(0, middle - overlap));
+  const [leftMatch, rightMatch] = await Promise.all([
+    matchTelemetryChunkWithRetries(left, config),
+    matchTelemetryChunkWithRetries(right, config),
+  ]);
+
+  if (!leftMatch.path || leftMatch.path.length < 2 || !rightMatch.path || rightMatch.path.length < 2) {
+    return { path: null, metadata: null };
+  }
+
+  const path = mergeMatchedChunks([leftMatch.path, rightMatch.path]);
+  return {
+    path: path.length >= 2 ? path : null,
+    metadata:
+      path.length >= 2
+        ? mergeRoadPathMatchMetadata([leftMatch.metadata, rightMatch.metadata], path, chunk.length)
+        : null,
+  };
+};
 
 const matchChunkedTelemetryPath = async (
   telemetry: RawTripTelemetryPoint[],
@@ -460,16 +573,7 @@ const matchChunkedTelemetryPath = async (
       return { path: null, provider: null, metadata: null };
     }
 
-    const matched = await fetchOsrmMatchedRoadPathDetailed(
-      chunk.map((point) => ({
-        latitude: point.latitude,
-        longitude: point.longitude,
-        accuracy: point.accuracy ?? null,
-        heading: point.heading ?? null,
-        speed: point.speed ?? null,
-        recordedAt: point.recordedAt,
-      })),
-    );
+    const matched = await matchTelemetryChunkWithRetries(chunk, config);
     if (!matched.path || matched.path.length < 2) {
       return { path: null, provider: null, metadata: null };
     }
@@ -488,93 +592,6 @@ const matchChunkedTelemetryPath = async (
     provider: 'osrm-match',
     metadata: mergeRoadPathMatchMetadata(matchedChunkMetadata, merged, telemetry.length),
   };
-};
-
-const selectEndpointTelemetryPoint = (
-  telemetry: RawTripTelemetryPoint[],
-  {
-    fromStart,
-    maxAccuracyMeters,
-  }: {
-    fromStart: boolean;
-    maxAccuracyMeters: number;
-  },
-) => {
-  const ordered = fromStart ? telemetry : [...telemetry].reverse();
-  return (
-    ordered.find((point) => {
-      const accuracyMeters =
-        typeof point.accuracy === 'number' && Number.isFinite(point.accuracy)
-          ? point.accuracy
-          : null;
-      return accuracyMeters === null || accuracyMeters <= maxAccuracyMeters;
-    }) ?? null
-  );
-};
-
-const trimMatchedPathToTelemetryEndpoints = (
-  matchedPath: LatLngPoint[],
-  telemetry: RawTripTelemetryPoint[],
-  acceptedTelemetry: RawTripTelemetryPoint[],
-) => {
-  const cleanMatchedPath = dedupeSequentialPoints(matchedPath);
-  if (cleanMatchedPath.length < 2 || telemetry.length < 2) {
-    return cleanMatchedPath;
-  }
-
-  const startTelemetryPoint =
-    selectEndpointTelemetryPoint(telemetry, {
-      fromStart: true,
-      maxAccuracyMeters: 45,
-    }) ?? acceptedTelemetry[0] ?? telemetry[0];
-  const endTelemetryPoint =
-    selectEndpointTelemetryPoint(telemetry, {
-      fromStart: false,
-      maxAccuracyMeters: 45,
-    }) ??
-    acceptedTelemetry[acceptedTelemetry.length - 1] ??
-    telemetry[telemetry.length - 1];
-
-  if (!startTelemetryPoint || !endTelemetryPoint) {
-    return cleanMatchedPath;
-  }
-
-  const acceptedStartPoint = {
-    latitude: startTelemetryPoint.latitude,
-    longitude: startTelemetryPoint.longitude,
-  };
-  const acceptedEndPoint = {
-    latitude: endTelemetryPoint.latitude,
-    longitude: endTelemetryPoint.longitude,
-  };
-  const defaultStartProjection = projectPointToRoadPath(cleanMatchedPath[0], cleanMatchedPath);
-  const defaultEndProjection = projectPointToRoadPath(
-    cleanMatchedPath[cleanMatchedPath.length - 1],
-    cleanMatchedPath,
-  );
-  const candidateStartProjection = projectPointToRoadPath(acceptedStartPoint, cleanMatchedPath);
-  const candidateEndProjection = projectPointToRoadPath(acceptedEndPoint, cleanMatchedPath);
-  const startProjection =
-    candidateStartProjection && candidateStartProjection.distanceKm <= 0.03
-      ? candidateStartProjection
-      : defaultStartProjection;
-  const endProjection =
-    candidateEndProjection && candidateEndProjection.distanceKm <= 0.03
-      ? candidateEndProjection
-      : defaultEndProjection;
-
-  if (!startProjection || !endProjection) {
-    return cleanMatchedPath;
-  }
-
-  const trimmedPath = buildRoadCenterlinePath({
-    roadPath: cleanMatchedPath,
-    startProjection,
-    endProjection,
-    maxBacktrackKm: 1,
-  });
-
-  return trimmedPath.length > 1 ? dedupeSequentialPoints(trimmedPath) : cleanMatchedPath;
 };
 
 const mergeRoadPathMatchMetadata = (
@@ -602,7 +619,7 @@ const mergeRoadPathMatchMetadata = (
     roadNames: available
       .flatMap((metadata) => metadata.roadNames)
       .filter((name, index, source) => source.indexOf(name) === index),
-    distanceMeters: available.reduce((sum, metadata) => sum + (metadata.distanceMeters ?? 0), 0) || null,
+    distanceMeters: polylineDistanceKm(mergedPath) * 1000 || null,
     durationSeconds:
       available.reduce((sum, metadata) => sum + (metadata.durationSeconds ?? 0), 0) || null,
     inputPointCount,
@@ -785,7 +802,9 @@ export async function reconstructCompletedTripPath(
   config: Partial<ReconstructionConfig> = {},
 ): Promise<TripPathReconstructionResult> {
   const resolvedConfig = { ...DEFAULT_CONFIG, ...config };
-  const acceptedTelemetry = filterAcceptedTripTelemetry(telemetry, resolvedConfig);
+  const acceptedTelemetry = resolvedConfig.useFullRawTrajectory
+    ? sortTelemetry(telemetry).filter(isFinitePoint)
+    : filterAcceptedTripTelemetry(telemetry, resolvedConfig);
   const rawAcceptedPath = dedupeSequentialPoints(
     acceptedTelemetry.map((point) => ({
       latitude: point.latitude,
@@ -807,24 +826,30 @@ export async function reconstructCompletedTripPath(
     };
   }
 
-  const kalmanSmoothedTelemetry = applyKalmanSmoothingToTelemetry(
-    acceptedTelemetry,
-    resolvedConfig,
-  );
-  const { telemetry: deSpikedTelemetry, rejectedCount } = pruneDirectionalOutliers(
-    kalmanSmoothedTelemetry,
-    resolvedConfig,
-  );
+  const kalmanSmoothedTelemetry = resolvedConfig.useFullRawTrajectory
+    ? acceptedTelemetry
+    : applyKalmanSmoothingToTelemetry(
+        acceptedTelemetry,
+        resolvedConfig,
+      );
+  const { telemetry: deSpikedTelemetry, rejectedCount } = resolvedConfig.useFullRawTrajectory
+    ? { telemetry: kalmanSmoothedTelemetry, rejectedCount: 0 }
+    : pruneDirectionalOutliers(
+        kalmanSmoothedTelemetry,
+        resolvedConfig,
+      );
   const smoothedAcceptedPath = dedupeSequentialPoints(
     deSpikedTelemetry.map((point) => ({
       latitude: point.latitude,
       longitude: point.longitude,
     })),
   );
-  const simplifiedPath = simplifyDouglasPeuckerPath(
-    smoothedAcceptedPath,
-    resolveSimplificationToleranceKm(smoothedAcceptedPath, resolvedConfig),
-  );
+  const simplifiedPath = resolvedConfig.useFullRawTrajectory
+    ? smoothedAcceptedPath
+    : simplifyDouglasPeuckerPath(
+        smoothedAcceptedPath,
+        resolveSimplificationToleranceKm(smoothedAcceptedPath, resolvedConfig),
+      );
   const preprocessedPath = dedupeSequentialPoints(
     simplifiedPath.length > 1
       ? simplifiedPath
@@ -839,13 +864,18 @@ export async function reconstructCompletedTripPath(
   let metadata: RoadPathMatchMetadata | null = null;
 
   const telemetryMatchedResult = await matchChunkedTelemetryPath(
-    deSpikedTelemetry.length >= 2 ? deSpikedTelemetry : acceptedTelemetry,
+    resolvedConfig.useFullRawTrajectory
+      ? acceptedTelemetry
+      : deSpikedTelemetry.length >= 2
+        ? deSpikedTelemetry
+        : acceptedTelemetry,
     resolvedConfig,
   );
   if (telemetryMatchedResult.path && telemetryMatchedResult.provider) {
     matchedPath = telemetryMatchedResult.path;
     provider = telemetryMatchedResult.provider;
     metadata = telemetryMatchedResult.metadata;
+
     matchedInputPath = dedupeSequentialPoints(
       (deSpikedTelemetry.length >= 2 ? deSpikedTelemetry : acceptedTelemetry).map((point) => ({
         latitude: point.latitude,
@@ -853,7 +883,11 @@ export async function reconstructCompletedTripPath(
       })),
     );
   } else {
-    const chunkMatchedResult = await matchChunkedPath(preprocessedPath, resolvedConfig);
+    const chunkMatchedResult = await matchChunkedPath(
+      preprocessedPath,
+      resolvedConfig,
+      getMatchingServices(resolvedConfig.forceOsrmMatch),
+    );
     matchedPath = chunkMatchedResult.path;
     provider = chunkMatchedResult.provider;
     metadata = chunkMatchedResult.metadata;
@@ -871,7 +905,7 @@ export async function reconstructCompletedTripPath(
       const remoteRetry = await matchChunkedPath(
         candidate,
         resolvedConfig,
-        REMOTE_MATCHING_SERVICES,
+        getRemoteMatchingServices(resolvedConfig.forceOsrmMatch),
       );
       if (remoteRetry.path && remoteRetry.provider && remoteRetry.provider !== 'local-directional') {
         matchedPath = remoteRetry.path;
@@ -883,14 +917,8 @@ export async function reconstructCompletedTripPath(
     }
   }
 
-  if (matchedPath && provider && provider !== 'local-directional') {
-    matchedPath = trimMatchedPathToTelemetryEndpoints(matchedPath, telemetry, acceptedTelemetry);
-  }
-
-  const hasAuthoritativeMatchedGeometry = Boolean(
-    matchedPath && provider && provider !== 'local-directional',
-  );
-  const reconstructedPath = hasAuthoritativeMatchedGeometry
+  const hasMatchedGeometry = Boolean(matchedPath && provider);
+  const reconstructedPath = hasMatchedGeometry
     ? dedupeSequentialPoints(matchedPath ?? [])
     : smoothDisplayedRoutePath(
         preprocessedPath.length > 1 ? preprocessedPath : rawAcceptedPath,
@@ -922,7 +950,7 @@ export async function reconstructCompletedTripPath(
             }
           : null,
     rejectedOutlierCount: rejectedCount,
-    status: hasAuthoritativeMatchedGeometry ? 'matched' : 'fallback',
+    status: hasMatchedGeometry ? 'matched' : 'fallback',
   };
 }
 

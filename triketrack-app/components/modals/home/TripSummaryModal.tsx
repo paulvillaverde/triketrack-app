@@ -171,7 +171,7 @@ export function TripSummaryModal({
                     isLowBatteryMapMode ? { color: MAXIM_UI_SUBTLE_DARK } : null,
                   ]}
                 >
-                  Payment
+                  Fare
                 </Text>
                 <Text
                   style={[

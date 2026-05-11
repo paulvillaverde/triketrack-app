@@ -26,7 +26,7 @@ export type NotificationCenterItem = {
 };
 
 export type NotificationCenterTarget = {
-  screen: 'home' | 'profile' | 'trip' | 'startTrip' | 'tripNavigation' | 'violation';
+  screen: 'login' | 'home' | 'profile' | 'trip' | 'startTrip' | 'tripNavigation' | 'violation';
   itemId?: string | null;
 };
 

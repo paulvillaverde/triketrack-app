@@ -2,16 +2,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { buildRoadAlignedTripPath, dedupeSequentialPoints, polylineDistanceKm } from '../../lib/roadPath';
 import { reconstructCompletedTripPath, type RawTripTelemetryPoint } from '../../lib/tripPathReconstruction';
 import {
-  buildRoadsideDisplayAnchor,
-  buildRenderedTripTrace,
-  buildTripEndConnector,
-  buildTripStartConnector,
   buildRoadCenterlinePath,
   projectPointToRoadPath,
+  type TripRoadProjection,
 } from '../../lib/tripTrace';
 import { OsmMapView, type OsmMapViewHandle } from './OsmMapView';
 import {
-  LOW_BATTERY_MAP_ACCENT_SOFT,
+  MAP_GEOFENCE_FILL_DARK,
+  MAP_GEOFENCE_FILL_LIGHT,
+  MAP_GEOFENCE_STROKE_DARK,
+  MAP_GEOFENCE_STROKE_LIGHT,
   MAXIM_ROUTE_CASING_DARK,
   MAXIM_ROUTE_CASING_LIGHT,
   MAXIM_ROUTE_CORE_DARK,
@@ -40,6 +40,9 @@ type TripRouteMapProps = {
   geofence: LatLng[];
   lockSavedRoute?: boolean;
   isLowBatteryMapMode?: boolean;
+  replayMarkerCoordinate?: LatLng | null;
+  replayMarkerHeadingDeg?: number | null;
+  replayCameraFollowToken?: number;
   style: any;
   getRouteRegion: (routePath: LatLng[]) => {
     latitude: number;
@@ -49,10 +52,13 @@ type TripRouteMapProps = {
   };
 };
 
-const distanceMetersBetween = (from: LatLng, to: LatLng) =>
-  Math.hypot(
-    (from.latitude - to.latitude) * 111320,
-    (from.longitude - to.longitude) * 111320 * Math.cos((from.latitude * Math.PI) / 180),
+const COMPLETED_ENDPOINT_CONNECTOR_MAX_METERS = 35;
+
+const isFiniteLatLng = (point: LatLng | null | undefined): point is LatLng =>
+  Boolean(
+    point &&
+      Number.isFinite(point.latitude) &&
+      Number.isFinite(point.longitude),
   );
 
 export function TripRouteMap({
@@ -67,16 +73,16 @@ export function TripRouteMap({
   geofence,
   lockSavedRoute = false,
   isLowBatteryMapMode = false,
+  replayMarkerCoordinate = null,
+  replayMarkerHeadingDeg = null,
+  replayCameraFollowToken = 0,
   style,
   getRouteRegion,
 }: TripRouteMapProps) {
   const mapRef = useRef<OsmMapViewHandle | null>(null);
   const lastFocusedRouteSignatureRef = useRef<string | null>(null);
+  const replayMarkerCoordinateRef = useRef<LatLng | null>(replayMarkerCoordinate);
   const [roadAlignedRoutePath, setRoadAlignedRoutePath] = useState<LatLng[]>(routePath);
-  const authoritativeStoredEndConnector = useMemo(
-    () => dedupeSequentialPoints(dashedEndConnector),
-    [dashedEndConnector],
-  );
   const closedGeofence = useMemo(() => {
     if (geofence.length < 2) {
       return geofence;
@@ -93,27 +99,47 @@ export function TripRouteMap({
 
     return [...geofence, firstPoint];
   }, [geofence]);
+  const telemetryPath = useMemo(
+    () =>
+      dedupeSequentialPoints(
+        rawTelemetry
+          .map((point) => ({
+            latitude: point.latitude,
+            longitude: point.longitude,
+          }))
+          .filter(isFiniteLatLng),
+      ),
+    [rawTelemetry],
+  );
   const endpointSeedPath = useMemo(
     () =>
       dedupeSequentialPoints(
         [
-          matchedStartPoint ?? rawStartPoint ?? routePath[0] ?? null,
-          endPoint ?? rawEndPoint ?? routePath.at(-1) ?? null,
-        ].filter((point): point is LatLng => Boolean(point)),
+          rawStartPoint ?? telemetryPath[0] ?? matchedStartPoint ?? dashedStartConnector[0] ?? routePath[0] ?? null,
+          rawEndPoint ??
+            telemetryPath.at(-1) ??
+            endPoint ??
+            dashedEndConnector.at(-1) ??
+            routePath.at(-1) ??
+            null,
+        ].filter(isFiniteLatLng),
       ),
-    [endPoint, matchedStartPoint, rawEndPoint, rawStartPoint, routePath],
+    [
+      dashedEndConnector,
+      dashedStartConnector,
+      endPoint,
+      matchedStartPoint,
+      rawEndPoint,
+      rawStartPoint,
+      routePath,
+      telemetryPath,
+    ],
   );
 
   useEffect(() => {
     let cancelled = false;
 
     setRoadAlignedRoutePath(routePath);
-    const telemetryPath = dedupeSequentialPoints(
-      rawTelemetry.map((point) => ({
-        latitude: point.latitude,
-        longitude: point.longitude,
-      })),
-    );
 
     if (routePath.length < 2 && telemetryPath.length < 2) {
       return () => {
@@ -121,7 +147,8 @@ export function TripRouteMap({
       };
     }
 
-    const shouldHonorAuthoritativeSavedRoute = lockSavedRoute && routePath.length > 1;
+    const shouldHonorAuthoritativeSavedRoute =
+      lockSavedRoute && routePath.length > 1;
     if (shouldHonorAuthoritativeSavedRoute) {
       return () => {
         cancelled = true;
@@ -136,9 +163,9 @@ export function TripRouteMap({
     const shouldHoldSavedRoute =
       lockSavedRoute &&
       routePath.length > 1 &&
+      telemetryPath.length < 2 &&
       !shouldTreatSavedPathAsSuspicious &&
-      routePath.length >= 8 &&
-      (telemetryPath.length === 0 || routePath.length >= telemetryPath.length);
+      routePath.length >= 8;
 
     if (shouldHoldSavedRoute) {
       return () => {
@@ -147,8 +174,9 @@ export function TripRouteMap({
     }
 
     const shouldTrustSavedRoutePath =
+      telemetryPath.length < 2 &&
       routePath.length >= 8 &&
-      (telemetryPath.length === 0 || routePath.length >= telemetryPath.length);
+      routePath.length >= telemetryPath.length;
 
     if (shouldTrustSavedRoutePath) {
       return () => {
@@ -157,15 +185,20 @@ export function TripRouteMap({
     }
 
     void (async () => {
-      const reconstructedPath =
+      const reconstruction =
         telemetryPath.length >= 2
-          ? await reconstructCompletedTripPath(rawTelemetry).then((result) =>
-              result.reconstructedPath.length > 1 ? result.reconstructedPath : telemetryPath,
-            )
-          : routePath;
+          ? await reconstructCompletedTripPath(rawTelemetry, {
+              useFullRawTrajectory: true,
+            })
+          : null;
+      const reconstructedPath =
+        reconstruction && reconstruction.reconstructedPath.length > 1
+          ? reconstruction.reconstructedPath
+          : telemetryPath.length > 1
+            ? telemetryPath
+            : routePath;
       const sourcePath =
-        reconstructedPath.length > 1 &&
-        (telemetryPath.length >= routePath.length || shouldTreatSavedPathAsSuspicious)
+        telemetryPath.length > 1 && reconstructedPath.length > 1
           ? reconstructedPath
           : shouldTreatSavedPathAsSuspicious && endpointSeedPath.length > 1
             ? endpointSeedPath
@@ -189,6 +222,10 @@ export function TripRouteMap({
       const roadAlignedPath = await buildRoadAlignedTripPath({
         candidatePath: sourcePath,
         fallbackPath,
+        preserveDetailedGeometry: telemetryPath.length > 1,
+        trustCandidateGeometry:
+          Boolean(reconstruction?.routeMatchMetadata?.provider) &&
+          reconstruction?.routeMatchMetadata?.provider !== 'local-directional',
       });
       if (!cancelled && roadAlignedPath.length > 1) {
         setRoadAlignedRoutePath(roadAlignedPath);
@@ -198,169 +235,79 @@ export function TripRouteMap({
     return () => {
       cancelled = true;
     };
-  }, [endpointSeedPath, lockSavedRoute, rawTelemetry, routePath]);
+  }, [endpointSeedPath, lockSavedRoute, rawTelemetry, routePath, telemetryPath]);
 
-  const renderedTrace = useMemo(
+  const recordedStartPoint =
+    rawStartPoint ?? telemetryPath[0] ?? matchedStartPoint ?? dashedStartConnector[0] ?? routePath[0] ?? null;
+  const recordedEndPoint =
+    rawEndPoint ??
+    telemetryPath.at(-1) ??
+    endPoint ??
+    dashedEndConnector.at(-1) ??
+    routePath.at(-1) ??
+    null;
+  const baseDisplayRoutePath = useMemo(
     () =>
-      buildRenderedTripTrace({
-        rawStartPoint,
-        matchedPoints: roadAlignedRoutePath,
-        dashedConnector: dashedStartConnector,
-      }),
-    [dashedStartConnector, rawStartPoint, roadAlignedRoutePath],
+      dedupeSequentialPoints(
+        roadAlignedRoutePath.length > 1
+          ? roadAlignedRoutePath
+          : routePath.length > 1
+            ? routePath
+            : telemetryPath,
+      ),
+    [roadAlignedRoutePath, routePath, telemetryPath],
   );
-  const offRoadEndDistanceMeters = useMemo(() => {
-    if (!rawEndPoint || !endPoint) {
-      return 0;
-    }
-    return distanceMetersBetween(rawEndPoint, endPoint);
-  }, [endPoint, rawEndPoint]);
-  const displayRoutePath = useMemo(() => {
-    const baseRoutePath = renderedTrace.solidOnRoadPath;
-    if (lockSavedRoute && baseRoutePath.length > 1) {
-      return baseRoutePath;
-    }
-    if (
-      baseRoutePath.length < 2 ||
-      !endPoint ||
-      !rawEndPoint ||
-      offRoadEndDistanceMeters < 3 ||
-      offRoadEndDistanceMeters > 250
-    ) {
-      return baseRoutePath;
+  const getEndpointProjection = (
+    endpoint: LatLng | null,
+    fallbackPoint: LatLng | null,
+  ): TripRoadProjection | null => {
+    if (endpoint && baseDisplayRoutePath.length >= 2) {
+      const projection = projectPointToRoadPath(endpoint, baseDisplayRoutePath);
+      if (
+        projection &&
+        projection.distanceKm * 1000 <= COMPLETED_ENDPOINT_CONNECTOR_MAX_METERS
+      ) {
+        return projection;
+      }
     }
 
-    const startProjection = projectPointToRoadPath(baseRoutePath[0], baseRoutePath);
-    const endProjection = projectPointToRoadPath(endPoint, baseRoutePath);
+    return fallbackPoint && baseDisplayRoutePath.length >= 2
+      ? projectPointToRoadPath(fallbackPoint, baseDisplayRoutePath)
+      : null;
+  };
+  const displayRoutePath = useMemo(() => {
+    if (baseDisplayRoutePath.length < 2) {
+      return baseDisplayRoutePath;
+    }
+    if (lockSavedRoute) {
+      return baseDisplayRoutePath;
+    }
+
+    const startProjection = getEndpointProjection(recordedStartPoint, baseDisplayRoutePath[0]);
+    const endProjection = getEndpointProjection(
+      recordedEndPoint,
+      baseDisplayRoutePath[baseDisplayRoutePath.length - 1],
+    );
     if (!startProjection || !endProjection) {
-      return dedupeSequentialPoints([...baseRoutePath.slice(0, -1), endPoint]);
+      return baseDisplayRoutePath;
     }
 
     const trimmedRoutePath = buildRoadCenterlinePath({
-      roadPath: baseRoutePath,
+      roadPath: baseDisplayRoutePath,
       startProjection,
       endProjection,
       maxBacktrackKm: 1,
     });
 
-      return trimmedRoutePath.length > 1 ? trimmedRoutePath : dedupeSequentialPoints([baseRoutePath[0], endPoint]);
-  }, [endPoint, lockSavedRoute, offRoadEndDistanceMeters, rawEndPoint, renderedTrace.solidOnRoadPath]);
-  const startRoadPoint = displayRoutePath[0] ?? matchedStartPoint ?? routePath[0] ?? null;
-  const endRoadPoint =
-    displayRoutePath[displayRoutePath.length - 1] ?? endPoint ?? routePath.at(-1) ?? null;
-  const startDisplayAnchor = useMemo(
-    () =>
-      buildRoadsideDisplayAnchor({
-        roadPath: displayRoutePath,
-        anchorPoint: startRoadPoint,
-        referencePoint: rawStartPoint ?? dashedStartConnector[0] ?? null,
-        defaultSide: 'left',
-        anchorRole: 'start',
-      }),
-    [dashedStartConnector, displayRoutePath, rawStartPoint, startRoadPoint],
-  );
-  const resolvedStartConnector = useMemo(() => {
-    if (startDisplayAnchor && startRoadPoint) {
-      const projectedStart = projectPointToRoadPath(startRoadPoint, displayRoutePath);
-      const connectorTarget = projectedStart?.point ?? startRoadPoint;
-      if (distanceMetersBetween(startDisplayAnchor, connectorTarget) >= 3) {
-        return [startDisplayAnchor, connectorTarget];
-      }
-    }
-    const liveConnector = buildTripStartConnector({
-      rawStartPoint,
-      firstSnappedPoint: matchedStartPoint ?? displayRoutePath[0] ?? null,
-      roadPath: displayRoutePath,
-    });
-    if (liveConnector.length === 2) {
-      return liveConnector;
-    }
-    if (dashedStartConnector.length === 2) {
-      return buildTripStartConnector({
-        rawStartPoint: dashedStartConnector[0] ?? null,
-        firstSnappedPoint: dashedStartConnector[1] ?? null,
-        roadPath: displayRoutePath,
-      });
-    }
-    return [];
-  }, [
-    dashedStartConnector,
-    displayRoutePath,
-    matchedStartPoint,
-    rawStartPoint,
-    startDisplayAnchor,
-    startRoadPoint,
-  ]);
-  const renderedRouteStartPoint =
-    resolvedStartConnector.length === 2
-      ? resolvedStartConnector[0]
-      : displayRoutePath[0] ?? matchedStartPoint ?? routePath[0] ?? rawStartPoint ?? null;
-  const endDisplayAnchor = useMemo(
-    () =>
-      buildRoadsideDisplayAnchor({
-        roadPath: displayRoutePath,
-        anchorPoint: endRoadPoint,
-        referencePoint: rawEndPoint ?? dashedEndConnector[1] ?? null,
-        defaultSide: 'right',
-        anchorRole: 'end',
-      }),
-    [dashedEndConnector, displayRoutePath, endRoadPoint, rawEndPoint],
-  );
-  const resolvedEndConnector = useMemo(() => {
-    const shouldUseStoredEndConnector =
-      authoritativeStoredEndConnector.length === 2 &&
-      Boolean(endPoint) &&
-      distanceMetersBetween(
-        authoritativeStoredEndConnector[authoritativeStoredEndConnector.length - 1],
-        endPoint as LatLng,
-      ) <= 12;
-    if (shouldUseStoredEndConnector) {
-      return authoritativeStoredEndConnector;
-    }
-    if (endDisplayAnchor && endRoadPoint) {
-      const projectedEnd = projectPointToRoadPath(endRoadPoint, displayRoutePath);
-      const connectorTarget = projectedEnd?.point ?? endRoadPoint;
-      if (distanceMetersBetween(connectorTarget, endDisplayAnchor) >= 3) {
-        return [connectorTarget, endDisplayAnchor];
-      }
-    }
-    const liveConnector = buildTripEndConnector({
-      rawEndPoint,
-      lastSnappedPoint: endPoint ?? displayRoutePath[displayRoutePath.length - 1] ?? null,
-      roadPath: displayRoutePath,
-    });
-    if (liveConnector.length === 2) {
-      return liveConnector;
-    }
-    if (dashedEndConnector.length === 2) {
-      return buildTripEndConnector({
-        rawEndPoint: dashedEndConnector[1] ?? null,
-        lastSnappedPoint: dashedEndConnector[0] ?? null,
-        roadPath: displayRoutePath,
-      });
-    }
-    return [];
-  }, [
-    authoritativeStoredEndConnector,
-    dashedEndConnector,
-    displayRoutePath,
-    endDisplayAnchor,
-    endPoint,
-    endRoadPoint,
-    rawEndPoint,
-  ]);
+    return trimmedRoutePath.length > 1 ? trimmedRoutePath : baseDisplayRoutePath;
+  }, [baseDisplayRoutePath, lockSavedRoute, recordedEndPoint, recordedStartPoint]);
+  const renderedRouteStartPoint = displayRoutePath[0] ?? matchedStartPoint ?? routePath[0] ?? null;
   const renderedRouteEndPoint =
-    authoritativeStoredEndConnector.length === 2 && endPoint
-      ? endPoint
-      : resolvedEndConnector.length === 2
-        ? resolvedEndConnector[1]
-      : displayRoutePath[displayRoutePath.length - 1] ?? endPoint ?? routePath.at(-1) ?? rawEndPoint ?? null;
+    displayRoutePath[displayRoutePath.length - 1] ?? endPoint ?? routePath.at(-1) ?? null;
   const regionSeedPath = useMemo(
     () =>
       [
-        ...resolvedStartConnector,
         ...displayRoutePath,
-        ...resolvedEndConnector,
         ...(renderedRouteStartPoint ? [renderedRouteStartPoint] : []),
         ...(renderedRouteEndPoint ? [renderedRouteEndPoint] : []),
       ].filter(
@@ -377,8 +324,6 @@ export function TripRouteMap({
       displayRoutePath,
       renderedRouteEndPoint,
       renderedRouteStartPoint,
-      resolvedStartConnector,
-      resolvedEndConnector,
     ],
   );
   const routeFitPadding = useMemo(
@@ -392,12 +337,11 @@ export function TripRouteMap({
         .join('|'),
     [regionSeedPath],
   );
-  const geofenceStrokeColor = isLowBatteryMapMode ? MAXIM_ROUTE_CORE_DARK : 'rgba(90,103,216,0.38)';
-  const geofencePolygonStrokeColor = isLowBatteryMapMode ? MAXIM_ROUTE_CORE_DARK : 'rgba(90,103,216,0.16)';
-  const geofenceFillColor = isLowBatteryMapMode ? LOW_BATTERY_MAP_ACCENT_SOFT : 'rgba(90,103,216,0.03)';
+  const geofenceStrokeColor = isLowBatteryMapMode ? MAP_GEOFENCE_STROKE_DARK : MAP_GEOFENCE_STROKE_LIGHT;
+  const geofencePolygonStrokeColor = geofenceStrokeColor;
+  const geofenceFillColor = isLowBatteryMapMode ? MAP_GEOFENCE_FILL_DARK : MAP_GEOFENCE_FILL_LIGHT;
   const routeCasingColor = isLowBatteryMapMode ? MAXIM_ROUTE_CASING_DARK : MAXIM_ROUTE_CASING_LIGHT;
   const routeCoreColor = isLowBatteryMapMode ? MAXIM_ROUTE_CORE_DARK : MAXIM_ROUTE_CORE_LIGHT;
-  const connectorColor = isLowBatteryMapMode ? MAXIM_ROUTE_CORE_DARK : 'rgba(107,114,128,0.78)';
   const osmMapStyleUrl = isLowBatteryMapMode ? OSM_VECTOR_DARK_STYLE : OSM_VECTOR_LIGHT_STYLE_URL;
   const osmBackgroundColor = isLowBatteryMapMode ? OSM_MAXIM_DARK_BACKGROUND : OSM_LIGHT_BACKGROUND;
   const tripPolylines = useMemo(
@@ -410,17 +354,6 @@ export function TripRouteMap({
               strokeColor: geofenceStrokeColor,
               strokeWidth: 1.5,
               lineDashPattern: [8, 6],
-            },
-          ]
-        : []),
-      ...(resolvedStartConnector.length === 2
-        ? [
-            {
-              id: 'start-connector',
-              coordinates: resolvedStartConnector,
-              strokeColor: connectorColor,
-              strokeWidth: 2,
-              lineDashPattern: [6, 6],
             },
           ]
         : []),
@@ -440,25 +373,11 @@ export function TripRouteMap({
             },
           ]
         : []),
-      ...(resolvedEndConnector.length === 2
-        ? [
-            {
-              id: 'end-connector',
-              coordinates: resolvedEndConnector,
-              strokeColor: connectorColor,
-              strokeWidth: 2,
-              lineDashPattern: [6, 6],
-            },
-          ]
-        : []),
     ],
     [
       closedGeofence,
-      connectorColor,
       displayRoutePath,
       geofenceStrokeColor,
-      resolvedEndConnector,
-      resolvedStartConnector,
       routeCasingColor,
       routeCoreColor,
     ],
@@ -473,6 +392,7 @@ export function TripRouteMap({
               kind: 'pin' as const,
               color: '#22C55E',
               fillColor: '#FFFFFF',
+              borderColor: '#22C55E',
               label: 'S',
               size: 34,
             },
@@ -486,13 +406,25 @@ export function TripRouteMap({
               kind: 'pin' as const,
               color: '#EF4444',
               fillColor: '#FFFFFF',
+              borderColor: '#EF4444',
               label: 'E',
               size: 34,
             },
           ]
         : []),
+      ...(replayMarkerCoordinate
+        ? [
+            {
+              id: 'trip-replay-driver',
+              coordinate: replayMarkerCoordinate,
+              kind: 'location' as const,
+              color: '#E53935',
+              size: 44,
+            },
+          ]
+        : []),
     ],
-    [renderedRouteEndPoint, renderedRouteStartPoint],
+    [renderedRouteEndPoint, renderedRouteStartPoint, replayMarkerCoordinate, replayMarkerHeadingDeg],
   );
   const tripPolygons = useMemo(
     () => [
@@ -547,6 +479,27 @@ export function TripRouteMap({
   useEffect(() => {
     return focusRoute();
   }, [focusRoute]);
+
+  useEffect(() => {
+    replayMarkerCoordinateRef.current = replayMarkerCoordinate;
+  }, [replayMarkerCoordinate]);
+
+  useEffect(() => {
+    const coordinate = replayMarkerCoordinateRef.current;
+    if (!mapRef.current || !coordinate) {
+      return;
+    }
+
+    mapRef.current.animateCamera(
+      {
+        center: coordinate,
+        zoom: 18.2,
+        pitch: 0,
+        heading: 0,
+      },
+      { duration: 900 },
+    );
+  }, [replayCameraFollowToken]);
 
   return (
     <OsmMapView

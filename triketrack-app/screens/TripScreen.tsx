@@ -15,6 +15,8 @@ import { type TripHistoryItem } from '../lib/tripTransactions';
 import { MAXIM_UI_SUBTLE_DARK } from './homeScreenShared';
 import { CompletedTripDetailScreen } from './CompletedTripDetailScreen';
 
+type TripHistoryListTab = 'ALL' | 'THIS_WEEK' | 'LAST_WEEK' | 'OVER_30' | 'UNSYNCED';
+
 type TripScreenProps = {
   onLogout?: () => void;
   onNavigate?: (tab: BottomTab) => void;
@@ -23,19 +25,9 @@ type TripScreenProps = {
     tripId: string;
     requestedAt: number;
   } | null;
-  offlineQueueStatus?: {
-    pendingTripCount: number;
-    pendingGpsPointCount: number;
-    pendingMatchedPointCount: number;
-    isSyncing: boolean;
-    lastAttemptAt: string | null;
-    lastError: string | null;
-    nextRetryAt: string | null;
-  };
   onDeleteTrip?: (tripId: string) => void | Promise<void>;
-  onRefreshTripHistory?: () => void | TripHistoryItem[] | Promise<void | TripHistoryItem[]>;
-  onSyncTrip?: (tripId: string) => void | TripHistoryItem[] | Promise<void | TripHistoryItem[]>;
-  isRefreshingTripHistory?: boolean;
+  onRoadMatchOfflineTrip?: (trip: TripHistoryItem) => void | Promise<void>;
+  onSyncOfflineTrip?: (trip: TripHistoryItem) => void | Promise<void>;
   profileName: string;
   profileDriverCode: string;
   profilePlateNumber: string;
@@ -66,11 +58,9 @@ export function TripScreen({
   onNavigate,
   tripHistory,
   focusTripRequest = null,
-  offlineQueueStatus,
   onDeleteTrip,
-  onRefreshTripHistory,
-  onSyncTrip,
-  isRefreshingTripHistory = false,
+  onRoadMatchOfflineTrip,
+  onSyncOfflineTrip,
   profileName,
   profileDriverCode,
   profilePlateNumber,
@@ -81,15 +71,32 @@ export function TripScreen({
 }: TripScreenProps) {
   const insets = useSafeAreaInsets();
   const [selectedTrip, setSelectedTrip] = useState<TripHistoryItem | null>(null);
-  const [listTab, setListTab] = useState<'ALL' | 'THIS_WEEK' | 'LAST_WEEK' | 'OVER_30'>('ALL');
+  const [listTab, setListTab] = useState<TripHistoryListTab>('ALL');
   const [query, setQuery] = useState('');
   const [isManagingTrips, setIsManagingTrips] = useState(false);
   const [selectedTripIds, setSelectedTripIds] = useState<string[]>([]);
-  const [selectedUnsyncedTripIds, setSelectedUnsyncedTripIds] = useState<string[]>([]);
-  const [isUnsyncedSectionExpanded, setIsUnsyncedSectionExpanded] = useState(false);
   const [isDeletingTrips, setIsDeletingTrips] = useState(false);
-  const [syncingTripId, setSyncingTripId] = useState<string | null>(null);
   const isLowBatteryTheme = isLowBatteryMapMode;
+  const [dateLabelNow, setDateLabelNow] = useState(() => new Date());
+
+  const getLocalDateKey = (value: Date) => {
+    const yyyy = value.getFullYear();
+    const mm = String(value.getMonth() + 1).padStart(2, '0');
+    const dd = String(value.getDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
+  };
+
+  const getTripLocalDateKey = (trip: TripHistoryItem) => {
+    const timestamp = trip.startedAt ?? trip.endedAt;
+    if (timestamp) {
+      const parsed = new Date(timestamp);
+      if (Number.isFinite(parsed.getTime())) {
+        return getLocalDateKey(parsed);
+      }
+    }
+
+    return trip.tripDate;
+  };
 
   useEffect(() => {
     if (!selectedTrip) {
@@ -101,12 +108,8 @@ export function TripScreen({
       return;
     }
 
-    if (isRefreshingTripHistory || syncingTripId) {
-      return;
-    }
-
     setSelectedTrip(null);
-  }, [isRefreshingTripHistory, selectedTrip, syncingTripId, tripHistory]);
+  }, [selectedTrip, tripHistory]);
 
   useEffect(() => {
     if (!focusTripRequest?.tripId) {
@@ -127,7 +130,6 @@ export function TripScreen({
 
     setIsManagingTrips(false);
     setSelectedTripIds([]);
-    setSelectedUnsyncedTripIds([]);
     setQuery('');
     setListTab('ALL');
     setSelectedTrip(focusedTrip);
@@ -136,26 +138,37 @@ export function TripScreen({
   useEffect(() => {
     const existingTripIds = new Set(tripHistory.map((item) => item.id));
     setSelectedTripIds((current) => current.filter((tripId) => existingTripIds.has(tripId)));
-    setSelectedUnsyncedTripIds((current) => current.filter((tripId) => existingTripIds.has(tripId)));
   }, [tripHistory]);
 
+  useEffect(() => {
+    const timer = setInterval(() => setDateLabelNow(new Date()), 60_000);
+    return () => clearInterval(timer);
+  }, []);
+
   const getDaysAgo = (tripDate: string) => {
-    const today = new Date();
+    const today = new Date(dateLabelNow);
     today.setHours(0, 0, 0, 0);
     const date = new Date(`${tripDate}T00:00:00`);
+    date.setHours(0, 0, 0, 0);
     const diffMs = today.getTime() - date.getTime();
     return Math.floor(diffMs / (1000 * 60 * 60 * 24));
   };
 
+  const getTripDaysAgo = (trip: TripHistoryItem) => getDaysAgo(getTripLocalDateKey(trip));
+
   const formatNumericDate = (tripDate: string) => {
     const date = new Date(`${tripDate}T00:00:00`);
+    if (!Number.isFinite(date.getTime())) {
+      return tripDate;
+    }
     const mm = String(date.getMonth() + 1).padStart(2, '0');
     const dd = String(date.getDate()).padStart(2, '0');
-    const yyyy = date.getFullYear();
-    return `${mm}/${dd}/${yyyy}`;
+    const yy = String(date.getFullYear()).slice(-2);
+    return `${mm}/${dd}/${yy}`;
   };
 
-  const formatTripDateForCard = (tripDate: string) => {
+  const formatTripDateForCard = (trip: TripHistoryItem) => {
+    const tripDate = getTripLocalDateKey(trip);
     const daysAgo = getDaysAgo(tripDate);
     const numeric = formatNumericDate(tripDate);
     if (daysAgo === 0) return `${numeric} (Today)`;
@@ -168,25 +181,6 @@ export function TripScreen({
 
   const getDestinationLabel = (trip: TripHistoryItem) =>
     trip.endDisplayName?.trim() || 'Unknown destination';
-
-  const getRouteSourceLabel = (trip: TripHistoryItem) => {
-    switch (trip.routeMatchSummary?.provider) {
-      case 'osrm-match':
-        return 'OSRM match';
-      case 'osrm-route':
-        return 'OSRM route';
-      case 'ors-directions':
-        return 'ORS route';
-      case 'local-directional':
-        return 'Local route';
-      default:
-        return trip.rawTelemetry.length > 0 ? 'Raw GPS' : 'No match';
-    }
-  };
-
-  const isOsrmRoute = (trip: TripHistoryItem) =>
-    trip.routeMatchSummary?.provider === 'osrm-match' ||
-    trip.routeMatchSummary?.provider === 'osrm-route';
 
   const matchesTripQuery = useCallback(
     (trip: TripHistoryItem) => {
@@ -235,91 +229,46 @@ export function TripScreen({
     );
   }, []);
 
+  const isOfflineSavedUnsyncedTrip = useCallback((trip: TripHistoryItem) => {
+    if (trip.syncStatus === 'SYNCED' || trip.offlineSyncStatus === 'synced') {
+      return false;
+    }
+
+    const hasRawGps =
+      trip.rawTelemetry.length > 0 ||
+      (Number.isFinite(trip.rawGpsPointCount) && trip.rawGpsPointCount > 0);
+    const isOfflineSyncCandidate =
+      trip.offlineSyncStatus === 'completed_offline' ||
+      trip.offlineSyncStatus === 'syncing' ||
+      trip.offlineSyncStatus === 'failed';
+
+    return (
+      (isOfflineSyncCandidate || trip.syncStatus === 'SYNC_PENDING') &&
+      trip.status === 'COMPLETED' &&
+      hasRawGps
+    );
+  }, []);
+
   const eligibleFinalizedTrips = useMemo(
-    () =>
-      tripHistory.filter(
-        (item) => item.syncStatus === 'SYNCED' || isVerifiedFinalizedTrip(item),
-      ),
-    [isVerifiedFinalizedTrip, tripHistory],
+    () => tripHistory.filter((item) => item.syncStatus === 'SYNCED'),
+    [tripHistory],
   );
   const syncedTrips = useMemo(
     () => eligibleFinalizedTrips.filter((item) => item.syncStatus === 'SYNCED'),
     [eligibleFinalizedTrips],
   );
   const thisWeekTrips = useMemo(
-    () => syncedTrips.filter((item) => getDaysAgo(item.tripDate) >= 0 && getDaysAgo(item.tripDate) <= 6),
-    [syncedTrips],
+    () => syncedTrips.filter((item) => getTripDaysAgo(item) >= 0 && getTripDaysAgo(item) <= 6),
+    [dateLabelNow, syncedTrips],
   );
   const lastWeekTrips = useMemo(
-    () => syncedTrips.filter((item) => getDaysAgo(item.tripDate) >= 7 && getDaysAgo(item.tripDate) < 30),
-    [syncedTrips],
+    () => syncedTrips.filter((item) => getTripDaysAgo(item) >= 7 && getTripDaysAgo(item) < 30),
+    [dateLabelNow, syncedTrips],
   );
   const over30DaysTrips = useMemo(
-    () => syncedTrips.filter((item) => getDaysAgo(item.tripDate) >= 30),
-    [syncedTrips],
+    () => syncedTrips.filter((item) => getTripDaysAgo(item) >= 30),
+    [dateLabelNow, syncedTrips],
   );
-  const unsyncedTrips = useMemo(
-    () =>
-      tripHistory.filter(
-        (item) => item.syncStatus === 'SYNC_PENDING' && isVerifiedFinalizedTrip(item),
-      ),
-    [isVerifiedFinalizedTrip, tripHistory],
-  );
-  const pendingTripCount = unsyncedTrips.length;
-  const queuedPointCount =
-    (offlineQueueStatus?.pendingGpsPointCount ?? 0) +
-    (offlineQueueStatus?.pendingMatchedPointCount ?? 0);
-  const pendingQueueTripCount = Math.max(
-    pendingTripCount,
-    offlineQueueStatus?.pendingTripCount ?? 0,
-  );
-  const hasOfflineQueueWork =
-    pendingTripCount > 0 ||
-    pendingQueueTripCount > 0 ||
-    queuedPointCount > 0 ||
-    Boolean(offlineQueueStatus?.lastError) ||
-    Boolean(offlineQueueStatus?.isSyncing);
-  const formatSyncTime = (value: string | null | undefined) => {
-    if (!value) {
-      return null;
-    }
-
-    const date = new Date(value);
-    if (!Number.isFinite(date.getTime())) {
-      return null;
-    }
-
-    return date.toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-    });
-  };
-  const nextRetryText = formatSyncTime(offlineQueueStatus?.nextRetryAt);
-  const lastAttemptText = formatSyncTime(offlineQueueStatus?.lastAttemptAt);
-  const queueStatusText = offlineQueueStatus?.isSyncing
-    ? 'Syncing queued trip data now'
-    : offlineQueueStatus?.lastError
-      ? nextRetryText
-        ? `Last sync failed. Auto retry at ${nextRetryText}`
-        : 'Last sync failed. Tap Sync all to retry'
-      : queuedPointCount > 0
-        ? `${queuedPointCount} route point${queuedPointCount === 1 ? '' : 's'} queued`
-        : lastAttemptText
-          ? `Last sync check ${lastAttemptText}`
-          : 'Ready to retry when online';
-  const queueSummaryText =
-    pendingQueueTripCount > 0
-      ? `${pendingQueueTripCount} trip${pendingQueueTripCount === 1 ? '' : 's'} waiting - ${queueStatusText}`
-      : queueStatusText;
-  useEffect(() => {
-    if (hasOfflineQueueWork) {
-      return;
-    }
-
-    setIsUnsyncedSectionExpanded(false);
-    setSelectedUnsyncedTripIds([]);
-  }, [hasOfflineQueueWork]);
-
   const visibleSyncedTrips = useMemo(() => {
     if (listTab === 'THIS_WEEK') return thisWeekTrips;
     if (listTab === 'LAST_WEEK') return lastWeekTrips;
@@ -327,30 +276,35 @@ export function TripScreen({
     return syncedTrips;
   }, [listTab, over30DaysTrips, syncedTrips, thisWeekTrips, lastWeekTrips]);
 
-  const visibleUnsyncedTrips = useMemo(
-    () => unsyncedTrips.filter(matchesTripQuery),
-    [matchesTripQuery, unsyncedTrips],
-  );
-  const allUnsyncedTripsSelected =
-    visibleUnsyncedTrips.length > 0 &&
-    visibleUnsyncedTrips.every((trip) => selectedUnsyncedTripIds.includes(trip.id));
   const searchedSyncedTrips = useMemo(
     () => visibleSyncedTrips.filter(matchesTripQuery),
     [matchesTripQuery, visibleSyncedTrips],
   );
+  const unsyncedOfflineTrips = useMemo(
+    () =>
+      tripHistory
+        .filter(isOfflineSavedUnsyncedTrip)
+        .filter(matchesTripQuery)
+        .sort((left, right) => {
+          const leftTime = new Date(left.startedAt ?? `${left.tripDate}T00:00:00`).getTime();
+          const rightTime = new Date(right.startedAt ?? `${right.tripDate}T00:00:00`).getTime();
+          return rightTime - leftTime;
+        }),
+    [isOfflineSavedUnsyncedTrip, matchesTripQuery, tripHistory],
+  );
   const activeTripHistory = useMemo(
     () =>
       searchedSyncedTrips.filter(
-        (trip) => getDaysAgo(trip.tripDate) === 0,
+        (trip) => getTripLocalDateKey(trip) === getLocalDateKey(dateLabelNow),
       ),
-    [searchedSyncedTrips],
+    [dateLabelNow, searchedSyncedTrips],
   );
   const pastTripHistory = useMemo(
     () =>
       searchedSyncedTrips.filter(
-        (trip) => getDaysAgo(trip.tripDate) >= 1,
+        (trip) => getTripLocalDateKey(trip) < getLocalDateKey(dateLabelNow),
       ),
-    [searchedSyncedTrips],
+    [dateLabelNow, searchedSyncedTrips],
   );
   const manageableTripIds = useMemo(
     () => searchedSyncedTrips.map((trip) => trip.id),
@@ -360,6 +314,8 @@ export function TripScreen({
   const selectedTripCount = selectedTripIds.length;
   const allVisibleTripsSelected =
     hasManageableTrips && manageableTripIds.every((tripId) => selectedTripIds.includes(tripId));
+  const shouldShowUnsyncedTrips = listTab === 'ALL' || listTab === 'UNSYNCED';
+  const shouldShowSyncedTrips = listTab !== 'UNSYNCED';
 
   const toggleTripSelection = (tripId: string) => {
     setSelectedTripIds((current) =>
@@ -368,109 +324,19 @@ export function TripScreen({
         : [...current, tripId],
     );
   };
-  const toggleUnsyncedTripSelection = (tripId: string) => {
-    setSelectedUnsyncedTripIds((current) =>
-      current.includes(tripId)
-        ? current.filter((selectedId) => selectedId !== tripId)
-        : [...current, tripId],
-    );
-  };
 
-  const syncAllTrips = async () => {
-    if (!onRefreshTripHistory || syncingTripId || isRefreshingTripHistory) {
-      return;
-    }
 
-    setSyncingTripId('__all__');
-    try {
-      const syncedTrips = await onRefreshTripHistory();
-      const nextTrips = Array.isArray(syncedTrips) ? syncedTrips : tripHistory;
-      const hasPendingTrips = nextTrips.some((trip) => trip.syncStatus === 'SYNC_PENDING');
 
-      if (hasPendingTrips) {
-        Alert.alert(
-          'Some trips still need sync',
-          'A few trips are still waiting to sync. Check your connection, then tap Sync all again.',
-        );
-        return;
-      }
 
-      setListTab('ALL');
-    } catch (error) {
-      Alert.alert(
-        'Trip sync failed',
-        error instanceof Error
-          ? error.message
-          : 'The app could not sync your pending trips yet.',
-      );
-    } finally {
-      setSyncingTripId(null);
-    }
-  };
 
-  const confirmSyncAllTrips = () => {
-    if (pendingTripCount === 0 || !onRefreshTripHistory || syncingTripId || isRefreshingTripHistory) {
-      return;
-    }
 
-    Alert.alert(
-      'Sync all trips?',
-      `${pendingTripCount} unsynced trip${pendingTripCount === 1 ? '' : 's'} will sync and move into Active Trips or Past Trips.`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: syncingTripId === '__all__' || isRefreshingTripHistory ? 'Syncing...' : 'Sync all',
-          onPress: () => {
-            void syncAllTrips();
-          },
-        },
-      ],
-    );
-  };
 
-  const syncPendingTrip = async (tripId: string) => {
-    if (!onSyncTrip || syncingTripId || isRefreshingTripHistory) {
-      return;
-    }
-
-    setSyncingTripId(tripId);
-    try {
-      await onSyncTrip(tripId);
-      setSelectedUnsyncedTripIds((current) => current.filter((selectedId) => selectedId !== tripId));
-    } catch (error) {
-      Alert.alert(
-        'Trip sync failed',
-        error instanceof Error ? error.message : 'This trip could not sync yet.',
-      );
-    } finally {
-      setSyncingTripId(null);
-    }
-  };
-
-  const syncSelectedUnsyncedTrips = async () => {
-    if (!onSyncTrip || selectedUnsyncedTripIds.length === 0 || syncingTripId || isRefreshingTripHistory) {
-      return;
-    }
-
-    setSyncingTripId('__selected__');
-    try {
-      for (const tripId of selectedUnsyncedTripIds) {
-        await onSyncTrip(tripId);
-      }
-      setSelectedUnsyncedTripIds([]);
-    } catch (error) {
-      Alert.alert(
-        'Trip sync failed',
-        error instanceof Error ? error.message : 'Some selected trips could not sync yet.',
-      );
-    } finally {
-      setSyncingTripId(null);
-    }
-  };
 
   const handleTripRowPress = (trip: TripHistoryItem) => {
     if (isManagingTrips) {
-      toggleTripSelection(trip.id);
+      if (manageableTripIds.includes(trip.id)) {
+        toggleTripSelection(trip.id);
+      }
       return;
     }
 
@@ -507,8 +373,7 @@ export function TripScreen({
         await onDeleteTrip(tripId);
       }
       setSelectedTripIds((current) => current.filter((tripId) => !tripIds.includes(tripId)));
-      setSelectedUnsyncedTripIds((current) => current.filter((tripId) => !tripIds.includes(tripId)));
-      if (tripIds.length === tripHistory.length) {
+      if (tripIds.length === manageableTripIds.length) {
         setIsManagingTrips(false);
       }
     } finally {
@@ -533,16 +398,6 @@ export function TripScreen({
     ]);
   };
 
-  const confirmRemoveUnsyncedTrips = (tripIds: string[]) => {
-    confirmDeleteTrips(
-      tripIds,
-      tripIds.length === 1 ? 'Remove unsynced trip?' : 'Remove unsynced trips?',
-      tripIds.length === 1
-        ? 'Remove this pending trip from the offline sync queue?'
-        : `Remove ${tripIds.length} pending trips from the offline sync queue?`,
-    );
-  };
-
   return (
     <View style={[styles.homeScreen, isLowBatteryTheme ? localStyles.lowBatteryScreen : null]}>
       <View style={[styles.homeContentArea, isLowBatteryTheme ? localStyles.lowBatteryScreen : null]}>
@@ -554,6 +409,8 @@ export function TripScreen({
             profilePlateNumber={profilePlateNumber}
             profileImageUri={profileImageUri}
             isLowBatteryMapMode={isLowBatteryMapMode}
+            onRoadMatchOfflineTrip={onRoadMatchOfflineTrip}
+            onSyncOfflineTrip={onSyncOfflineTrip}
             onBack={() => setSelectedTrip(null)}
           />
         ) : (
@@ -608,7 +465,12 @@ export function TripScreen({
                 ]}
                 onPress={() => setListTab('ALL')}
               >
-                <Text style={[localStyles.tabText, isLowBatteryTheme ? localStyles.lowBatteryMutedText : null, listTab === 'ALL' && localStyles.tabTextActive]}>All</Text>
+                <Text style={[
+                  localStyles.tabText,
+                  isLowBatteryTheme ? localStyles.lowBatteryMutedText : null,
+                  listTab === 'ALL' && localStyles.tabTextActive,
+                  isLowBatteryTheme && listTab === 'ALL' ? localStyles.lowBatteryTabTextActive : null,
+                ]}>All</Text>
               </Pressable>
               <Pressable
                 style={[
@@ -619,7 +481,12 @@ export function TripScreen({
                 ]}
                 onPress={() => setListTab('THIS_WEEK')}
               >
-                <Text style={[localStyles.tabText, isLowBatteryTheme ? localStyles.lowBatteryMutedText : null, listTab === 'THIS_WEEK' && localStyles.tabTextActive]}>
+                <Text style={[
+                  localStyles.tabText,
+                  isLowBatteryTheme ? localStyles.lowBatteryMutedText : null,
+                  listTab === 'THIS_WEEK' && localStyles.tabTextActive,
+                  isLowBatteryTheme && listTab === 'THIS_WEEK' ? localStyles.lowBatteryTabTextActive : null,
+                ]}>
                   This Week
                 </Text>
               </Pressable>
@@ -632,7 +499,12 @@ export function TripScreen({
                 ]}
                 onPress={() => setListTab('LAST_WEEK')}
               >
-                <Text style={[localStyles.tabText, isLowBatteryTheme ? localStyles.lowBatteryMutedText : null, listTab === 'LAST_WEEK' && localStyles.tabTextActive]}>
+                <Text style={[
+                  localStyles.tabText,
+                  isLowBatteryTheme ? localStyles.lowBatteryMutedText : null,
+                  listTab === 'LAST_WEEK' && localStyles.tabTextActive,
+                  isLowBatteryTheme && listTab === 'LAST_WEEK' ? localStyles.lowBatteryTabTextActive : null,
+                ]}>
                   Last Week
                 </Text>
               </Pressable>
@@ -645,313 +517,197 @@ export function TripScreen({
                 ]}
                 onPress={() => setListTab('OVER_30')}
               >
-                <Text style={[localStyles.tabText, isLowBatteryTheme ? localStyles.lowBatteryMutedText : null, listTab === 'OVER_30' && localStyles.tabTextActive]}>
+                <Text style={[
+                  localStyles.tabText,
+                  isLowBatteryTheme ? localStyles.lowBatteryMutedText : null,
+                  listTab === 'OVER_30' && localStyles.tabTextActive,
+                  isLowBatteryTheme && listTab === 'OVER_30' ? localStyles.lowBatteryTabTextActive : null,
+                ]}>
                   30+ Days
+                </Text>
+              </Pressable>
+              <Pressable
+                style={[
+                  localStyles.tabPill,
+                  isLowBatteryTheme ? localStyles.lowBatterySurface : null,
+                  listTab === 'UNSYNCED' && localStyles.tabPillActive,
+                  isLowBatteryTheme && listTab === 'UNSYNCED' ? localStyles.lowBatteryTabPillActive : null,
+                ]}
+                onPress={() => setListTab('UNSYNCED')}
+              >
+                <Text style={[
+                  localStyles.tabText,
+                  isLowBatteryTheme ? localStyles.lowBatteryMutedText : null,
+                  listTab === 'UNSYNCED' && localStyles.tabTextActive,
+                  isLowBatteryTheme && listTab === 'UNSYNCED' ? localStyles.lowBatteryTabTextActive : null,
+                ]}>
+                  Unsynced
                 </Text>
               </Pressable>
             </View>
 
-            {hasOfflineQueueWork ? (
-              <>
-                <Pressable
-                  style={[
-                    localStyles.unsyncedSummaryCard,
-                    isLowBatteryTheme ? localStyles.lowBatteryWarningSurface : null,
-                    (isRefreshingTripHistory || Boolean(syncingTripId))
-                      ? localStyles.unsyncedSummaryCardDisabled
-                      : null,
-                  ]}
-                  onPress={() => setIsUnsyncedSectionExpanded((current) => !current)}
-                >
-                  <View style={localStyles.unsyncedSummaryIcon}>
-                    <AppIcon name="refresh-cw" size={18} color="#B45309" />
-                  </View>
-                  <View style={localStyles.unsyncedSummaryCopy}>
-                    <Text style={[localStyles.unsyncedSummaryTitle, isLowBatteryTheme ? localStyles.lowBatteryText : null]}>Unsynced trips</Text>
-                    <Text style={[localStyles.unsyncedSummaryText, isLowBatteryTheme ? localStyles.lowBatteryWarningText : null]}>
-                      {queueSummaryText}
-                    </Text>
-                  </View>
-                  <Text style={[localStyles.unsyncedSummaryAction, isLowBatteryTheme ? localStyles.lowBatteryWarningText : null]}>
-                    {isUnsyncedSectionExpanded ? 'Hide trips' : 'View trips'}
-                  </Text>
-                </Pressable>
 
-                {isUnsyncedSectionExpanded ? (
-                <View style={[localStyles.unsyncedPanel, isLowBatteryTheme ? localStyles.lowBatterySurface : null]}>
-                  <View style={localStyles.unsyncedPanelHeader}>
-                    <View style={localStyles.unsyncedPanelTitleWrap}>
-                      <Text style={[localStyles.unsyncedPanelTitle, isLowBatteryTheme ? localStyles.lowBatteryText : null]}>
-                        Unsynced Trips
-                      </Text>
-                      <Text style={[localStyles.unsyncedPanelStatus, isLowBatteryTheme ? localStyles.lowBatteryMutedText : null]} numberOfLines={2}>
-                        {queueStatusText}
-                      </Text>
-                    </View>
-                    <Pressable
-                      style={[localStyles.unsyncedPanelSmallButton, isLowBatteryTheme ? localStyles.lowBatterySurfaceAlt : null]}
-                      onPress={() =>
-                        setSelectedUnsyncedTripIds(
-                          allUnsyncedTripsSelected ? [] : visibleUnsyncedTrips.map((trip) => trip.id),
-                        )
-                      }
-                      disabled={Boolean(syncingTripId) || isDeletingTrips || visibleUnsyncedTrips.length === 0}
-                    >
-                      <Text style={[localStyles.unsyncedPanelSmallButtonText, isLowBatteryTheme ? localStyles.lowBatteryText : null]}>
-                        {allUnsyncedTripsSelected ? 'Clear' : 'Select all'}
-                      </Text>
-                    </Pressable>
-                  </View>
-                  <View style={localStyles.unsyncedActionsRow}>
-                    <Pressable
-                      style={[
-                        localStyles.unsyncedActionButton,
-                        (!onSyncTrip || selectedUnsyncedTripIds.length === 0 || Boolean(syncingTripId) || isRefreshingTripHistory)
-                          ? localStyles.manageTripsButtonDisabled
-                          : null,
-                      ]}
-                      onPress={() => {
-                        void syncSelectedUnsyncedTrips();
-                      }}
-                      disabled={!onSyncTrip || selectedUnsyncedTripIds.length === 0 || Boolean(syncingTripId) || isRefreshingTripHistory}
-                    >
-                      <Text style={localStyles.unsyncedActionButtonText}>
-                        {syncingTripId === '__selected__' ? 'Syncing...' : 'Sync selected'}
-                      </Text>
-                    </Pressable>
-                    <Pressable
-                      style={[
-                        localStyles.unsyncedActionButton,
-                        (!onRefreshTripHistory || Boolean(syncingTripId) || isRefreshingTripHistory)
-                          ? localStyles.manageTripsButtonDisabled
-                          : null,
-                      ]}
-                      onPress={confirmSyncAllTrips}
-                      disabled={!onRefreshTripHistory || Boolean(syncingTripId) || isRefreshingTripHistory}
-                    >
-                      <Text style={localStyles.unsyncedActionButtonText}>
-                        {syncingTripId === '__all__' || isRefreshingTripHistory ? 'Syncing...' : 'Sync all'}
-                      </Text>
-                    </Pressable>
-                    <Pressable
-                      style={[
-                        localStyles.unsyncedActionButton,
-                        localStyles.unsyncedRemoveButton,
-                        (!onDeleteTrip || selectedUnsyncedTripIds.length === 0 || isDeletingTrips)
-                          ? localStyles.manageTripsButtonDisabled
-                          : null,
-                      ]}
-                      onPress={() => confirmRemoveUnsyncedTrips(selectedUnsyncedTripIds)}
-                      disabled={!onDeleteTrip || selectedUnsyncedTripIds.length === 0 || isDeletingTrips}
-                    >
-                      <Text style={[localStyles.unsyncedActionButtonText, localStyles.manageTripsDeleteText]}>
-                        Remove selected
-                      </Text>
-                    </Pressable>
-                  </View>
-
-                  {offlineQueueStatus?.lastError ? (
-                    <View style={[localStyles.unsyncedStatusBox, isLowBatteryTheme ? localStyles.lowBatteryWarningSurface : null]}>
-                      <Text style={[localStyles.unsyncedStatusText, isLowBatteryTheme ? localStyles.lowBatteryWarningText : null]} numberOfLines={3}>
-                        {offlineQueueStatus.lastError}
-                      </Text>
-                    </View>
-                  ) : null}
-
-                  {visibleUnsyncedTrips.length === 0 ? (
-                    <View style={[localStyles.emptySection, isLowBatteryTheme ? localStyles.lowBatterySurfaceAlt : null]}>
-                      <Text style={[localStyles.emptyText, isLowBatteryTheme ? localStyles.lowBatteryMutedText : null]}>
-                        No unsynced trips match this search
-                      </Text>
-                    </View>
-                  ) : (
-                    visibleUnsyncedTrips.map((trip) => (
-                      <Pressable
-                        key={trip.id}
-                        style={[
-                          localStyles.unsyncedTripRow,
-                          isLowBatteryTheme ? localStyles.lowBatterySurfaceAlt : null,
-                          selectedUnsyncedTripIds.includes(trip.id) ? localStyles.tripRowSelected : null,
-                          syncingTripId === trip.id ? localStyles.tripRowSyncing : null,
-                        ]}
-                        onPress={() => toggleUnsyncedTripSelection(trip.id)}
-                      >
-                        <View style={[localStyles.tripSelectControl, selectedUnsyncedTripIds.includes(trip.id) ? localStyles.tripSelectControlActive : null]}>
-                          {selectedUnsyncedTripIds.includes(trip.id) ? (
-                            <AppIcon name="check" size={12} color="#FFFFFF" />
-                          ) : null}
-                        </View>
-                        <View style={localStyles.unsyncedTripCopy}>
-                          <Text style={[localStyles.unsyncedTripTitle, isLowBatteryTheme ? localStyles.lowBatteryText : null]} numberOfLines={1}>
-                            {getPickupLabel(trip)}
-                          </Text>
-                          <Text style={[localStyles.unsyncedTripText, isLowBatteryTheme ? localStyles.lowBatteryMutedText : null]} numberOfLines={1}>
-                            {formatTripDateForCard(trip.tripDate)} - {trip.distance} - {trip.fare}
-                          </Text>
-                        </View>
-                        <View style={localStyles.unsyncedTripActions}>
-                          <Pressable
-                            style={[
-                              localStyles.unsyncedTripAction,
-                              (!onSyncTrip || Boolean(syncingTripId) || isRefreshingTripHistory)
-                                ? localStyles.manageTripsButtonDisabled
-                                : null,
-                            ]}
-                            onPress={() => {
-                              void syncPendingTrip(trip.id);
-                            }}
-                            disabled={!onSyncTrip || Boolean(syncingTripId) || isRefreshingTripHistory}
-                          >
-                            <Text style={localStyles.unsyncedTripActionText}>
-                              {syncingTripId === trip.id ? 'Syncing' : 'Sync'}
-                            </Text>
-                          </Pressable>
-                          <Pressable
-                            style={[
-                              localStyles.unsyncedTripAction,
-                              localStyles.unsyncedTripRemoveAction,
-                              (!onDeleteTrip || isDeletingTrips) ? localStyles.manageTripsButtonDisabled : null,
-                            ]}
-                            onPress={() => confirmRemoveUnsyncedTrips([trip.id])}
-                            disabled={!onDeleteTrip || isDeletingTrips}
-                          >
-                            <Text style={[localStyles.unsyncedTripActionText, localStyles.manageTripsDeleteText]}>
-                              Remove
-                            </Text>
-                          </Pressable>
-                        </View>
-                      </Pressable>
-                    ))
-                  )}
-                </View>
-                ) : null}
-              </>
-            ) : null}
 
             <>
-                <View style={localStyles.orderSection}>
-                  <View style={localStyles.completedSectionHeader}>
-                    <Text style={[localStyles.orderSectionTitle, localStyles.completedSectionTitle, isLowBatteryTheme ? localStyles.lowBatteryText : null]}>
-                      Active Trips
+                {shouldShowUnsyncedTrips && unsyncedOfflineTrips.length > 0 ? (
+                  <View style={localStyles.orderSection}>
+                    <Text style={[localStyles.orderSectionTitle, isLowBatteryTheme ? localStyles.lowBatteryText : null]}>
+                      Unsynced Trips
                     </Text>
-                    <Pressable
-                      style={[
-                        localStyles.manageTripsButton,
-                        isLowBatteryTheme ? localStyles.lowBatterySurface : null,
-                        (!hasManageableTrips || !onDeleteTrip || isDeletingTrips)
-                          ? localStyles.manageTripsButtonDisabled
-                          : null,
-                      ]}
-                      onPress={handleToggleManageTrips}
-                      disabled={!hasManageableTrips || !onDeleteTrip || isDeletingTrips}
-                    >
-                      <Text
+                    {unsyncedOfflineTrips.map((trip) => (
+                      <Pressable
+                        key={trip.id}
                         style={[
-                          localStyles.manageTripsButtonText,
-                          isLowBatteryTheme ? localStyles.lowBatteryText : null,
-                          isManagingTrips ? localStyles.manageTripsButtonTextActive : null,
+                          localStyles.tripRow,
+                          localStyles.unsyncedOfflineTripRow,
+                          isLowBatteryTheme ? localStyles.lowBatteryTripRow : null,
                         ]}
+                        onPress={() => handleTripRowPress(trip)}
                       >
-                        {isManagingTrips ? 'Done' : 'Select'}
-                      </Text>
-                    </Pressable>
+                        <TripCardContent
+                          trip={trip}
+                          isSelected={false}
+                          allowSelection={false}
+                          showSyncPill
+                          showRawGpsMeta
+                        />
+                      </Pressable>
+                    ))}
                   </View>
-                  {isManagingTrips ? (
-                    <View style={localStyles.manageTripsToolbar}>
-                      <Pressable
-                        style={[localStyles.manageTripsToolbarButton, isLowBatteryTheme ? localStyles.lowBatterySurface : null]}
-                        onPress={handleSelectAllVisibleTrips}
-                        disabled={isDeletingTrips}
-                      >
-                        <Text style={[localStyles.manageTripsToolbarText, isLowBatteryTheme ? localStyles.lowBatteryText : null]}>
-                          {allVisibleTripsSelected ? 'Clear' : 'Select all'}
-                        </Text>
-                      </Pressable>
-                      <Pressable
-                        style={[
-                          localStyles.manageTripsToolbarButton,
-                          isLowBatteryTheme ? localStyles.lowBatterySurface : null,
-                          selectedTripCount === 0 || isDeletingTrips ? localStyles.manageTripsButtonDisabled : null,
-                        ]}
-                        onPress={() =>
-                          confirmDeleteTrips(
-                            selectedTripIds,
-                            'Delete selected trips?',
-                            `Delete ${selectedTripCount} selected trip${selectedTripCount === 1 ? '' : 's'}?`,
-                          )
-                        }
-                        disabled={selectedTripCount === 0 || isDeletingTrips}
-                      >
-                        <Text style={[localStyles.manageTripsToolbarText, isLowBatteryTheme ? localStyles.lowBatteryText : null, localStyles.manageTripsDeleteText]}>
-                          Delete selected
-                        </Text>
-                      </Pressable>
-                      <Pressable
-                        style={[
-                          localStyles.manageTripsToolbarButton,
-                          isLowBatteryTheme ? localStyles.lowBatterySurface : null,
-                          tripHistory.length === 0 || isDeletingTrips ? localStyles.manageTripsButtonDisabled : null,
-                        ]}
-                        onPress={() =>
-                          confirmDeleteTrips(
-                            tripHistory.map((trip) => trip.id),
-                            'Delete all trips?',
-                            'Delete every trip from your history?',
-                          )
-                        }
-                        disabled={tripHistory.length === 0 || isDeletingTrips}
-                      >
-                        <Text style={[localStyles.manageTripsToolbarText, isLowBatteryTheme ? localStyles.lowBatteryText : null, localStyles.manageTripsDeleteText]}>
-                          Delete all
-                        </Text>
-                      </Pressable>
-                    </View>
-                  ) : null}
-                  {activeTripHistory.length === 0 ? (
-                    <View style={[localStyles.emptySection, isLowBatteryTheme ? localStyles.lowBatterySurface : null]}>
-                      <Text style={[localStyles.emptyText, isLowBatteryTheme ? localStyles.lowBatteryMutedText : null]}>No trips from today in this section</Text>
-                    </View>
-                  ) : (
-                    activeTripHistory.map((trip) => (
-                      <Pressable
-                        key={trip.id}
-                        style={[
-                          localStyles.tripRow,
-                          isLowBatteryTheme ? localStyles.lowBatteryTripRow : null,
-                          isManagingTrips && selectedTripIds.includes(trip.id) ? localStyles.tripRowSelected : null,
-                          syncingTripId === trip.id ? localStyles.tripRowSyncing : null,
-                        ]}
-                        onPress={() => handleTripRowPress(trip)}
-                      >
-                        <TripCardContent trip={trip} isSelected={selectedTripIds.includes(trip.id)} />
-                      </Pressable>
-                    ))
-                  )}
-                </View>
+                ) : null}
+                {listTab === 'UNSYNCED' && unsyncedOfflineTrips.length === 0 ? (
+                  <View style={[localStyles.emptySection, isLowBatteryTheme ? localStyles.lowBatterySurfaceAlt : null]}>
+                    <Text style={[localStyles.emptyText, isLowBatteryTheme ? localStyles.lowBatteryMutedText : null]}>
+                      No unsynced trips
+                    </Text>
+                  </View>
+                ) : null}
 
-                <View style={localStyles.orderSection}>
-                  <Text style={[localStyles.orderSectionTitle, isLowBatteryTheme ? localStyles.lowBatteryText : null]}>Past Trips</Text>
-                  {pastTripHistory.length === 0 ? (
-                    <View style={[localStyles.emptySection, isLowBatteryTheme ? localStyles.lowBatterySurface : null]}>
-                      <Text style={[localStyles.emptyText, isLowBatteryTheme ? localStyles.lowBatteryMutedText : null]}>No trips from yesterday or earlier in this section</Text>
+                {shouldShowSyncedTrips ? (
+                  <>
+                    <View style={localStyles.orderSection}>
+                      <View style={localStyles.completedSectionHeader}>
+                        <Text style={[localStyles.orderSectionTitle, localStyles.completedSectionTitle, isLowBatteryTheme ? localStyles.lowBatteryText : null]}>
+                          Today's Trip
+                        </Text>
+                        <Pressable
+                          style={[
+                            localStyles.manageTripsButton,
+                            isLowBatteryTheme ? localStyles.lowBatterySurface : null,
+                            (!hasManageableTrips || !onDeleteTrip || isDeletingTrips)
+                              ? localStyles.manageTripsButtonDisabled
+                              : null,
+                          ]}
+                          onPress={handleToggleManageTrips}
+                          disabled={!hasManageableTrips || !onDeleteTrip || isDeletingTrips}
+                        >
+                          <Text
+                            style={[
+                              localStyles.manageTripsButtonText,
+                              isLowBatteryTheme ? localStyles.lowBatteryText : null,
+                              isManagingTrips ? localStyles.manageTripsButtonTextActive : null,
+                            ]}
+                          >
+                            {isManagingTrips ? 'Done' : 'Select'}
+                          </Text>
+                        </Pressable>
+                      </View>
+                      {isManagingTrips ? (
+                        <View style={localStyles.manageTripsToolbar}>
+                          <Pressable
+                            style={[localStyles.manageTripsToolbarButton, isLowBatteryTheme ? localStyles.lowBatterySurface : null]}
+                            onPress={handleSelectAllVisibleTrips}
+                            disabled={isDeletingTrips}
+                          >
+                            <Text style={[localStyles.manageTripsToolbarText, isLowBatteryTheme ? localStyles.lowBatteryText : null]}>
+                              {allVisibleTripsSelected ? 'Clear' : 'Select all'}
+                            </Text>
+                          </Pressable>
+                          <Pressable
+                            style={[
+                              localStyles.manageTripsToolbarButton,
+                              isLowBatteryTheme ? localStyles.lowBatterySurface : null,
+                              selectedTripCount === 0 || isDeletingTrips ? localStyles.manageTripsButtonDisabled : null,
+                            ]}
+                            onPress={() =>
+                              confirmDeleteTrips(
+                                selectedTripIds,
+                                'Delete selected trips?',
+                                `Delete ${selectedTripCount} selected trip${selectedTripCount === 1 ? '' : 's'}?`,
+                              )
+                            }
+                            disabled={selectedTripCount === 0 || isDeletingTrips}
+                          >
+                            <Text style={[localStyles.manageTripsToolbarText, isLowBatteryTheme ? localStyles.lowBatteryText : null, localStyles.manageTripsDeleteText]}>
+                              Delete selected
+                            </Text>
+                          </Pressable>
+                          <Pressable
+                            style={[
+                              localStyles.manageTripsToolbarButton,
+                              isLowBatteryTheme ? localStyles.lowBatterySurface : null,
+                              manageableTripIds.length === 0 || isDeletingTrips ? localStyles.manageTripsButtonDisabled : null,
+                            ]}
+                            onPress={() =>
+                              confirmDeleteTrips(
+                                manageableTripIds,
+                                'Delete all trips?',
+                                'Delete every synced trip currently shown?',
+                              )
+                            }
+                            disabled={manageableTripIds.length === 0 || isDeletingTrips}
+                          >
+                            <Text style={[localStyles.manageTripsToolbarText, isLowBatteryTheme ? localStyles.lowBatteryText : null, localStyles.manageTripsDeleteText]}>
+                              Delete all
+                            </Text>
+                          </Pressable>
+                        </View>
+                      ) : null}
+                      {activeTripHistory.length === 0 ? (
+                        <View style={[localStyles.emptySection, isLowBatteryTheme ? localStyles.lowBatterySurface : null]}>
+                          <Text style={[localStyles.emptyText, isLowBatteryTheme ? localStyles.lowBatteryMutedText : null]}>No trips from today in this section</Text>
+                        </View>
+                      ) : (
+                        activeTripHistory.map((trip) => (
+                          <Pressable
+                            key={trip.id}
+                            style={[
+                              localStyles.tripRow,
+                              isLowBatteryTheme ? localStyles.lowBatteryTripRow : null,
+                              isManagingTrips && selectedTripIds.includes(trip.id) ? localStyles.tripRowSelected : null,
+                            ]}
+                            onPress={() => handleTripRowPress(trip)}
+                          >
+                            <TripCardContent trip={trip} isSelected={selectedTripIds.includes(trip.id)} />
+                          </Pressable>
+                        ))
+                      )}
                     </View>
-                  ) : (
-                    pastTripHistory.map((trip) => (
-                      <Pressable
-                        key={trip.id}
-                        style={[
-                          localStyles.tripRow,
-                          isLowBatteryTheme ? localStyles.lowBatteryTripRow : null,
-                          isManagingTrips && selectedTripIds.includes(trip.id) ? localStyles.tripRowSelected : null,
-                          syncingTripId === trip.id ? localStyles.tripRowSyncing : null,
-                        ]}
-                        onPress={() => handleTripRowPress(trip)}
-                      >
-                        <TripCardContent trip={trip} isSelected={selectedTripIds.includes(trip.id)} />
-                      </Pressable>
-                    ))
-                  )}
-                </View>
+
+                    <View style={localStyles.orderSection}>
+                      <Text style={[localStyles.orderSectionTitle, isLowBatteryTheme ? localStyles.lowBatteryText : null]}>Past Trips</Text>
+                      {pastTripHistory.length === 0 ? (
+                        <View style={[localStyles.emptySection, isLowBatteryTheme ? localStyles.lowBatterySurface : null]}>
+                          <Text style={[localStyles.emptyText, isLowBatteryTheme ? localStyles.lowBatteryMutedText : null]}>No trips from yesterday or earlier in this section</Text>
+                        </View>
+                      ) : (
+                        pastTripHistory.map((trip) => (
+                          <Pressable
+                            key={trip.id}
+                            style={[
+                              localStyles.tripRow,
+                              isLowBatteryTheme ? localStyles.lowBatteryTripRow : null,
+                              isManagingTrips && selectedTripIds.includes(trip.id) ? localStyles.tripRowSelected : null,
+                            ]}
+                            onPress={() => handleTripRowPress(trip)}
+                          >
+                            <TripCardContent trip={trip} isSelected={selectedTripIds.includes(trip.id)} />
+                          </Pressable>
+                        ))
+                      )}
+                    </View>
+                  </>
+                ) : null}
               </>
           </ScrollView>
         )}
@@ -969,10 +725,45 @@ export function TripScreen({
     </View>
   );
 
-  function TripCardContent({ trip, isSelected }: { trip: TripHistoryItem; isSelected: boolean }) {
+  function TripCardContent({
+    trip,
+    isSelected,
+    allowSelection = true,
+    showSyncPill = false,
+    showRawGpsMeta = false,
+  }: {
+    trip: TripHistoryItem;
+    isSelected: boolean;
+    allowSelection?: boolean;
+    showSyncPill?: boolean;
+    showRawGpsMeta?: boolean;
+  }) {
+    const rawGpsCount = Math.max(
+      Number.isFinite(trip.rawGpsPointCount) ? trip.rawGpsPointCount : 0,
+      trip.rawTelemetry.length,
+    );
+    const syncLabel =
+      trip.offlineSyncStatus === 'syncing'
+        ? 'Syncing'
+        : trip.offlineSyncStatus === 'failed'
+          ? 'Failed'
+          : trip.syncStatus === 'SYNC_PENDING'
+            ? 'Unsynced'
+            : 'Synced';
+    const statusLabel =
+      trip.syncStatus === 'SYNCED'
+        ? 'Completed'
+        : trip.offlineSyncStatus === 'syncing'
+          ? 'Syncing'
+          : trip.offlineSyncStatus === 'failed'
+            ? 'Unsynced'
+            : trip.offlineSegmentsCount > 0
+              ? 'Offline'
+              : 'Unsynced';
+
     return (
       <View style={localStyles.tripRowInner}>
-        {isManagingTrips ? (
+        {isManagingTrips && allowSelection ? (
           <View style={[localStyles.tripSelectControl, isSelected ? localStyles.tripSelectControlActive : null]}>
             {isSelected ? <AppIcon name="check" size={12} color="#FFFFFF" /> : null}
           </View>
@@ -1018,43 +809,37 @@ export function TripScreen({
           <View style={[localStyles.tripOrderFooter, isLowBatteryTheme ? localStyles.lowBatteryTripOrderFooter : null]}>
             <View style={localStyles.tripFooterCopy}>
               <Text style={[localStyles.tripRowMetaText, isLowBatteryTheme ? localStyles.lowBatteryMutedText : null]} numberOfLines={1}>
-                {formatTripDateForCard(trip.tripDate)} - {trip.duration}
+                {formatTripDateForCard(trip)} - {trip.duration}
+                {showRawGpsMeta ? ` - Saved locally (${rawGpsCount} point${rawGpsCount === 1 ? '' : 's'})` : ''}
               </Text>
-              <View style={[
-                localStyles.routeSourcePill,
-                isLowBatteryTheme ? localStyles.lowBatteryPill : null,
-                isOsrmRoute(trip) ? localStyles.routeSourcePillOsrm : null,
-              ]}>
-                <Text
+              {showSyncPill ? (
+                <View
                   style={[
-                    localStyles.routeSourcePillText,
-                    isLowBatteryTheme ? localStyles.lowBatteryMutedText : null,
-                    isOsrmRoute(trip) ? localStyles.routeSourcePillTextOsrm : null,
-                  ]}
-                  numberOfLines={1}
-                >
-                  {getRouteSourceLabel(trip)}
-                </Text>
-              </View>
-              <View
-                style={[
-                  localStyles.tripSyncPill,
-                  isLowBatteryTheme ? localStyles.lowBatteryPill : null,
-                  trip.syncStatus === 'SYNC_PENDING' ? localStyles.tripSyncPillPending : null,
-                ]}
-              >
-                <Text
-                  style={[
-                    localStyles.tripSyncPillText,
-                    trip.syncStatus === 'SYNC_PENDING' ? localStyles.tripSyncPillTextPending : null,
+                    localStyles.tripSyncPill,
+                    isLowBatteryTheme ? localStyles.lowBatteryPill : null,
+                    trip.syncStatus === 'SYNC_PENDING' ? localStyles.tripSyncPillPending : null,
                   ]}
                 >
-                  {trip.syncStatus === 'SYNC_PENDING' ? 'Unsynced' : 'Synced'}
+                  <Text
+                    style={[
+                      localStyles.tripSyncPillText,
+                      trip.syncStatus === 'SYNC_PENDING' ? localStyles.tripSyncPillTextPending : null,
+                    ]}
+                  >
+                  {syncLabel}
                 </Text>
               </View>
-            </View>
+            ) : null}
+            {trip.status === 'COMPLETED' ? (
+              <View style={[localStyles.tripCompletedRoutePill, isLowBatteryTheme ? localStyles.lowBatteryPill : null]}>
+                <Text style={[localStyles.tripCompletedRoutePillText, isLowBatteryTheme ? localStyles.lowBatteryMutedText : null]}>
+                  {statusLabel}
+                </Text>
+              </View>
+            ) : null}
           </View>
         </View>
+      </View>
       </View>
     );
   }
@@ -1100,6 +885,9 @@ const localStyles = StyleSheet.create({
   lowBatteryTabPillActive: {
     backgroundColor: 'rgba(87,199,168,0.16)',
     borderColor: 'rgba(87,199,168,0.32)',
+  },
+  lowBatteryTabTextActive: {
+    color: '#F4D24E',
   },
   lowBatteryTripRow: {
     backgroundColor: '#2A303B',
@@ -1265,193 +1053,9 @@ const localStyles = StyleSheet.create({
   orderSection: {
     marginBottom: 12,
   },
-  unsyncedSummaryCard: {
-    width: '100%',
-    minHeight: 76,
-    borderRadius: 8,
-    borderWidth: 1,
+  unsyncedOfflineTripRow: {
     borderColor: '#FED7AA',
-    backgroundColor: '#FFF7ED',
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    marginBottom: 14,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-  },
-  unsyncedSummaryCardDisabled: {
-    opacity: 0.55,
-  },
-  unsyncedSummaryIcon: {
-    width: 38,
-    height: 38,
-    borderRadius: 8,
-    backgroundColor: '#FFEDD5',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  unsyncedSummaryCopy: {
-    flex: 1,
-    minWidth: 0,
-  },
-  unsyncedSummaryTitle: {
-    fontSize: 15,
-    lineHeight: 18,
-    color: '#0F172A',
-    fontFamily: 'CircularStdMedium500',
-  },
-  unsyncedSummaryText: {
-    marginTop: 3,
-    fontSize: 12,
-    lineHeight: 15,
-    color: '#9A3412',
-    fontFamily: 'CircularStdMedium500',
-  },
-  unsyncedSummaryAction: {
-    fontSize: 12,
-    lineHeight: 15,
-    color: '#B45309',
-    fontFamily: 'CircularStdMedium500',
-  },
-  unsyncedPanel: {
-    marginTop: -6,
-    marginBottom: 14,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#FED7AA',
-    backgroundColor: '#FFFFFF',
-    paddingHorizontal: 12,
-    paddingVertical: 12,
-  },
-  unsyncedPanelHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 10,
-    marginBottom: 10,
-  },
-  unsyncedPanelTitleWrap: {
-    flex: 1,
-    minWidth: 0,
-  },
-  unsyncedPanelTitle: {
-    fontSize: 14,
-    lineHeight: 17,
-    color: '#0F172A',
-    fontFamily: 'CircularStdMedium500',
-  },
-  unsyncedPanelStatus: {
-    marginTop: 3,
-    fontSize: 11,
-    lineHeight: 14,
-    color: '#64748B',
-    fontFamily: 'CircularStdMedium500',
-  },
-  unsyncedPanelSmallButton: {
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#E2E8F0',
-    paddingHorizontal: 9,
-    paddingVertical: 6,
-  },
-  unsyncedPanelSmallButtonText: {
-    fontSize: 11,
-    lineHeight: 13,
-    color: '#334155',
-    fontFamily: 'CircularStdMedium500',
-  },
-  unsyncedActionsRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-    marginBottom: 10,
-  },
-  unsyncedStatusBox: {
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#FED7AA',
-    backgroundColor: '#FFF7ED',
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    marginBottom: 8,
-  },
-  unsyncedStatusText: {
-    fontSize: 11,
-    lineHeight: 14,
-    color: '#9A3412',
-    fontFamily: 'CircularStdMedium500',
-  },
-  unsyncedActionButton: {
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#BAE6FD',
-    backgroundColor: '#F0F9FF',
-    paddingHorizontal: 10,
-    paddingVertical: 7,
-  },
-  unsyncedRemoveButton: {
-    borderColor: '#FECACA',
-    backgroundColor: '#FFF1F2',
-  },
-  unsyncedActionButtonText: {
-    fontSize: 11,
-    lineHeight: 13,
-    color: '#075985',
-    fontFamily: 'CircularStdMedium500',
-  },
-  unsyncedTripRow: {
-    minHeight: 66,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#E8EDF3',
-    backgroundColor: '#FFFFFF',
-    paddingHorizontal: 10,
-    paddingVertical: 10,
-    marginTop: 8,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-  },
-  unsyncedTripCopy: {
-    flex: 1,
-    minWidth: 0,
-  },
-  unsyncedTripTitle: {
-    fontSize: 13,
-    lineHeight: 16,
-    color: '#0F172A',
-    fontFamily: 'CircularStdMedium500',
-  },
-  unsyncedTripText: {
-    marginTop: 4,
-    fontSize: 11,
-    lineHeight: 13,
-    color: '#64748B',
-    fontFamily: 'CircularStdMedium500',
-  },
-  unsyncedTripActions: {
-    alignItems: 'flex-end',
-    gap: 6,
-  },
-  unsyncedTripAction: {
-    minWidth: 62,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#BAE6FD',
-    backgroundColor: '#F0F9FF',
-    paddingHorizontal: 8,
-    paddingVertical: 5,
-    alignItems: 'center',
-  },
-  unsyncedTripRemoveAction: {
-    borderColor: '#FECACA',
-    backgroundColor: '#FFF1F2',
-  },
-  unsyncedTripActionText: {
-    fontSize: 10,
-    lineHeight: 12,
-    color: '#075985',
-    fontFamily: 'CircularStdMedium500',
+    backgroundColor: '#FFFBF5',
   },
   orderSectionTitle: {
     marginBottom: 8,
@@ -1537,9 +1141,6 @@ const localStyles = StyleSheet.create({
   tripRowSelected: {
     borderColor: '#FCA5A5',
     backgroundColor: '#FFFBFB',
-  },
-  tripRowSyncing: {
-    opacity: 0.62,
   },
   tripRowInner: {
     flexDirection: 'row',
@@ -1711,6 +1312,20 @@ const localStyles = StyleSheet.create({
   },
   routeSourcePillTextOsrm: {
     color: '#0369A1',
+  },
+  tripCompletedRoutePill: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#BBF7D0',
+    backgroundColor: '#ECFDF5',
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+  },
+  tripCompletedRoutePillText: {
+    fontSize: 9,
+    lineHeight: 11,
+    color: '#047857',
+    fontFamily: 'CircularStdMedium500',
   },
   tripSyncPill: {
     borderRadius: 8,
@@ -2413,33 +2028,6 @@ const localStyles = StyleSheet.create({
     fontSize: 11,
     lineHeight: 14,
     fontFamily: 'CircularStdMedium500',
-  },
-  syncPendingButton: {
-    marginTop: -2,
-    marginBottom: 14,
-    alignSelf: 'flex-start',
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: 'rgba(54, 228, 247, 0.34)',
-    backgroundColor: 'rgba(2, 132, 199, 0.18)',
-    paddingHorizontal: 12,
-    paddingVertical: 9,
-  },
-  syncPendingButtonDisabled: {
-    borderColor: '#E2E8F0',
-    backgroundColor: '#F8FAFC',
-  },
-  syncPendingButtonText: {
-    fontSize: 12,
-    lineHeight: 15,
-    color: '#36E4F7',
-    fontFamily: 'CircularStdMedium500',
-  },
-  syncPendingButtonTextDisabled: {
-    color: '#94A3B8',
   },
   primaryStatsRow: {
     flexDirection: 'row',

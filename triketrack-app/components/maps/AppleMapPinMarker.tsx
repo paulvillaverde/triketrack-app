@@ -5,7 +5,7 @@ type AppleMapPinMarkerProps = {
   color?: string;
   iconName?: AppIconName;
   iconColor?: string;
-  size?: 'sm' | 'md';
+  size?: 'sm' | 'md' | 'lg';
 };
 
 const SIZE_MAP = {
@@ -29,6 +29,16 @@ const SIZE_MAP = {
     iconWrap: 20,
     border: 2,
   },
+  lg: {
+    width: 52,
+    height: 70,
+    head: 46,
+    pointerHeight: 16,
+    dot: 8,
+    icon: 18,
+    iconWrap: 27,
+    border: 2.5,
+  },
 } as const;
 
 export function AppleMapPinMarker({
@@ -49,6 +59,8 @@ export function AppleMapPinMarker({
         },
       ]}
       renderToHardwareTextureAndroid
+      needsOffscreenAlphaCompositing
+      collapsable={false}
     >
       <View
         style={[
@@ -72,6 +84,7 @@ export function AppleMapPinMarker({
             backgroundColor: color,
           },
         ]}
+        collapsable={false}
       >
         <View
           style={[
@@ -174,6 +187,7 @@ const styles = StyleSheet.create({
     transform: [{ scaleX: 1.12 }],
   },
   pinBody: {
+    zIndex: 3,
     borderColor: 'rgba(255,255,255,0.96)',
     alignItems: 'center',
     justifyContent: 'flex-start',
@@ -224,6 +238,7 @@ const styles = StyleSheet.create({
   },
   pointerTip: {
     position: 'absolute',
+    zIndex: 2,
     transform: [{ rotate: '45deg' }],
     borderBottomRightRadius: 8,
     shadowColor: '#0F172A',
@@ -234,6 +249,7 @@ const styles = StyleSheet.create({
   },
   bottomDot: {
     position: 'absolute',
+    zIndex: 4,
     shadowColor: '#0F172A',
     shadowOpacity: 0.14,
     shadowRadius: 4,

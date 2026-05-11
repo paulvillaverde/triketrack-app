@@ -375,16 +375,6 @@ export async function attachServerTripIdToOfflineTrip(localTripId: string, serve
   });
 }
 
-export async function getUnsyncedOfflineTripPoints(limit = 500) {
-  return sortByRecordedAtAsc(loadState().points.filter((point) => point.synced === 0)).slice(0, limit);
-}
-
-export async function getUnsyncedOfflineMatchedTripPoints(limit = 500) {
-  return sortByRecordedAtAsc(
-    loadState().matchedPoints.filter((point) => point.synced === 0),
-  ).slice(0, limit);
-}
-
 export async function markOfflineTripPointsSynced(ids: number[]) {
   if (ids.length === 0) {
     return;
