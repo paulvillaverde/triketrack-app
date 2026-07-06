@@ -45,6 +45,7 @@ const OPENROUTESERVICE_DIRECTIONS_MAX_POINTS = 50;
 const TRACE_MATCH_MAX_POINT_OFFSET_KM = 0.055;
 const TRACE_MATCH_AVG_POINT_OFFSET_KM = 0.028;
 const TRACE_MATCH_MIN_DISTANCE_RATIO = 0.92;
+const OSRM_REQUEST_TIMEOUT_MS = 7000;
 
 export const dedupeSequentialPoints = <T extends LatLngPoint>(points: T[]) => {
   if (points.length <= 1) {
@@ -777,6 +778,29 @@ const buildOsrmCoordinateString = (points: LatLngPoint[]) =>
     .map((point) => `${point.longitude.toFixed(6)},${point.latitude.toFixed(6)}`)
     .join(';');
 
+const fetchOsrmJson = async <T>(url: string): Promise<T | null> => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), OSRM_REQUEST_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Accept: 'application/json',
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      return null;
+    }
+
+    return (await response.json()) as T;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
 const buildOsrmTimestamps = (points: RoadPathTelemetryPointInput[]) => {
   const timestamps = points
     .map((point) => {
@@ -821,6 +845,75 @@ const buildOsrmRadiuses = (points: RoadPathTelemetryPointInput[]) =>
     )
     .join(';');
 
+const buildOsrmWideRadiuses = (points: RoadPathTelemetryPointInput[]) =>
+  points.map(() => '100').join(';');
+
+const buildMergedOsrmMatchPath = async (
+  matchings?: OsrmRoute[] | null,
+  options: { forceRemote?: boolean } = {},
+) => {
+  const matchingPaths = (matchings ?? [])
+    .map((matching) => mapCoordinatePairsToPoints(matching.geometry?.coordinates ?? null))
+    .filter((path) => path.length >= 2);
+  const merged: LatLngPoint[] = [];
+
+  for (const path of matchingPaths) {
+    if (merged.length === 0) {
+      merged.push(...path);
+      continue;
+    }
+
+    const previousEnd = merged[merged.length - 1];
+    const nextStart = path[0];
+    const joinDistanceKm = polylineDistanceKm([previousEnd, nextStart]);
+    if (joinDistanceKm > 0.006) {
+      const connector = await fetchOsrmRoutedRoadPathDetailed([previousEnd, nextStart], options);
+      if (connector.path && connector.path.length >= 2) {
+        merged.push(...connector.path.slice(1));
+      } else {
+        merged.push(nextStart);
+      }
+    }
+
+    merged.push(...path.slice(1));
+  }
+
+  return dedupeSequentialPoints(merged);
+};
+
+const buildMergedOsrmMatchMetadata = ({
+  matchings,
+  inputPointCount,
+  path,
+}: {
+  matchings?: OsrmRoute[] | null;
+  inputPointCount: number;
+  path: LatLngPoint[];
+}) => {
+  const availableMatchings = matchings ?? [];
+  const confidenceValues = availableMatchings
+    .map((matching) => matching.confidence)
+    .filter((confidence): confidence is number => typeof confidence === 'number' && Number.isFinite(confidence));
+  const confidence =
+    confidenceValues.length > 0
+      ? confidenceValues.reduce((sum, value) => sum + value, 0) / confidenceValues.length
+      : inputPointCount >= 2
+        ? Math.min(1, path.length / Math.max(inputPointCount, 1))
+        : null;
+
+  return buildRoadPathMatchMetadata({
+    provider: 'osrm-match',
+    inputPointCount,
+    path,
+    confidence,
+    roadNames: availableMatchings.flatMap((matching) => extractOsrmRoadNames(matching)),
+    distanceMeters:
+      availableMatchings.reduce((sum, matching) => sum + (matching.distance ?? 0), 0) || null,
+    durationSeconds:
+      availableMatchings.reduce((sum, matching) => sum + (matching.duration ?? 0), 0) || null,
+  });
+};
+
 export const fetchOsrmMatchedRoadPathDetailed = async (
   points: RoadPathTelemetryPointInput[],
   options: { forceRemote?: boolean } = {},
@@ -837,75 +930,81 @@ export const fetchOsrmMatchedRoadPathDetailed = async (
     return { path: null, metadata: null };
   }
 
-  try {
-    const timestamps = buildOsrmTimestamps(cleanPoints);
-    const queryParams = [
-      'geometries=geojson',
-      'overview=full',
-      'steps=true',
-      `radiuses=${encodeURIComponent(buildOsrmRadiuses(cleanPoints))}`,
-    ];
-    if (timestamps) {
-      queryParams.push(`timestamps=${encodeURIComponent(timestamps)}`);
-    }
+  const timestamps = buildOsrmTimestamps(cleanPoints);
+  const requestVariants = [
+    {
+      radiuses: buildOsrmRadiuses(cleanPoints),
+      timestamps,
+    },
+    {
+      radiuses: buildOsrmWideRadiuses(cleanPoints),
+      timestamps,
+    },
+    {
+      radiuses: buildOsrmWideRadiuses(cleanPoints),
+      timestamps: null,
+    },
+    {
+      radiuses: null,
+      timestamps: null,
+    },
+  ];
 
-    const response = await fetch(
-      `${OSRM_API_BASE_URL}/match/v1/${encodeURIComponent(OSRM_PROFILE)}/${buildOsrmCoordinateString(
-        cleanPoints,
-      )}?${queryParams.join('&')}`,
-      {
-        headers: {
-          Accept: 'application/json',
-        },
-      },
-    );
-    if (!response.ok) {
-      return { path: null, metadata: null };
-    }
+  for (const variant of requestVariants) {
+    try {
+      const queryParams = [
+        'geometries=geojson',
+        'overview=full',
+        'steps=true',
+      ];
+      if (variant.radiuses) {
+        queryParams.push(`radiuses=${encodeURIComponent(variant.radiuses)}`);
+      }
+      if (variant.timestamps) {
+        queryParams.push(`timestamps=${encodeURIComponent(variant.timestamps)}`);
+      }
 
-    const json = (await response.json()) as {
-      code?: string;
-      matchings?: OsrmRoute[];
-    };
-    if (json.code && json.code !== 'Ok') {
-      return { path: null, metadata: null };
-    }
+      const json = await fetchOsrmJson<{
+        code?: string;
+        matchings?: OsrmRoute[];
+      }>(
+        `${OSRM_API_BASE_URL}/match/v1/${encodeURIComponent(OSRM_PROFILE)}/${buildOsrmCoordinateString(
+          cleanPoints,
+        )}?${queryParams.join('&')}`,
+      );
+      if (!json || (json.code && json.code !== 'Ok')) {
+        continue;
+      }
 
-    const matchedRoute = json.matchings?.[0] ?? null;
-    const path = mapCoordinatePairsToPoints(matchedRoute?.geometry?.coordinates ?? null);
-    if (path.length < 2) {
-      return { path: null, metadata: null };
-    }
-    if (!matchedPathFollowsTrace({ trace: cleanPoints, matchedPath: path })) {
-      return { path: null, metadata: null };
-    }
+      const path = await buildMergedOsrmMatchPath(json.matchings, options);
+      if (path.length < 2) {
+        continue;
+      }
+      if (!matchedPathFollowsTrace({ trace: cleanPoints, matchedPath: path })) {
+        continue;
+      }
 
-    return {
-      path,
-      metadata: buildRoadPathMatchMetadata({
-        provider: 'osrm-match',
-        inputPointCount: cleanPoints.length,
+      return {
         path,
-        confidence:
-          typeof matchedRoute?.confidence === 'number' && Number.isFinite(matchedRoute.confidence)
-            ? matchedRoute.confidence
-            : cleanPoints.length >= 2
-              ? Math.min(1, path.length / Math.max(cleanPoints.length, 1))
-              : null,
-        roadNames: extractOsrmRoadNames(matchedRoute),
-        distanceMeters: matchedRoute?.distance ?? null,
-        durationSeconds: matchedRoute?.duration ?? null,
-      }),
-    };
-  } catch {
-    return { path: null, metadata: null };
+        metadata: buildMergedOsrmMatchMetadata({
+          matchings: json.matchings,
+          inputPointCount: cleanPoints.length,
+          path,
+        }),
+      };
+    } catch {
+      continue;
+    }
   }
+
+  return { path: null, metadata: null };
 };
 
 export const fetchOsrmRoutedRoadPathDetailed = async (
   points: LatLngPoint[],
+  options: { forceRemote?: boolean } = {},
 ): Promise<RoadPathMatchResult> => {
-  if (!REMOTE_ROAD_SNAPPING_ENABLED || !OSRM_API_BASE_URL) {
+  if ((!REMOTE_ROAD_SNAPPING_ENABLED && !options.forceRemote) || !OSRM_API_BASE_URL) {
     return { path: null, metadata: null };
   }
 
@@ -920,25 +1019,15 @@ export const fetchOsrmRoutedRoadPathDetailed = async (
       'overview=full',
       'steps=true',
     ];
-    const response = await fetch(
+    const json = await fetchOsrmJson<{
+      code?: string;
+      routes?: OsrmRoute[];
+    }>(
       `${OSRM_API_BASE_URL}/route/v1/${encodeURIComponent(OSRM_PROFILE)}/${buildOsrmCoordinateString(
         cleanPoints,
       )}?${queryParams.join('&')}`,
-      {
-        headers: {
-          Accept: 'application/json',
-        },
-      },
     );
-    if (!response.ok) {
-      return { path: null, metadata: null };
-    }
-
-    const json = (await response.json()) as {
-      code?: string;
-      routes?: OsrmRoute[];
-    };
-    if (json.code && json.code !== 'Ok') {
+    if (!json || (json.code && json.code !== 'Ok')) {
       return { path: null, metadata: null };
     }
 

@@ -11,7 +11,13 @@ import {
 } from '../components/maps/osmTheme';
 import { BottomTab, HomeNavigationCard } from '../components/navigation/HomeNavigationCard';
 import { AppIcon, Avatar } from '../components/ui';
-import { submitViolationAppeal, uploadViolationProof, type ViolationAppealRecord, type ViolationProofRecord } from '../supabase';
+import {
+  submitViolationAppeal,
+  uploadViolationProof,
+  type ViolationAppealRecord,
+  type ViolationProofRecord,
+  type ViolationRecord,
+} from '../supabase';
 import {
   MAXIM_UI_BG_DARK,
   MAXIM_UI_BORDER_DARK,
@@ -53,7 +59,7 @@ export type ViolationItem = {
   id: string;
   driverId?: number;
   tripId?: number | null;
-  type?: 'GEOFENCE_BOUNDARY' | 'ROUTE_DEVIATION' | 'UNAUTHORIZED_STOP';
+  type?: ViolationRecord['type'];
   title: string;
   date: string;
   occurredAt?: string;
@@ -71,6 +77,11 @@ const formatViolationType = (type?: ViolationItem['type']) => {
   if (type === 'GEOFENCE_BOUNDARY') return 'Geofence Boundary';
   if (type === 'ROUTE_DEVIATION') return 'Route Deviation';
   if (type === 'UNAUTHORIZED_STOP') return 'Unauthorized Stop';
+  if (type === 'GPS_SILENCE') return 'GPS Updates Paused';
+  if (type === 'LONG_STOP') return 'Long Stop';
+  if (type === 'TRIP_TIMEOUT') return 'Trip Timeout';
+  if (type === 'SUSPICIOUS_SPEED') return 'Suspicious Speed';
+  if (type === 'REPEATED_GEOFENCE_BOUNDARY') return 'Repeated Boundary Issues';
   return 'Route Violation';
 };
 

@@ -1,6 +1,7 @@
 import {
   buildDirectionalRoadSnappedPath,
   fetchOsrmMatchedRoadPathDetailed,
+  fetchOsrmRoutedRoadPathDetailed,
   dedupeSequentialPoints,
   type RoadPathMatchMetadata,
   type RoadPathMatchProvider,
@@ -23,7 +24,8 @@ export type RawTripTelemetryPoint = {
 type RouteMatchingService = {
   name:
     | 'local-directional'
-    | 'osrm-match';
+    | 'osrm-match'
+    | 'osrm-route';
   matchPath: (points: LatLngPoint[]) => Promise<{
     path: LatLngPoint[] | null;
     metadata: RoadPathMatchMetadata | null;
@@ -87,6 +89,11 @@ const REMOTE_MATCHING_SERVICES: RouteMatchingService[] = [
   },
 ];
 
+const REMOTE_ROUTING_SERVICE: RouteMatchingService = {
+  name: 'osrm-route',
+  matchPath: fetchOsrmRoutedRoadPathDetailed,
+};
+
 const LOCAL_DIRECTIONAL_MATCHING_SERVICE: RouteMatchingService = {
   name: 'local-directional',
   matchPath: async (points) => {
@@ -111,6 +118,7 @@ const LOCAL_DIRECTIONAL_MATCHING_SERVICE: RouteMatchingService = {
 
 const MATCHING_SERVICES: RouteMatchingService[] = [
   ...REMOTE_MATCHING_SERVICES,
+  REMOTE_ROUTING_SERVICE,
   {
     ...LOCAL_DIRECTIONAL_MATCHING_SERVICE,
   },
@@ -127,6 +135,10 @@ const getMatchingServices = (forceOsrmMatch: boolean): RouteMatchingService[] =>
       matchPath: (points) => fetchOsrmMatchedRoadPathDetailed(points, { forceRemote: true }),
     },
     {
+      name: 'osrm-route',
+      matchPath: (points) => fetchOsrmRoutedRoadPathDetailed(points, { forceRemote: true }),
+    },
+    {
       ...LOCAL_DIRECTIONAL_MATCHING_SERVICE,
     },
   ];
@@ -141,6 +153,10 @@ const getRemoteMatchingServices = (forceOsrmMatch: boolean): RouteMatchingServic
     {
       name: 'osrm-match',
       matchPath: (points) => fetchOsrmMatchedRoadPathDetailed(points, { forceRemote: true }),
+    },
+    {
+      name: 'osrm-route',
+      matchPath: (points) => fetchOsrmRoutedRoadPathDetailed(points, { forceRemote: true }),
     },
   ];
 };
@@ -631,11 +647,162 @@ const sortTelemetry = (points: RawTripTelemetryPoint[]) =>
   [...points].sort((left, right) => {
     const leftTime = new Date(left.recordedAt).getTime();
     const rightTime = new Date(right.recordedAt).getTime();
+    if (!Number.isFinite(leftTime) && !Number.isFinite(rightTime)) {
+      return 0;
+    }
+    if (!Number.isFinite(leftTime)) {
+      return 1;
+    }
+    if (!Number.isFinite(rightTime)) {
+      return -1;
+    }
     return leftTime - rightTime;
   });
 
 const isFinitePoint = (point: RawTripTelemetryPoint) =>
-  Number.isFinite(point.latitude) && Number.isFinite(point.longitude);
+  Number.isFinite(point.latitude) &&
+  Number.isFinite(point.longitude) &&
+  Math.abs(point.latitude) <= 90 &&
+  Math.abs(point.longitude) <= 180;
+
+const optimizeRawTelemetryForMapMatching = (
+  telemetry: RawTripTelemetryPoint[],
+  config: ReconstructionConfig,
+) => {
+  const ordered = sortTelemetry(telemetry).filter(isFinitePoint);
+  if (ordered.length <= 2) {
+    return dedupeSequentialTelemetryPoints(ordered);
+  }
+
+  const maxRawAccuracyMeters = Math.max(config.maxAccuracyMeters, 75);
+  const movementThresholdKm = Math.max(Math.min(config.minMovementKm, 0.004), 0.0025);
+  const compacted: RawTripTelemetryPoint[] = [];
+
+  for (let index = 0; index < ordered.length; index += 1) {
+    const point = ordered[index];
+    const isEndpoint = index === 0 || index === ordered.length - 1;
+    if (
+      !isEndpoint &&
+      typeof point.accuracy === 'number' &&
+      Number.isFinite(point.accuracy) &&
+      point.accuracy > maxRawAccuracyMeters
+    ) {
+      continue;
+    }
+
+    const previous = compacted[compacted.length - 1];
+    if (!previous) {
+      compacted.push(point);
+      continue;
+    }
+
+    const movedKm = distanceBetweenKm(previous, point);
+    const elapsedSeconds = Math.max(
+      (new Date(point.recordedAt).getTime() - new Date(previous.recordedAt).getTime()) / 1000,
+      0,
+    );
+    const effectiveSpeedKmh =
+      typeof point.speed === 'number' && Number.isFinite(point.speed)
+        ? point.speed
+        : elapsedSeconds > 0
+          ? movedKm / (elapsedSeconds / 3600)
+          : 0;
+    const isStationaryJitter =
+      movedKm < movementThresholdKm &&
+      effectiveSpeedKmh <= Math.max(config.stationarySpeedKmh, 4);
+
+    if (isStationaryJitter) {
+      if (isEndpoint) {
+        compacted[compacted.length - 1] = point;
+      }
+      continue;
+    }
+
+    compacted.push(point);
+  }
+
+  const deduped = dedupeSequentialTelemetryPoints(compacted);
+  if (deduped.length <= 2) {
+    return deduped;
+  }
+
+  const keepIndexes = new Set<number>([0, deduped.length - 1]);
+  const shapeToleranceKm = Math.max(Math.min(config.simplificationToleranceKm * 1.35, 0.006), 0.0035);
+  const turnThresholdDeg = 18;
+  const anchorDistanceKm = 0.035;
+  const anchorSeconds = 20;
+  const cumulativeDistanceKm = [0];
+  for (let index = 1; index < deduped.length; index += 1) {
+    cumulativeDistanceKm[index] =
+      cumulativeDistanceKm[index - 1] + distanceBetweenKm(deduped[index - 1], deduped[index]);
+  }
+
+  const visitSegment = (startIndex: number, endIndex: number) => {
+    let maxDistanceKm = 0;
+    let maxDistanceIndex = -1;
+
+    for (let index = startIndex + 1; index < endIndex; index += 1) {
+      const distanceKm = distancePointToSegmentKm(deduped[index], deduped[startIndex], deduped[endIndex]);
+      if (distanceKm > maxDistanceKm) {
+        maxDistanceKm = distanceKm;
+        maxDistanceIndex = index;
+      }
+    }
+
+    if (maxDistanceIndex === -1 || maxDistanceKm < shapeToleranceKm) {
+      return;
+    }
+
+    keepIndexes.add(maxDistanceIndex);
+    visitSegment(startIndex, maxDistanceIndex);
+    visitSegment(maxDistanceIndex, endIndex);
+  };
+
+  visitSegment(0, deduped.length - 1);
+
+  let lastAnchorIndex = 0;
+  for (let index = 1; index < deduped.length - 1; index += 1) {
+    const previous = deduped[index - 1];
+    const current = deduped[index];
+    const next = deduped[index + 1];
+    const angleDeg = turnAngleDeg(previous, current, next);
+    const currentOffsetKm = distancePointToSegmentKm(current, previous, next);
+    const movedSinceAnchorKm = cumulativeDistanceKm[index] - cumulativeDistanceKm[lastAnchorIndex];
+    const anchorElapsedSeconds = Math.max(
+      (new Date(current.recordedAt).getTime() - new Date(deduped[lastAnchorIndex].recordedAt).getTime()) / 1000,
+      0,
+    );
+
+    if (
+      (angleDeg >= turnThresholdDeg && currentOffsetKm >= 0.002) ||
+      movedSinceAnchorKm >= anchorDistanceKm ||
+      anchorElapsedSeconds >= anchorSeconds
+    ) {
+      keepIndexes.add(index);
+      lastAnchorIndex = index;
+    }
+  }
+
+  return deduped.filter((_, index) => keepIndexes.has(index));
+};
+
+const dedupeSequentialTelemetryPoints = (points: RawTripTelemetryPoint[]) => {
+  if (points.length <= 1) {
+    return points;
+  }
+
+  return points.filter((point, index) => {
+    if (index === 0) {
+      return true;
+    }
+
+    const previous = points[index - 1];
+    return (
+      Math.abs(previous.latitude - point.latitude) >= 0.000001 ||
+      Math.abs(previous.longitude - point.longitude) >= 0.000001
+    );
+  });
+};
 
 export const filterAcceptedTripTelemetry = (
   telemetry: RawTripTelemetryPoint[],
@@ -803,7 +970,7 @@ export async function reconstructCompletedTripPath(
 ): Promise<TripPathReconstructionResult> {
   const resolvedConfig = { ...DEFAULT_CONFIG, ...config };
   const acceptedTelemetry = resolvedConfig.useFullRawTrajectory
-    ? sortTelemetry(telemetry).filter(isFinitePoint)
+    ? optimizeRawTelemetryForMapMatching(telemetry, resolvedConfig)
     : filterAcceptedTripTelemetry(telemetry, resolvedConfig);
   const rawAcceptedPath = dedupeSequentialPoints(
     acceptedTelemetry.map((point) => ({

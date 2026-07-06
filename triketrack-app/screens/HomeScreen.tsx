@@ -326,7 +326,7 @@ export function HomeScreen({
   const lastAcceptedSampleRef = useRef<{ point: LatLngPoint; timestampMs: number } | null>(null);
   const acceptedTelemetryRef = useRef<RawTripTelemetryPoint[]>([]);
   const tripStartedAtRef = useRef<string | null>(null);
-  const fareOptions = [10, 20, 30, 40, 50, 60, 70];
+  const fareOptions = [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 105, 110];
   const lastAnimatedMarkerPointRef = useRef<LatLngPoint | null>(null);
   const firstFixStartedAtRef = useRef<number | null>(null);
   const firstFixCapturedRef = useRef(false);

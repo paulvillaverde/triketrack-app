@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.triketrack.driver.twa",
+      "sha256_cert_fingerprints": [
+        "0F:25:F3:00:16:FD:FB:3D:C1:72:76:BE:84:A6:6A:C4:3E:6B:B2:31:60:29:08:0D:3C:DA:7F:8F:FC:D5:8B:D2"
+      ]
+    }
+  }
+]

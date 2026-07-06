@@ -8,6 +8,8 @@
     "ios": "expo run:ios",
     "web": "expo start --web",
     "build:web": "expo export --platform web",
+    "build:twa": "powershell -ExecutionPolicy Bypass -File ./scripts/build-twa.ps1",
+    "deploy:vercel": "vercel --prod",
     "backfill:trip-routes": "node ./scripts/backfill-trip-routes.mjs"
   },
   "dependencies": {
@@ -30,6 +32,7 @@
     "expo-sqlite": "~55.0.15",
     "expo-status-bar": "~55.0.6",
     "expo-updates": "~55.0.21",
+    "maplibre-gl": "^5.24.0",
     "qrcode": "^1.5.4",
     "react": "19.2.0",
     "react-dom": "19.2.0",

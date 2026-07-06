@@ -41,12 +41,14 @@ import {
   listTripsWithRoutePoints,
   replaceTripRouteFallback,
   requestDriverPasswordReset,
+  setDriverPassword,
   setDriverLocationOffline,
   startTrip,
   supabase,
   type DriverProfileRecord,
   type DriverQrStatus,
   type DriverRecord,
+  type ViolationRecord,
   uploadDriverAvatar,
   upsertDriverLocation,
 } from './supabase';
@@ -769,7 +771,7 @@ const mapViolationRecordToItem = (violation: {
   id: string;
   driver_id: number;
   trip_id: number | null;
-  type: 'GEOFENCE_BOUNDARY' | 'ROUTE_DEVIATION' | 'UNAUTHORIZED_STOP';
+  type: ViolationRecord['type'];
   occurred_at: string;
   latitude: number | null;
   longitude: number | null;
@@ -798,7 +800,17 @@ const mapViolationRecordToItem = (violation: {
         ? 'Route Deviation Alert'
         : violation.type === 'UNAUTHORIZED_STOP'
           ? 'Unauthorized Stop'
-          : 'Route Violation';
+          : violation.type === 'GPS_SILENCE'
+            ? 'GPS Updates Paused'
+            : violation.type === 'LONG_STOP'
+              ? 'Long Stop During Trip'
+              : violation.type === 'TRIP_TIMEOUT'
+                ? 'Trip Running Too Long'
+                : violation.type === 'SUSPICIOUS_SPEED'
+                  ? 'Suspicious Movement Speed'
+                  : violation.type === 'REPEATED_GEOFENCE_BOUNDARY'
+                    ? 'Repeated Geofence Boundary Issues'
+                    : 'Route Violation';
 
   return {
     id: violation.id,
@@ -821,7 +833,7 @@ const mapViolationRecordToItem = (violation: {
 
 type RealtimeViolationPayload = {
   id?: string;
-  type?: 'GEOFENCE_BOUNDARY' | 'ROUTE_DEVIATION' | 'UNAUTHORIZED_STOP';
+  type?: ViolationRecord['type'];
   priority?: 'HIGH' | 'MEDIUM' | 'LOW';
   title?: string | null;
   details?: string | null;
@@ -837,6 +849,13 @@ const getViolationRealtimeTitle = (violation: RealtimeViolationPayload) => {
   if (violation.type === 'GEOFENCE_BOUNDARY') return 'Geofence Boundary Violation';
   if (violation.type === 'ROUTE_DEVIATION') return 'Route Deviation Alert';
   if (violation.type === 'UNAUTHORIZED_STOP') return 'Unauthorized Stop';
+  if (violation.type === 'GPS_SILENCE') return 'GPS Updates Paused';
+  if (violation.type === 'LONG_STOP') return 'Long Stop During Trip';
+  if (violation.type === 'TRIP_TIMEOUT') return 'Trip Running Too Long';
+  if (violation.type === 'SUSPICIOUS_SPEED') return 'Suspicious Movement Speed';
+  if (violation.type === 'REPEATED_GEOFENCE_BOUNDARY') {
+    return 'Repeated Geofence Boundary Issues';
+  }
   return 'Violation recorded';
 };
 
@@ -1018,7 +1037,16 @@ export default function App() {
   } | null>(null);
   const screenTransitionOpacity = useRef(new Animated.Value(1)).current;
   const screenTransitionTranslateY = useRef(new Animated.Value(0)).current;
-  const content = useMemo(() => SCREEN_CONTENT[screen], [screen]);
+  const content = useMemo(() => {
+    if (screen === 'createPassword' && !tempResetCandidate) {
+      return {
+        ...SCREEN_CONTENT.createPassword,
+        subtitle: 'Enter your Driver Code and create your first password to activate your driver login.',
+      };
+    }
+
+    return SCREEN_CONTENT[screen];
+  }, [screen, tempResetCandidate]);
   const filteredHomeTrips = useMemo(
     () =>
       filterTripHistoryByRange(tripHistory, homeStatsFilter).filter(
@@ -2732,7 +2760,7 @@ export default function App() {
           for (const event of offlineViolationEvents) {
             let payload:
               | {
-                  type?: 'GEOFENCE_BOUNDARY' | 'ROUTE_DEVIATION' | 'UNAUTHORIZED_STOP';
+                  type?: ViolationRecord['type'];
                   priority?: 'HIGH' | 'MEDIUM' | 'LOW';
                   locationLabel?: string;
                   details?: string;
@@ -3040,11 +3068,14 @@ export default function App() {
     const osrmRoutePath = normalizeSavedRoutePath(reconstruction.reconstructedPath, [], {
       preserveDetailedGeometry: shouldPreserveDetailedRouteGeometry(reconstruction.routeMatchMetadata),
     });
+    const hasUsableOsrmRoadRoute =
+      osrmRoutePath.length > 2 &&
+      (reconstruction.routeMatchMetadata?.provider === 'osrm-match' ||
+        reconstruction.routeMatchMetadata?.provider === 'osrm-route');
     if (
-      osrmRoutePath.length <= 2 ||
-      reconstruction.routeMatchMetadata?.provider !== 'osrm-match'
+      !hasUsableOsrmRoadRoute
     ) {
-      throw new Error('OSRM map matching did not return a usable road-matched route yet.');
+      throw new Error('OSRM did not return a usable road-following route yet.');
     }
 
     return {
@@ -4342,6 +4373,28 @@ export default function App() {
       return false;
     }
     // Keep the user on the forgot password screen; admin will approve the request.
+    return true;
+  };
+
+  const handleCreateFirstPassword = async (driverCode: string, newPassword: string) => {
+    setIsRequestingPasswordReset(true);
+    const { driver, error } = await setDriverPassword(driverCode, newPassword);
+    setIsRequestingPasswordReset(false);
+
+    if (error) {
+      Alert.alert('Create Password Error', error);
+      return false;
+    }
+
+    if (!driver) {
+      Alert.alert('Driver not found', 'The driver code was not found in the database.');
+      return false;
+    }
+
+    Alert.alert('Password created', 'Sign in with your Driver Code and new password.');
+    setTempResetCandidate(null);
+    setLoginPasswordMode('password');
+    setScreen('login');
     return true;
   };
 
@@ -6522,6 +6575,11 @@ export default function App() {
                 <View style={styles.loginScreenFill}>
                   <LoginScreen
                     onForgotPassword={() => setScreen('forgotPassword')}
+                    onCreatePassword={() => {
+                      setTempResetCandidate(null);
+                      setLoginPasswordMode('password');
+                      setScreen('createPassword');
+                    }}
                     onLogin={handleDriverLogin}
                     passwordPlaceholder={loginPasswordMode === 'temporary' ? 'Temporary Password' : 'Password'}
                     isAuthenticating={isAuthenticating}
@@ -6543,7 +6601,7 @@ export default function App() {
                       lockDriverCode={Boolean(tempResetCandidate?.driverCode)}
                       onSubmit={async (driverCode: string, newPassword: string) => {
                         if (!tempResetCandidate) {
-                          Alert.alert('Error', 'Temporary password not found.');
+                          await handleCreateFirstPassword(driverCode, newPassword);
                           return;
                         }
                         await handleCompletePasswordReset(driverCode, tempResetCandidate.temporaryPassword, newPassword);

@@ -50,6 +50,12 @@ const textSize = (stops: Array<[number, number]>) => [
 export const OSM_VECTOR_LIGHT_STYLE_URL =
   `https://api.maptiler.com/maps/streets-v4/style.json?key=${MAPTILER_API_KEY}`;
 
+export const OSM_RASTER_LIGHT_TILE_URL =
+  `https://api.maptiler.com/maps/streets-v4/{z}/{x}/{y}.png?key=${MAPTILER_API_KEY}`;
+
+export const OSM_RASTER_DARK_TILE_URL =
+  `https://api.maptiler.com/maps/dataviz-dark/{z}/{x}/{y}.png?key=${MAPTILER_API_KEY}`;
+
 export const OSM_VECTOR_DARK_STYLE = {
   version: 8,
   glyphs: OPEN_FREEMAP_GLYPHS_URL,

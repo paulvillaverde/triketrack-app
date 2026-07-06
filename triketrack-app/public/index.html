@@ -14,9 +14,9 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="TrikeTrack" />
-    <link rel="manifest" href="./manifest.json" />
-    <link rel="icon" href="./icon-192.png" />
-    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="icon" href="/icon-192.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <style id="expo-reset">
       html,
       body {
@@ -42,7 +42,7 @@
     <script>
       if ('serviceWorker' in navigator) {
         window.addEventListener('load', function () {
-          navigator.serviceWorker.register('./sw.js').catch(function (error) {
+          navigator.serviceWorker.register('/sw.js').catch(function (error) {
             console.warn('Service worker registration failed.', error);
           });
         });

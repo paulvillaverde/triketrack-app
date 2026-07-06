@@ -110,7 +110,9 @@ const hasDetailedMatchedRoute = (trip: TripHistoryItem) =>
   trip.routeMatchSummary.provider !== 'local-directional';
 
 const hasSavedMapMatchedRoute = (trip: TripHistoryItem) =>
-  trip.routePath.length > 2 && trip.routeMatchSummary?.provider === 'osrm-match';
+  trip.routePath.length > 2 &&
+  (trip.routeMatchSummary?.provider === 'osrm-match' ||
+    trip.routeMatchSummary?.provider === 'osrm-route');
 
 const getRouteSourceLabel = (trip: TripHistoryItem) => {
   if (

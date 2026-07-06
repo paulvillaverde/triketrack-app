@@ -1,4 +1,4 @@
-import { LayoutChangeEvent, Pressable, Text, View } from 'react-native';
+import { LayoutChangeEvent, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { AppIcon } from '../ui';
 import {
   MAXIM_UI_BORDER_DARK,
@@ -47,6 +47,8 @@ export function StartTripPanel({
   onLayout,
   isLowBatteryMapMode = false,
 }: StartTripPanelProps) {
+  const isWeb = Platform.OS === 'web';
+
   return (
     <View
       style={[
@@ -91,11 +93,12 @@ export function StartTripPanel({
         </View>
       </View>
 
-      <View style={[styles.routeTripStatsRow, localStyles.tripStatsRow]}>
+      <View style={[styles.routeTripStatsRow, localStyles.tripStatsRow, isWeb ? webStyles.tripStatsRow : null]}>
         <View
           style={[
             styles.routeTripStatPill,
             localStyles.tripStatPill,
+            isWeb ? webStyles.tripStatPill : null,
             isLowBatteryMapMode
               ? {
                   backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
@@ -107,8 +110,10 @@ export function StartTripPanel({
           <Text
             style={[
               styles.routeTripStatValue,
+              isWeb ? webStyles.tripStatValue : null,
               isLowBatteryMapMode ? { color: MAXIM_UI_TEXT_DARK } : null,
             ]}
+            numberOfLines={1}
           >
             {minutesText}
           </Text>
@@ -125,6 +130,7 @@ export function StartTripPanel({
           style={[
             styles.routeTripStatPill,
             localStyles.tripStatPill,
+            isWeb ? webStyles.tripStatPill : null,
             isLowBatteryMapMode
               ? {
                   backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
@@ -136,8 +142,10 @@ export function StartTripPanel({
           <Text
             style={[
               styles.routeTripStatValue,
+              isWeb ? webStyles.tripStatValue : null,
               isLowBatteryMapMode ? { color: MAXIM_UI_TEXT_DARK } : null,
             ]}
+            numberOfLines={1}
           >
             {kmText}
           </Text>
@@ -154,6 +162,7 @@ export function StartTripPanel({
           style={[
             styles.routeTripStatPill,
             localStyles.tripStatPill,
+            isWeb ? webStyles.tripStatPill : null,
             isLowBatteryMapMode
               ? {
                   backgroundColor: MAXIM_UI_SURFACE_ALT_DARK,
@@ -166,8 +175,10 @@ export function StartTripPanel({
           <Text
             style={[
               styles.routeTripStatValue,
+              isWeb ? webStyles.tripStatValue : null,
               isLowBatteryMapMode ? { color: MAXIM_UI_TEXT_DARK } : null,
             ]}
+            numberOfLines={1}
           >
             {'\u20B1'}{selectedFare}
           </Text>
@@ -256,3 +267,29 @@ export function StartTripPanel({
     </View>
   );
 }
+
+const webStyles = StyleSheet.create({
+  tripStatsRow: {
+    justifyContent: 'space-between',
+    alignItems: 'stretch',
+    gap: 0,
+    width: '100%',
+  },
+  tripStatPill: {
+    flexBasis: '31%',
+    flexGrow: 0,
+    flexShrink: 1,
+    width: '31%',
+    minWidth: 0,
+    marginHorizontal: 0,
+    paddingHorizontal: 2,
+    overflow: 'hidden',
+  },
+  tripStatValue: {
+    width: '100%',
+    minWidth: 0,
+    textAlign: 'center',
+    fontSize: 16,
+    lineHeight: 20,
+  },
+});

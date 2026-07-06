@@ -545,7 +545,15 @@ export type ViolationRecord = {
   id: string;
   driver_id: number;
   trip_id: number | null;
-  type: 'GEOFENCE_BOUNDARY' | 'ROUTE_DEVIATION' | 'UNAUTHORIZED_STOP';
+  type:
+    | 'GEOFENCE_BOUNDARY'
+    | 'ROUTE_DEVIATION'
+    | 'UNAUTHORIZED_STOP'
+    | 'GPS_SILENCE'
+    | 'LONG_STOP'
+    | 'TRIP_TIMEOUT'
+    | 'SUSPICIOUS_SPEED'
+    | 'REPEATED_GEOFENCE_BOUNDARY';
   status: 'OPEN' | 'UNDER_REVIEW' | 'RESOLVED';
   priority: 'HIGH' | 'MEDIUM' | 'LOW';
   occurred_at: string;
@@ -1518,7 +1526,7 @@ export async function listViolations(driverId: number) {
 export async function createViolation(params: {
   driverId: number;
   tripId?: string | number | null;
-  type: 'GEOFENCE_BOUNDARY' | 'ROUTE_DEVIATION' | 'UNAUTHORIZED_STOP';
+  type: ViolationRecord['type'];
   priority?: 'HIGH' | 'MEDIUM' | 'LOW';
   occurredAt?: string;
   latitude?: number;

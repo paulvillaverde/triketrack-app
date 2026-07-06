@@ -10,7 +10,7 @@
     "splash": {
       "image": "./assets/logo.png",
       "resizeMode": "contain",
-      "backgroundColor": "#FFFFFF"
+      "backgroundColor": "#000000"
     },
     "ios": {
       "supportsTablet": true
@@ -18,7 +18,7 @@
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#FFFFFF"
+        "backgroundColor": "#000000"
       },
       "predictiveBackGestureEnabled": false,
       "package": "com.anonymous.triketrackapp",
@@ -35,9 +35,9 @@
       "shortName": "TrikeTrack",
       "display": "standalone",
       "themeColor": "#57C7A8",
-      "backgroundColor": "#F5F6F8",
-      "scope": "./",
-      "startUrl": "./"
+      "backgroundColor": "#000000",
+      "scope": "/",
+      "startUrl": "/"
     },
     "plugins": [
       [

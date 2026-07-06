@@ -1,11 +1,11 @@
 const CACHE_NAME = 'triketrack-pwa-v1';
 const APP_SHELL_URLS = [
-  './',
-  './index.html',
-  './manifest.json',
-  './icon-192.png',
-  './icon-512.png',
-  './apple-touch-icon.png',
+  '/',
+  '/index.html',
+  '/manifest.json',
+  '/icon-192.png',
+  '/icon-512.png',
+  '/apple-touch-icon.png',
 ];
 
 self.addEventListener('install', (event) => {
@@ -45,12 +45,12 @@ self.addEventListener('fetch', (event) => {
       fetch(request)
         .then((response) => {
           const responseClone = response.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put('./', responseClone));
+          caches.open(CACHE_NAME).then((cache) => cache.put('/', responseClone));
           return response;
         })
         .catch(async () => {
           const cachedResponse = await caches.match(request);
-          return cachedResponse || caches.match('./');
+          return cachedResponse || caches.match('/');
         }),
     );
     return;

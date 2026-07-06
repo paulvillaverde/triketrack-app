@@ -5,6 +5,7 @@ import { MAXIM_UI_SUBTLE_DARK, MAXIM_UI_TEXT_DARK } from './homeScreenShared';
 
 type LoginScreenProps = {
   onForgotPassword: () => void;
+  onCreatePassword: () => void;
   onLogin: (driverCode: string, password: string) => void;
   passwordPlaceholder?: string;
   isAuthenticating?: boolean;
@@ -14,6 +15,7 @@ type LoginScreenProps = {
 
 export function LoginScreen({
   onForgotPassword,
+  onCreatePassword,
   onLogin,
   passwordPlaceholder = 'Password',
   isAuthenticating = false,
@@ -56,12 +58,19 @@ export function LoginScreen({
       />
 
       <View style={styles.forgotPasswordRow}>
+        <Pressable onPress={onCreatePassword}>
+          <Text style={styles.smallLinkDark}>Don't have password?</Text>
+        </Pressable>
+      </View>
+
+      <View style={styles.loginButtonBottomSpacer} />
+
+      <View style={[styles.forgotPasswordRow, localStyles.forgotPasswordCenterRow]}>
         <Pressable onPress={onForgotPassword}>
           <Text style={styles.smallLinkDark}>Forgot password?</Text>
         </Pressable>
       </View>
 
-      <View style={styles.loginButtonBottomSpacer} />
       <AnimatedButton
         style={[styles.primaryButton, styles.loginPrimaryButtonLower, localStyles.loginButton]}
         onPress={() => onLogin(driverCode.trim().toUpperCase(), password)}
@@ -73,6 +82,10 @@ export function LoginScreen({
 }
 
 const localStyles = StyleSheet.create({
+  forgotPasswordCenterRow: {
+    justifyContent: 'center',
+    marginBottom: 20,
+  },
   loginButton: {
     minHeight: 60,
     height: 60,

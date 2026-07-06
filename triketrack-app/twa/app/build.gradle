@@ -1,0 +1,24 @@
+plugins {
+    id "com.android.application"
+}
+
+def twaHost = providers.gradleProperty("twaHost").orElse("https://project-x1g12.vercel.app").get()
+
+android {
+    namespace "com.triketrack.driver.twa"
+    compileSdk 36
+
+    defaultConfig {
+        applicationId "com.triketrack.driver.twa"
+        minSdk 23
+        targetSdk 35
+        versionCode 1
+        versionName "1.0.0"
+
+        resValue "string", "twa_default_url", twaHost
+    }
+}
+
+dependencies {
+    implementation "com.google.androidbrowserhelper:androidbrowserhelper:2.6.2"
+}
